@@ -1,46 +1,63 @@
-# License analysis TODO (must complete before first public Release)
+# License analysis — findings & decision
 
-Goal: choose the **most permissive license possible** for `flamingo-stitcher`,
-consistent with what the code is **derived from** and what the frozen Windows
-executable **bundles**. Produce: (1) a final `LICENSE`, (2) a `NOTICE` file
-aggregating third-party attributions, (3) a decision on the PyQt5 constraint.
+Status: **analysis complete**, one decision required (PyQt5 → PySide). Goal was the
+**most permissive license possible**.
 
-Recommended tool: the `license-check` skill.
+## Resolution (TL;DR)
 
-## 1. Derived-from (carry-forward obligations)
-- [ ] Confirm the license of the upstream **Py2Flamingo / Flamingo_Control** repo
-      (this code — pipeline + dialog — is derived from it). The new repo's license
-      must be compatible with / no more permissive than what that repo allows.
+- **Origin is permissive.** `flamingo-stitcher` is derived from Py2Flamingo /
+  Flamingo_Control, which is **MIT** (© 2023 MichaelSNelson). MIT permits
+  relicensing/sublicensing, so the only obligation from the origin is to
+  **preserve that MIT notice** (done — see `NOTICE`). No relicense obstacle.
+- **One copyleft dependency: PyQt5 (GPL-3.0).** Every other dependency is
+  permissive (BSD-3-Clause / MIT / Apache-2.0), including the ones that mattered
+  most: multiview-stitcher (BSD-3), ngff-zarr (MIT), pystripe (MIT), RedLionfish
+  (Apache-2.0), PyImarisWriter (Apache-2.0), napari/vispy/numpy/scipy/dask/
+  tifffile (BSD-3), zarr/numcodecs/PyYAML (MIT).
+- **The frozen Windows `.exe` BUNDLES PyQt5**, so the distributed binary is a
+  combined work → it is **GPL-3.0** unless the GUI uses LGPL Qt instead.
 
-## 2. The blocking constraint: PyQt5 (GUI)
-- [ ] **PyQt5 is GPLv3-or-commercial.** Bundling it in a *distributed* frozen
-      `.exe` makes the whole distribution effectively **GPLv3** unless we either:
-      - (a) migrate the GUI to **PySide6 / PySide2 (LGPL)** — permits a permissive
-        top-level license with dynamically-linked Qt; OR
-      - (b) obtain a commercial Qt/PyQt license.
-- [ ] Decision required: this single choice determines whether "most permissive"
-      (BSD-3 / MIT / Apache-2.0) is achievable, or whether we ship GPLv3.
-      - Migration cost estimate: the dialog uses `PyQt5.QtWidgets/QtCore/QtGui`
-        + `pyqtSignal`/`QSettings`. A PySide port is mostly mechanical
-        (`pyqtSignal`→`Signal`, import swaps) but must be tested.
-      - The **CLI-only** install path has no Qt and is unaffected — its license
-        could be permissive regardless.
+## The decision: PyQt5 vs PySide6
 
-## 3. Bundled runtime deps — audit licenses + collect into NOTICE
-Core (always bundled in the exe):
-- [ ] numpy (BSD-3) · scipy (BSD-3) · dask (BSD-3) · zarr (MIT) · numcodecs (MIT)
-- [ ] tifffile (BSD-3) · PyYAML (MIT) · psutil (BSD-3)
-- [ ] **multiview-stitcher** — VERIFY license (core registration/fusion dependency)
-- [ ] **ngff-zarr** — VERIFY license
-Optional / not necessarily bundled:
-- [ ] PyImarisWriter — Apache-2.0 (Windows-only)
-- [ ] pystripe — VERIFY
-- [ ] RedLionfish / pycudadecon — VERIFY (GPU deconvolution)
-- [ ] napari (BSD-3), vispy (BSD-3) — only the optional `preview` extra
-- [ ] Isolated-env (NOT bundled, but document): basicpy, leonardo-toolset
-      (pull jax / torch / open3d — note their licenses for completeness)
+| Path | Top-level license achievable | Work required |
+|---|---|---|
+| **Keep PyQt5** (GPL-3.0) | The distributed installer must be **GPL-3.0**. | none |
+| **Migrate GUI to PySide6** (LGPL-3.0) | **MIT** (matches origin + all other deps) — the permissive goal. | mechanical port + test |
 
-## 4. Deliverables
-- [ ] Replace `LICENSE` placeholder with the chosen license text.
-- [ ] Write `NOTICE` aggregating all third-party license notices.
-- [ ] One-line record of the PyQt5 → (PySide | GPLv3 | commercial) decision.
+PySide6 is the official Qt for Python (LGPL-3.0). LGPL allows distributing a
+binary that *dynamically links* Qt while keeping your own code permissive,
+provided users can relink/replace the Qt libraries — satisfied by PyInstaller
+(Qt ships as separate DLLs) plus the installer's reinstall path.
+
+### PySide6 migration scope (mostly mechanical)
+- `from PyQt5.X import ...` → `from PySide6.X import ...` (QtCore/QtGui/QtWidgets)
+- `pyqtSignal` → `Signal`, `pyqtSlot` → `Slot`
+- `dialog.exec_()` → `dialog.exec()`; `QApplication.exec_()` → `exec()`
+- Scoped-enum strictness (e.g. `Qt.AlignLeft` → `Qt.AlignmentFlag.AlignLeft`) in spots
+- `QSettings`, `QByteArray`, geometry save/restore: API-compatible
+- Files touched: `gui/stitching_dialog.py`, `gui/background_zero_preview_dialog.py`,
+  `gui/_compat.py`, `gui/app.py`, and `worker.py` (QtCore only). napari preview
+  works on PySide6 too.
+- Also update the in-app side: `py2flamingo` itself uses PyQt5 — note this does
+  not have to migrate for `flamingo-stitcher` to be MIT (the embedded dialog runs
+  under whatever Qt the host provides), but the *standalone frozen exe* must ship
+  PySide6 to be MIT.
+
+## Decision (2026-06-09): keep PyQt5 → GPL-3.0
+
+Chosen: **keep PyQt5, license the project GPL-3.0-or-later** (no code migration).
+The PySide6 → MIT path remains documented above as a future option.
+
+## Deliverables produced
+- [x] `LICENSE` — verbatim GNU GPL v3.0 text.
+- [x] `pyproject.toml` — `license = "GPL-3.0-or-later"` + GPLv3 classifier.
+- [x] `README.md` — license section updated.
+- [x] `NOTICE` — origin MIT attribution + third-party component licenses + PyQt5 note.
+- [x] This findings doc.
+
+### Note on the host app (Flamingo_Control)
+Flamingo_Control is MIT and now declares a dependency on this GPL-3.0 package.
+This does not change Flamingo_Control's own source license, and it introduces no
+new obligation beyond its **pre-existing** direct PyQt5 (GPL-3.0) dependency —
+the app already combined with GPL Qt at install/run time. The combined,
+distributed application is effectively GPL-3.0, as it already was.

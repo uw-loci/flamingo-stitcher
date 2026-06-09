@@ -4,13 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flamingo-stitcher"
-version = "0.1.1"
+version = "0.1.2"
 description = "Standalone light-sheet tile stitching pipeline and GUI for Flamingo T-SPIM data."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "TBD — see LICENSE / license analysis" }
+license = { text = "GPL-3.0-or-later" }
 authors = [{ name = "Michael S. Nelson" }]
 keywords = ["light-sheet", "microscopy", "stitching", "OME-Zarr", "OME-TIFF", "multiview-stitcher"]
+classifiers = [
+    "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+    "Programming Language :: Python :: 3",
+    "Operating System :: Microsoft :: Windows",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
 
 # Core (headless CLI) dependencies. Mirrors Flamingo_Control/requirements.txt pins.
 dependencies = [

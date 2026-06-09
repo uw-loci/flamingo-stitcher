@@ -59,6 +59,12 @@ OME-Zarr v0.4 writes; see forum.image.sc topic 120480).
 
 ## License
 
-**Pending** — see the license analysis. Note: the GUI currently uses **PyQt5**
-(GPLv3-or-commercial), which affects the distributable license. Third-party
-attributions will live in `NOTICE`.
+**GNU General Public License v3.0 or later** (GPL-3.0-or-later) — see [`LICENSE`](LICENSE).
+
+The GUI uses **PyQt5** (GPL-3.0), which the Windows installer bundles, making the
+distributed binary GPL-3.0. Every other dependency is permissive (BSD-3-Clause /
+MIT / Apache-2.0) and GPL-compatible. This project is derived from
+[Py2Flamingo](https://github.com/MichaelSNelson/Flamingo_Control) (MIT); see
+[`NOTICE`](NOTICE) for full third-party attribution and
+[`LICENSE_ANALYSIS_TODO.md`](LICENSE_ANALYSIS_TODO.md) for the analysis (incl. the
+PySide6/MIT alternative).
