@@ -244,8 +244,11 @@ class StitchingDialog(PersistentDialog):
     # Subfolder-per-tile layout: grandparent (2 levels up).
     _acq_dir_restore_levels_up = 2
 
-    def __init__(self, parent=None):
-        super().__init__(parent=parent)
+    def __init__(self, parent=None, **kwargs):
+        # **kwargs forwards PersistentDialog options (geometry_manager,
+        # window_id) so the host app can inject its own geometry manager when
+        # embedding this dialog; standalone uses the module default.
+        super().__init__(parent=parent, **kwargs)
         self._logger = logging.getLogger(__name__)
         self._worker = None
 
@@ -2782,8 +2785,8 @@ class NativeStitchingDialog(StitchingDialog):
     # Flat layout: parent only (1 level up).
     _acq_dir_restore_levels_up = 1
 
-    def __init__(self, parent=None):
-        super().__init__(parent=parent)
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent=parent, **kwargs)
         self.setWindowTitle("Tile Stitching (Single Workflow)")
 
     def _discover_tiles_for_path(self, acq_path: Path):
