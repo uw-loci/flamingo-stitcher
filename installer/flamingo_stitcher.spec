@@ -12,7 +12,15 @@ napari/vispy/matplotlib are deliberately EXCLUDED — the GUI does not need them
 (the optional background-zero preview is disabled when napari is absent).
 """
 
+import os
+
 from PyInstaller.utils.hooks import collect_all, collect_data_files
+
+# PyInstaller resolves relative paths in a spec relative to the spec's own
+# directory (SPECPATH), NOT the invocation CWD. Anchor everything on the repo
+# root (the parent of installer/) so paths work regardless of where the build
+# is launched from.
+ROOT = os.path.dirname(os.path.abspath(SPECPATH))
 
 datas = []
 binaries = []
@@ -47,9 +55,9 @@ for pkg in (
 datas += collect_data_files("flamingo_stitcher", includes=["configs/*.yaml"])
 # App icon + preprocessing-env setup scripts.
 datas += [
-    ("src/flamingo_stitcher/gui/flamingo_icon.png", "flamingo_stitcher/gui"),
-    ("scripts/create_preprocessing_env.bat", "scripts"),
-    ("scripts/create_preprocessing_env.sh", "scripts"),
+    (os.path.join(ROOT, "src/flamingo_stitcher/gui/flamingo_icon.png"), "flamingo_stitcher/gui"),
+    (os.path.join(ROOT, "scripts/create_preprocessing_env.bat"), "scripts"),
+    (os.path.join(ROOT, "scripts/create_preprocessing_env.sh"), "scripts"),
 ]
 
 # PyImarisWriter (optional, Windows-only) — include if installed.
@@ -61,11 +69,9 @@ try:
 except Exception:
     pass
 
-block_cipher = None
-
 a = Analysis(
-    ["installer/launcher.py"],
-    pathex=["src"],
+    [os.path.join(ROOT, "installer", "launcher.py")],
+    pathex=[os.path.join(ROOT, "src")],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -81,11 +87,10 @@ a = Analysis(
         "pyqtgraph",
         "notebook",
     ],
-    cipher=block_cipher,
     noarchive=False,
 )
 
-pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+pyz = PYZ(a.pure)
 
 exe = EXE(
     pyz,
@@ -98,7 +103,7 @@ exe = EXE(
     strip=False,
     upx=False,
     console=False,  # GUI app — no console window
-    icon="src/flamingo_stitcher/gui/flamingo_icon.ico",
+    icon=os.path.join(ROOT, "src/flamingo_stitcher/gui/flamingo_icon.ico"),
 )
 
 coll = COLLECT(
