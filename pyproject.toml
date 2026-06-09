@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm>=8"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flamingo-stitcher"
+version = "0.1.0"
+description = "Standalone light-sheet tile stitching pipeline and GUI for Flamingo T-SPIM data."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "TBD — see LICENSE / license analysis" }
+authors = [{ name = "Michael S. Nelson" }]
+keywords = ["light-sheet", "microscopy", "stitching", "OME-Zarr", "OME-TIFF", "multiview-stitcher"]
+
+# Core (headless CLI) dependencies. Mirrors Flamingo_Control/requirements.txt pins.
+dependencies = [
+    "numpy>=2.0.0,<3",
+    "scipy>=1.14.0,<2",
+    "psutil>=5.9.0,<7",
+    "PyYAML>=6.0,<7",
+    "tifffile>=2023.2.0,<2027",
+    "zarr>=3.1.4,<4",
+    "numcodecs>=0.14.0,<1",
+    "multiview-stitcher>=0.1.37,<0.2",
+    # ngff-zarr writes the default sharded OME-Zarr output + .ozx packaging.
+    # (It was implied-but-undeclared in the original requirements.txt.)
+    "ngff-zarr>=0.9,<1",
+    # dask 2025.12.0 - 2026.3.0 break ngff-zarr's zarr_format selection, causing
+    # version="0.4" writes to silently produce zarr v3 (zarr.json instead of
+    # .zgroup) that Fiji cannot open. See forum.image.sc topic 120480 and
+    # ngff-zarr PR #480. TODO: relax once ngff-zarr releases the fix.
+    "dask[array]>=2024.1.0,!=2025.12.0,!=2026.1.0,!=2026.1.1,!=2026.2.0,!=2026.3.0,<2027",
+]
+
+[project.optional-dependencies]
+# GUI (the frozen Windows app builds from this). PyQt5 only — NOT napari.
+# NOTE: PyQt5 is GPLv3-or-commercial; see the license analysis before release.
+gui = ["PyQt5>=5.15.8,<6"]
+
+# Optional background-zero threshold PREVIEW (3-D viewer). Without it the
+# numeric background-zeroing still runs; only the live preview is disabled.
+preview = ["napari>=0.7.0,<0.8", "vispy>=0.16.0,<0.17"]
+
+# Direct Imaris (.ims) output — Bitplane's Apache-2.0 writer, Windows-only DLLs.
+imaris = ["PyImarisWriter>=0.7.0; sys_platform == 'win32'"]
+
+# GPU deconvolution (cross-platform OpenCL). pycudadecon is conda-forge only,
+# so it is documented in the README rather than declared here.
+deconv = ["RedLionfish"]
+
+# Destriping. pystripe must be installed with --no-deps to avoid resolver
+# backtracking (see README); declared here for discoverability only.
+destripe = ["pystripe==1.3.1"]
+
+dev = ["pytest", "pytest-cov", "black", "flake8"]
+
+[project.scripts]
+flamingo-stitch = "flamingo_stitcher.__main__:main"
+flamingo-stitch-gui = "flamingo_stitcher.gui.app:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["flamingo_stitcher*"]
+
+[tool.setuptools.package-data]
+flamingo_stitcher = ["configs/*.yaml"]

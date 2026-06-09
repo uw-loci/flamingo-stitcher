@@ -1,0 +1,18 @@
+LICENSE PENDING
+===============
+
+The license for flamingo-stitcher has not yet been finalized.
+
+A license analysis is required before public release (see the project plan,
+Phase 5). The goal is the most permissive license possible, but a key
+constraint must be resolved first:
+
+  - The GUI currently depends on PyQt5, which is GPLv3-or-commercial.
+    Bundling PyQt5 in a distributed frozen executable would force the whole
+    distribution to GPLv3 unless the GUI is migrated to PySide6/PySide2 (LGPL)
+    or a commercial Qt/PyQt license is obtained.
+
+Until this file is replaced with a real license, treat the code as
+"all rights reserved" by the author(s).
+
+Third-party component attributions will be collected in the NOTICE file.

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# PyInstaller / Inno Setup build output
+/build/
+/dist/
+installer/Output/
+*.manifest
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
+
+# Runtime caches
+*.log
+stitching_timing_cache.json
+window_geometry.json
