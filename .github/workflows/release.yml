@@ -35,6 +35,24 @@ jobs:
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Building version $V"
 
+      - name: Verify __version__ matches the tag
+        # Single source of truth: src/flamingo_stitcher/_version.py drives the
+        # package version, the installer version, AND the in-app updater's
+        # "installed version". A tag whose version segment disagrees with the
+        # code would ship an installer that reports itself out of date forever
+        # — fail fast instead.
+        shell: bash
+        run: |
+          CODE_V=$(python -c "import re,sys; s=open('src/flamingo_stitcher/_version.py').read(); m=re.search(r'__version__\s*=\s*[\x27\x22]([^\x27\x22]+)', s); sys.stdout.write(m.group(1) if m else '')")
+          echo "_version.py __version__ = $CODE_V"
+          if [ -z "$CODE_V" ]; then
+            echo "::error::Could not parse __version__ from src/flamingo_stitcher/_version.py"; exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "$CODE_V" != "${{ steps.ver.outputs.version }}" ]; then
+            echo "::error::Tag version (${{ steps.ver.outputs.version }}) != __version__ ($CODE_V). Bump them in lockstep."
+            exit 1
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:

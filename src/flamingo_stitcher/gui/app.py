@@ -39,6 +39,7 @@ def main() -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    from PyQt5.QtCore import QSettings, QTimer
     from PyQt5.QtWidgets import (
         QApplication,
         QMainWindow,
@@ -54,6 +55,7 @@ def main() -> int:
         NativeStitchingDialog,
         StitchingDialog,
     )
+    from flamingo_stitcher.gui.updater import UpdatePanel
 
     # QSettings location (the dialogs persist their own settings via QSettings).
     QApplication.setOrganizationName("Flamingo")
@@ -78,10 +80,26 @@ def main() -> int:
     single = NativeStitchingDialog(parent=window)
     tabs.addTab(multi, "Multi-Acquisition")
     tabs.addTab(single, "Single Workflow")
+
+    # Updates tab — checks GitHub Releases for newer installers (standalone
+    # build only; the in-app Py2Flamingo dialogs ship their own updates).
+    settings = QSettings()
+    update_panel = UpdatePanel(window, tabs, settings)
+    tabs.addTab(update_panel, "Updates")
+    tabs.currentChanged.connect(
+        lambda idx: update_panel.on_tab_changed(tabs.widget(idx))
+    )
+
     window.setCentralWidget(tabs)
 
     window.resize(1100, 800)
     window.show()
+
+    # Re-apply a pending-update badge from a prior session, then run the
+    # throttled launch auto-check once the event loop is up.
+    update_panel.restore_badge_from_cache()
+    QTimer.singleShot(0, update_panel.maybe_auto_check)
+
     return app.exec_()
 
 

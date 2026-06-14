@@ -23,6 +23,7 @@ Optional dependencies (install separately if needed):
     conda install -c conda-forge pycudadecon  # NVIDIA GPU deconvolution
 """
 
+from ._version import __version__
 from .pipeline import StitchingConfig, StitchingPipeline, discover_tiles
 
-__all__ = ["StitchingConfig", "StitchingPipeline", "discover_tiles"]
+__all__ = ["StitchingConfig", "StitchingPipeline", "discover_tiles", "__version__"]

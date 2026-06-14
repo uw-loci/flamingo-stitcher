@@ -53,6 +53,9 @@ collect_pkgs = [
     #   "Failed to load dynlib/dll '...\\wasmtime\\win32-x86_64\\_wasmtime.dll'".
     "wasmtime",
     "itkwasm",
+    # certifi ships cacert.pem; the GUI updater's HTTPS call to api.github.com
+    # needs it because the frozen build has no system CA store.
+    "certifi",
 ]
 # Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
 # itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.

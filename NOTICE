@@ -19,6 +19,14 @@ under the MIT License:
     in the Software without restriction ... (full text in the Py2Flamingo repo).
 
 --------------------------------------------------------------------------------
+Acknowledgements
+--------------------------------------------------------------------------------
+The standalone GUI's in-app update checker (src/flamingo_stitcher/gui/updater.py)
+is a re-implementation, adapted to this codebase, of the updater design in TRACE
+(https://github.com/alexmpdx/TRACE) by Alex M. Used with permission and
+gratefully acknowledged.
+
+--------------------------------------------------------------------------------
 Third-party components
 --------------------------------------------------------------------------------
 The following components are dependencies of, and/or bundled into the frozen

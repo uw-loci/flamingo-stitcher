@@ -33,6 +33,14 @@ Download the latest **`FlamingoStitcher-Setup-vX.Y.Z.exe`** from the
 [Releases](../../releases) page and run it. (Unsigned for now — Windows SmartScreen
 may warn; choose *More info → Run anyway*.)
 
+**Staying up to date.** The app has an **Updates** tab that checks GitHub
+Releases on launch (throttled; opt-out from the same tab). When a newer
+installer exists it badges the tab and offers a one-click **Install update** —
+it downloads the new `FlamingoStitcher-Setup-*.exe`, launches it, and the
+installer upgrades over your current copy in place (no uninstall needed; your
+settings are preserved). You can always grab installers manually from the
+Releases page instead.
+
 ## Usage
 
 GUI:
