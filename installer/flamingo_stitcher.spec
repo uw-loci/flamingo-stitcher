@@ -13,6 +13,7 @@ napari/vispy/matplotlib are deliberately EXCLUDED — the GUI does not need them
 """
 
 import os
+import importlib.metadata
 
 from PyInstaller.utils.hooks import collect_all, collect_data_files
 
@@ -29,7 +30,7 @@ hiddenimports = []
 # The scientific stack ships data files, compiled extensions, and lazily
 # imported submodules that PyInstaller's static analysis misses. collect_all
 # pulls submodules + data + dylibs for each.
-for pkg in (
+collect_pkgs = [
     "dask",
     "zarr",
     "numcodecs",
@@ -42,7 +43,25 @@ for pkg in (
     "xarray",
     "spatial_image",
     "multiscale_spatial_image",
-):
+    # ngff-zarr / multiscale-spatial-image generate image pyramids via
+    # itkwasm-downsample, which runs a WebAssembly module through the wasmtime
+    # runtime. wasmtime ships a native `_wasmtime.dll` (under
+    # wasmtime/<platform>/) and the itkwasm-*-wasi packages ship `.wasi`/`.wasm`
+    # payloads — all loaded by explicit path at runtime, so PyInstaller's static
+    # analysis misses them unless we collect the packages wholesale. Without this
+    # a stitch dies at the registration step with
+    #   "Failed to load dynlib/dll '...\\wasmtime\\win32-x86_64\\_wasmtime.dll'".
+    "wasmtime",
+    "itkwasm",
+]
+# Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
+# itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.
+for dist in importlib.metadata.distributions():
+    dist_name = (dist.metadata["Name"] or "").replace("-", "_").lower()
+    if dist_name.startswith("itkwasm") and dist_name not in collect_pkgs:
+        collect_pkgs.append(dist_name)
+
+for pkg in collect_pkgs:
     try:
         d, b, h = collect_all(pkg)
         datas += d
