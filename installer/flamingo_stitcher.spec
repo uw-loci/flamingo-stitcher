@@ -56,6 +56,12 @@ collect_pkgs = [
     # certifi ships cacert.pem; the GUI updater's HTTPS call to api.github.com
     # needs it because the frozen build has no system CA store.
     "certifi",
+    # multiview-stitcher's registration.py unconditionally imports vis_utils,
+    # which imports matplotlib (+ mpl_toolkits) at module load. Excluding
+    # matplotlib therefore makes `import multiview_stitcher.registration` raise
+    # ImportError and breaks every stitch at Step 3. collect_all pulls in its
+    # mpl-data (fonts/styles) too. We never plot — it's an import-time dep only.
+    "matplotlib",
 ]
 # Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
 # itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.
@@ -102,7 +108,8 @@ a = Analysis(
     excludes=[
         "napari",
         "vispy",
-        "matplotlib",
+        # NOTE: matplotlib is NOT excluded — multiview-stitcher imports it at
+        # module load (registration.py -> vis_utils). It is collected above.
         "IPython",
         "tkinter",
         "pytest",

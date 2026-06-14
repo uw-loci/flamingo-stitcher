@@ -41,6 +41,69 @@ def _get_git_version() -> Optional[str]:
     return None
 
 
+def _pkg_version(dist_name: str) -> str:
+    """Installed version of a distribution, or '?' if unavailable.
+
+    Defensive on purpose: a missing/odd metadata entry must never break the
+    run header. In a frozen build the metadata may be absent for some packages,
+    in which case we fall back to the imported module's ``__version__``.
+    """
+    try:
+        import importlib.metadata as _md
+
+        return _md.version(dist_name)
+    except Exception:
+        # Frozen builds sometimes drop dist metadata; try the live module.
+        mod_name = dist_name.replace("-", "_")
+        try:
+            import importlib
+
+            return str(getattr(importlib.import_module(mod_name), "__version__", "?"))
+        except Exception:
+            return "?"
+
+
+def environment_summary() -> List[str]:
+    """Lines describing the running environment for the log header.
+
+    Captures the bits that actually matter when reproducing or diagnosing a
+    run from its log alone: the Flamingo Stitcher version, whether this is a
+    frozen build, the Python/OS, and the versions of the dependencies that
+    drive (and most often break) stitching. Every lookup is best-effort.
+    """
+    import platform
+    import sys
+
+    try:
+        from flamingo_stitcher import __version__ as fs_version
+    except Exception:
+        fs_version = "?"
+
+    frozen = bool(getattr(sys, "frozen", False))
+    build = "frozen" if frozen else "source"
+    git = _get_git_version() if not frozen else None
+
+    lines = [
+        f"Flamingo Stitcher: {fs_version} ({build})"
+        + (f", git {git}" if git else ""),
+        f"Python {platform.python_version()} on {platform.platform()}",
+        "Key deps: "
+        + ", ".join(
+            f"{name}={_pkg_version(name)}"
+            for name in (
+                "multiview-stitcher",
+                "ngff-zarr",
+                "dask",
+                "zarr",
+                "numpy",
+                "scipy",
+                "tifffile",
+            )
+        ),
+    ]
+    return lines
+
+
 # ---------------------------------------------------------------------------
 # Constants (loaded from microscope_hardware.yaml if available)
 # ---------------------------------------------------------------------------
@@ -1496,7 +1559,8 @@ class StitchingPipeline:
         """
         t0 = time.time()
         self.logger.info(f"=== Stitching Pipeline Start ===")
-        self.logger.info(f"Git: {_get_git_version() or 'unknown'}")
+        for _line in environment_summary():
+            self.logger.info(_line)
         self.logger.info(f"Input:  {acquisition_dir}")
         self.logger.info(f"Output: {output_path}")
 
@@ -2737,11 +2801,15 @@ class StitchingPipeline:
                 registration,
             )
             from multiview_stitcher import spatial_image_utils as si_utils
-        except ImportError:
+        except ImportError as exc:
+            # Surface the REAL missing module (e.g. a dependency stripped from a
+            # frozen build) instead of hiding it behind a generic message — the
+            # underlying ImportError names exactly what's absent.
             raise ImportError(
-                "multiview-stitcher is required for stitching. "
-                "Install with: pip install multiview-stitcher"
-            )
+                "multiview-stitcher (or one of its dependencies) failed to import. "
+                f"Underlying error: {exc}. "
+                "If running from source, install with: pip install multiview-stitcher"
+            ) from exc
 
         import dask.array as da
 
@@ -2868,11 +2936,15 @@ class StitchingPipeline:
                 msi_utils,
             )
             from multiview_stitcher import spatial_image_utils as si_utils
-        except ImportError:
+        except ImportError as exc:
+            # Surface the REAL missing module (e.g. a dependency stripped from a
+            # frozen build) instead of hiding it behind a generic message — the
+            # underlying ImportError names exactly what's absent.
             raise ImportError(
-                "multiview-stitcher is required for stitching. "
-                "Install with: pip install multiview-stitcher"
-            )
+                "multiview-stitcher (or one of its dependencies) failed to import. "
+                f"Underlying error: {exc}. "
+                "If running from source, install with: pip install multiview-stitcher"
+            ) from exc
 
         import dask.array as da
 
@@ -3197,11 +3269,15 @@ class StitchingPipeline:
                 registration,
             )
             from multiview_stitcher import spatial_image_utils as si_utils
-        except ImportError:
+        except ImportError as exc:
+            # Surface the REAL missing module (e.g. a dependency stripped from a
+            # frozen build) instead of hiding it behind a generic message — the
+            # underlying ImportError names exactly what's absent.
             raise ImportError(
-                "multiview-stitcher is required for stitching. "
-                "Install with: pip install multiview-stitcher"
-            )
+                "multiview-stitcher (or one of its dependencies) failed to import. "
+                f"Underlying error: {exc}. "
+                "If running from source, install with: pip install multiview-stitcher"
+            ) from exc
 
         import dask.array as da
 
