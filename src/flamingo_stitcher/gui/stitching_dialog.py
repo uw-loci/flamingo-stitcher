@@ -274,6 +274,8 @@ class StitchingDialog(PersistentDialog):
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         self._setup_ui()
+        # Accept folders dropped anywhere on the dialog → add them to the queue.
+        self.setAcceptDrops(True)
         self._restore_settings()
         # Initial paint of the Native → Output voxel readout using whatever
         # restore left in the spins + combos.
@@ -302,6 +304,15 @@ class StitchingDialog(PersistentDialog):
         self._queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._queue_table.verticalHeader().setVisible(False)
         self._queue_table.setMaximumHeight(140)
+        # Right-click menu + double-click to re-queue a finished item, so the
+        # reset-to-Pending action is discoverable without hunting for the button.
+        self._queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._queue_table.customContextMenuRequested.connect(
+            self._on_queue_context_menu
+        )
+        self._queue_table.cellDoubleClicked.connect(
+            lambda _row, _col: self._requeue_selected()
+        )
         queue_layout.addWidget(self._queue_table)
 
         queue_btn_layout = QHBoxLayout()
@@ -317,6 +328,14 @@ class StitchingDialog(PersistentDialog):
         )
         self._add_folder_btn.clicked.connect(self._add_folder_to_queue)
         queue_btn_layout.addWidget(self._add_folder_btn)
+
+        self._requeue_btn = QPushButton("Re-queue")
+        self._requeue_btn.setToolTip(
+            "Reset the selected Done / Cancelled / Error items back to Pending\n"
+            "so they can be stitched again. This re-enables the Run button."
+        )
+        self._requeue_btn.clicked.connect(self._requeue_selected)
+        queue_btn_layout.addWidget(self._requeue_btn)
 
         self._remove_btn = QPushButton("Remove")
         self._remove_btn.setToolTip("Remove selected directories from the queue")
@@ -975,6 +994,96 @@ class StitchingDialog(PersistentDialog):
                     self._queue_index -= 1
         self._update_queue_table()
         self._update_action_buttons()
+
+    def _requeue_selected(self):
+        """Reset selected finished items (Done / Error / Cancelled) to Pending.
+
+        After a completed or cancelled run every item is in a terminal state, so
+        the Run button stays disabled (it needs at least one Pending item). This
+        flips the selected terminal items back to Pending — clearing any prior
+        error and keeping discovered tiles — so they can be stitched again and
+        the Run button re-enables. Items currently discovering/stitching are
+        left untouched.
+        """
+        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
+        if not rows:
+            return
+        n = 0
+        for row in rows:
+            if 0 <= row < len(self._queue):
+                item = self._queue[row]
+                if item["status"] in ("done", "error", "cancelled"):
+                    item["status"] = "pending"
+                    item["error"] = None
+                    n += 1
+        if n:
+            self._update_queue_table()
+            self._update_action_buttons()
+            self._log(f"Re-queued {n} item(s) to Pending — ready to run again.")
+
+    def _on_queue_context_menu(self, pos):
+        """Right-click menu on the queue table: re-queue or remove rows."""
+        from PyQt5.QtWidgets import QMenu
+
+        # Right-click doesn't change selection by default — if the clicked row
+        # isn't part of the current selection, select it so the action targets
+        # what the user clicked on.
+        index = self._queue_table.indexAt(pos)
+        if index.isValid() and index.row() not in {
+            i.row() for i in self._queue_table.selectedIndexes()
+        }:
+            self._queue_table.selectRow(index.row())
+
+        menu = QMenu(self)
+        act_requeue = menu.addAction("Re-queue (reset to Pending)")
+        act_remove = menu.addAction("Remove from queue")
+        chosen = menu.exec_(self._queue_table.viewport().mapToGlobal(pos))
+        if chosen == act_requeue:
+            self._requeue_selected()
+        elif chosen == act_remove:
+            self._remove_from_queue()
+
+    # --- Drag-and-drop of acquisition folders into the queue ---
+
+    @staticmethod
+    def _dropped_dirs(mime) -> list:
+        """Local directory paths from a drag-and-drop mime payload."""
+        if not mime.hasUrls():
+            return []
+        dirs = []
+        for url in mime.urls():
+            local = url.toLocalFile()
+            if local and Path(local).is_dir():
+                dirs.append(Path(local))
+        return dirs
+
+    def dragEnterEvent(self, event):
+        if self._dropped_dirs(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        if self._dropped_dirs(event.mimeData()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        dirs = self._dropped_dirs(event.mimeData())
+        if not dirs:
+            event.ignore()
+            return
+        before = len(self._queue)
+        for d in dirs:
+            self._add_path_to_queue(d)
+        added = len(self._queue) - before
+        event.acceptProposedAction()
+        if added:
+            self._log(
+                f"Added {added} folder(s) via drag-and-drop. "
+                f"Click Discover or Run."
+            )
 
     def _update_queue_table(self):
         """Refresh the queue table from self._queue."""
