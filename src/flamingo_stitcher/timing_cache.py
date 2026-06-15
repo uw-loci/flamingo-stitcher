@@ -83,6 +83,18 @@ class StitchingTimingKey:
     fusion_method: str  # "content_based" | "cosine"
     skip_registration: bool
     planes_per_tile: int
+    # Downsample factors strongly change fuse/write time, so they're part of
+    # the key — otherwise a full-res and a heavily-downsampled run would share
+    # (and average) one cached total. -1 = iso (auto). Default 1 keeps older
+    # call sites valid.
+    downsample_xy: int = 1
+    downsample_z: int = 1
+    # Source (read) and destination (write) drive roots, e.g. "H:" / "C:" on
+    # Windows. I/O speed dominates load + write, so bucketing by drive lets the
+    # cache learn per-drive throughput empirically. "" = unknown (POSIX / no
+    # drive letter) and just collapses to one bucket.
+    source_drive: str = ""
+    dest_drive: str = ""
 
     def serialize(self) -> str:
         return (
@@ -93,7 +105,11 @@ class StitchingTimingKey:
             f"fmt={self.output_format}|"
             f"fus={self.fusion_method}|"
             f"skipreg={int(self.skip_registration)}|"
-            f"pl={_bucket_planes(self.planes_per_tile)}"
+            f"pl={_bucket_planes(self.planes_per_tile)}|"
+            f"dxy={self.downsample_xy}|"
+            f"dz={self.downsample_z}|"
+            f"src={self.source_drive}|"
+            f"dst={self.dest_drive}"
         )
 
 

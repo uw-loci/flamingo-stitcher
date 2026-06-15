@@ -1506,11 +1506,17 @@ class StitchingDialog(PersistentDialog):
             from flamingo_stitcher.timing_cache import StitchingTimingCache
 
             config = self._build_config()
+            output_dir = self._output_dir_edit.text().strip() or None
             cache = StitchingTimingCache()
             total_s = 0.0
             measured = 0
             for it in items:
-                key = build_timing_key(it["tiles"], config)
+                key = build_timing_key(
+                    it["tiles"],
+                    config,
+                    acquisition_dir=it.get("path"),
+                    output_dir=output_dir,
+                )
                 cached = cache.get_total_s(key)
                 if cached:
                     total_s += cached

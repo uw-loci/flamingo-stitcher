@@ -139,12 +139,30 @@ _ROUGH_S_PER_TILE_CH = 4.0
 _ROUGH_S_PER_OUT_UNIT = 0.08
 
 
-def build_timing_key(tiles, config):
+def _drive_root(path) -> str:
+    """Stable drive identifier for a path, e.g. 'H:' on Windows, '' on POSIX.
+
+    Used to bucket timing-cache entries by source/destination drive so the
+    cache learns per-drive I/O speed. Falls back to the path anchor (mount
+    point) when there's no drive letter; uppercased for case-insensitive match.
+    """
+    if not path:
+        return ""
+    try:
+        p = Path(path)
+        return (p.drive or p.anchor or "").upper().rstrip("\\/")
+    except Exception:
+        return ""
+
+
+def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
     """Build the StitchingTimingKey for a set of tiles + config.
 
     Single source of truth for the cache key, shared by the live estimator
     (``_build_estimator``) and the GUI's pre-run queue-time estimate so both
-    look up the same cached totals.
+    look up the same cached totals. ``acquisition_dir`` / ``output_dir`` feed
+    the source/destination drive axes (so I/O speed is bucketed per drive);
+    when omitted, the source drive falls back to the first tile's folder.
     """
     from flamingo_stitcher.timing_cache import StitchingTimingKey
 
@@ -156,6 +174,10 @@ def build_timing_key(tiles, config):
         -1 if config.pyramid_levels is None else int(config.pyramid_levels)
     )
     fusion_method = "content_based" if config.content_based_fusion else "cosine"
+
+    src = acquisition_dir
+    if not src and tiles:
+        src = getattr(tiles[0], "folder", None)
     return StitchingTimingKey(
         n_tiles=n_tiles,
         n_channels=n_channels,
@@ -165,6 +187,10 @@ def build_timing_key(tiles, config):
         fusion_method=fusion_method,
         skip_registration=bool(config.skip_registration),
         planes_per_tile=planes,
+        downsample_xy=int(getattr(config, "downsample_xy", 1) or 1),
+        downsample_z=int(getattr(config, "downsample_z", 1) or 1),
+        source_drive=_drive_root(src),
+        dest_drive=_drive_root(output_dir),
     )
 
 
@@ -1483,7 +1509,7 @@ class StitchingPipeline:
                 msg = f"{msg}  —  {tail}"
         self._raw_progress_fn(pct, msg)
 
-    def _build_estimator(self, tiles):
+    def _build_estimator(self, tiles, acquisition_dir=None, output_dir=None):
         """Construct the multi-phase estimator from tiles + config.
 
         Imported lazily so the module is importable in environments
@@ -1494,7 +1520,9 @@ class StitchingPipeline:
         )
         from flamingo_stitcher.timing_cache import StitchingTimingCache
 
-        key = build_timing_key(tiles, self.config)
+        key = build_timing_key(
+            tiles, self.config, acquisition_dir=acquisition_dir, output_dir=output_dir
+        )
         self.logger.info(f"Stitching ETA key: {key.serialize()}")
         return MultiPhaseEstimator(StitchingTimingCache(), key)
 
@@ -1618,7 +1646,9 @@ class StitchingPipeline:
         # first emit went through; we'll start it here too once the
         # estimator exists, then transition on subsequent emits.
         try:
-            self._estimator = self._build_estimator(tiles)
+            self._estimator = self._build_estimator(
+                tiles, acquisition_dir=acquisition_dir, output_dir=output_path
+            )
             self._estimator.start_phase("discover")
         except Exception as e:
             self.logger.debug(f"ETA estimator unavailable: {e}")
