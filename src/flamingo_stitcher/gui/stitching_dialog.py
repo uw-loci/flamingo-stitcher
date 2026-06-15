@@ -424,6 +424,7 @@ class StitchingDialog(PersistentDialog):
             "  Z 5.0 \u00b5m  \u2192 XY 8x, Z 1x  (3.25 \u00d7 5.00 \u00b5m)"
         )
         ds_layout.addWidget(self._downsample_xy_combo)
+        ds_layout.addSpacing(16)  # visible gap between the XY group and Z group
         ds_layout.addWidget(QLabel("Z"))
         self._downsample_z_combo = QComboBox()
         for label, value in [("1x", 1), ("2x", 2), ("4x", 4)]:
@@ -433,6 +434,10 @@ class StitchingDialog(PersistentDialog):
             "Greys out when XY is set to 'iso' — iso overrides both."
         )
         ds_layout.addWidget(self._downsample_z_combo)
+        # Absorb leftover width on the right so each label hugs its own combo,
+        # instead of the (Expanding) combos stretching wide and opening big
+        # gaps between each label and its dropdown.
+        ds_layout.addStretch(1)
         # When XY=iso, Z is overridden by the iso-resolution algorithm at
         # run time, so grey out the Z combo as a visual cue.
         self._downsample_xy_combo.currentIndexChanged.connect(
