@@ -70,14 +70,20 @@ def main() -> int:
         WindowGeometryManager(str(cfg_dir / "window_geometry.json"))
     )
 
+    from flamingo_stitcher import __version__
+
     window = QMainWindow()
-    window.setWindowTitle("Flamingo Stitcher")
+    window.setWindowTitle(f"Flamingo Stitcher {__version__}")
     window.setWindowIcon(get_app_icon())
 
     tabs = QTabWidget()
     # The dialogs are QWidget subclasses, so they embed directly as tab pages.
     multi = StitchingDialog(parent=window)
     single = NativeStitchingDialog(parent=window)
+    # Standalone has no 3D Sample View, so hide the "Load … into Sample View"
+    # completion button (the load_stitched_requested signal has no receiver here).
+    multi.set_sample_view_available(False)
+    single.set_sample_view_available(False)
     tabs.addTab(multi, "Multi-Acquisition")
     tabs.addTab(single, "Single Workflow")
 

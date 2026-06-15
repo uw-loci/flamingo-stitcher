@@ -252,6 +252,13 @@ class StitchingDialog(PersistentDialog):
         self._logger = logging.getLogger(__name__)
         self._worker = None
 
+        # Whether a 3D "Sample View" exists to receive stitched output. True
+        # when embedded in the Py2Flamingo control app (which connects
+        # load_stitched_requested to its napari viewer); the standalone app
+        # sets this False via set_sample_view_available() since it has no
+        # viewer — so the "Load … into Sample View" completion button is hidden.
+        self._sample_view_available = True
+
         # Batch queue state
         self._queue = []  # List of dicts: {path, status, tiles, error, output_path}
         self._queue_index = -1  # Index of currently processing item
@@ -2039,14 +2046,19 @@ class StitchingDialog(PersistentDialog):
                 break
 
         if last_success_path:
-            load_btn = msg.addButton(
-                "Load Latest into Sample View", QMessageBox.AcceptRole
-            )
+            # "Load … into Sample View" only makes sense when there's a viewer
+            # to receive it (embedded in Py2Flamingo). In the standalone app
+            # there's no Sample View, so offer just "Open Output Folder".
+            load_btn = None
+            if self._sample_view_available:
+                load_btn = msg.addButton(
+                    "Load Latest into Sample View", QMessageBox.AcceptRole
+                )
             open_btn = msg.addButton("Open Output Folder", QMessageBox.ActionRole)
             msg.addButton(QMessageBox.Close)
             msg.exec_()
             clicked = msg.clickedButton()
-            if clicked == load_btn:
+            if load_btn is not None and clicked == load_btn:
                 self.load_stitched_requested.emit(last_success_path)
             elif clicked == open_btn:
                 import subprocess
@@ -2270,46 +2282,61 @@ class StitchingDialog(PersistentDialog):
                 if max_idx >= 0:
                     self._fusion_combo.setCurrentIndex(max_idx)
 
+    def set_sample_view_available(self, available: bool) -> None:
+        """Tell the dialog whether a 3D Sample View exists to receive output.
+
+        The standalone app calls this with False (it has no viewer), which
+        hides the "Load … into Sample View" button on the batch-complete
+        dialog. Embedded in Py2Flamingo it stays True (the default).
+        """
+        self._sample_view_available = bool(available)
+
+    # GitHub blob URL for the bundled troubleshooting doc — the always-works
+    # fallback when a local copy can't be found (and the most current source).
+    _TROUBLESHOOTING_URL = (
+        "https://github.com/uw-loci/flamingo-stitcher/blob/main/"
+        "src/flamingo_stitcher/docs/stitching_hardware_troubleshooting.md"
+    )
+
+    def _find_troubleshooting_doc(self) -> Optional[Path]:
+        """Locate the bundled troubleshooting doc, or None.
+
+        The doc is package data at ``flamingo_stitcher/docs/``. That path works
+        for source/pip runs directly, and for the frozen build via PyInstaller's
+        ``_MEIPASS`` unpack dir. Returns the first that exists.
+        """
+        import sys
+
+        here = Path(__file__).resolve()
+        candidates = [
+            # Bundled in the package: src/flamingo_stitcher/docs/...
+            here.parent.parent / "docs" / "stitching_hardware_troubleshooting.md",
+        ]
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            candidates.append(
+                Path(sys._MEIPASS)
+                / "flamingo_stitcher"
+                / "docs"
+                / "stitching_hardware_troubleshooting.md"
+            )
+        return next((p for p in candidates if p.exists()), None)
+
     def _on_open_help_doc(self):
         """Open the stitching hardware / troubleshooting doc.
 
-        Ships at ``docs/stitching_hardware_troubleshooting.md`` relative
-        to the repo root. Uses QDesktopServices so the user's default
-        markdown/text viewer handles it. If the file can't be located
-        (someone moved the repo, running from a pip install, etc.) we
-        show a QMessageBox with the expected location and a short
-        summary so they can still find it manually.
+        Opens a local bundled copy in the user's default markdown/text viewer
+        when one is present; otherwise falls back to opening the doc on GitHub
+        in the browser (always available, always current). No more dead-end
+        "couldn't be found" message.
         """
         from PyQt5.QtCore import QUrl
         from PyQt5.QtGui import QDesktopServices
 
-        # Walk up from this file to find the repo-root-ish
-        # `docs/stitching_hardware_troubleshooting.md`. The view lives
-        # at src/flamingo_stitcher/gui/, so the repo root is 3
-        # parents up.
-        here = Path(__file__).resolve()
-        candidates = [
-            here.parents[3] / "docs" / "stitching_hardware_troubleshooting.md",
-            here.parents[3] / "docs" / "stitching_hardware_troubleshooting.md",
-        ]
-        doc_path = next((p for p in candidates if p.exists()), None)
-
-        if doc_path is None:
-            QMessageBox.information(
-                self,
-                "Help & Troubleshooting",
-                "The troubleshooting doc should be at "
-                "<code>docs/stitching_hardware_troubleshooting.md</code> "
-                "under the repo root, but it couldn't be found from this "
-                "install.<br><br>"
-                "It covers: RAM / disk / drive-type requirements, a "
-                "diagnostic matrix for stuck or slow runs "
-                "(CPU % × Disk %), and a symptom → commit-fix index "
-                "for every OOM, hang, or checkbox-state bug we've seen.",
-            )
-            return
-
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(doc_path)))
+        doc_path = self._find_troubleshooting_doc()
+        if doc_path is not None:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(doc_path)))
+        else:
+            QDesktopServices.openUrl(QUrl(self._TROUBLESHOOTING_URL))
 
     def _on_setup_env(self):
         """Run the preprocessing environment setup script."""

@@ -80,7 +80,9 @@ for pkg in collect_pkgs:
         print(f"[spec] collect_all({pkg!r}) skipped: {exc}")
 
 # Bundle the vendored config YAMLs so config_loader finds them at runtime.
-datas += collect_data_files("flamingo_stitcher", includes=["configs/*.yaml"])
+datas += collect_data_files(
+    "flamingo_stitcher", includes=["configs/*.yaml", "docs/*.md"]
+)
 # App icon + preprocessing-env setup scripts.
 datas += [
     (os.path.join(ROOT, "src/flamingo_stitcher/gui/flamingo_icon.png"), "flamingo_stitcher/gui"),

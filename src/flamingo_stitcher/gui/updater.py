@@ -296,6 +296,29 @@ class UpdatePanel(QWidget):
         )
         layout.addWidget(self.chk_auto)
 
+        layout.addSpacing(14)
+        links_title = QLabel("Help &amp; links")
+        lf = QFont(links_title.font())
+        lf.setPointSize(lf.pointSize() + 2)
+        lf.setBold(True)
+        links_title.setFont(lf)
+        layout.addWidget(links_title)
+
+        repo = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+        links = QLabel(
+            f"&bull; <a href='{repo}#readme' style='color:{_C_ACCENT};'>README &amp; usage guide</a><br>"
+            f"&bull; <a href='{repo}/blob/main/src/flamingo_stitcher/docs/"
+            f"stitching_hardware_troubleshooting.md' style='color:{_C_ACCENT};'>"
+            f"Hardware &amp; troubleshooting guide</a><br>"
+            f"&bull; <a href='{repo}/issues/new' style='color:{_C_ACCENT};'>Report an issue</a> "
+            f"<span style='color:{_C_MUTED};'>(GitHub account required)</span><br>"
+            f"&bull; <a href='{repo}' style='color:{_C_ACCENT};'>Project on GitHub</a>"
+        )
+        links.setOpenExternalLinks(True)
+        links.setTextInteractionFlags(Qt.TextBrowserInteraction)
+        links.setWordWrap(True)
+        layout.addWidget(links)
+
         layout.addStretch(1)
 
     def _open_releases_page(self) -> None:
