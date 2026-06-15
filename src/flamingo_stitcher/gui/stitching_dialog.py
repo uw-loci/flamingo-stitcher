@@ -571,6 +571,18 @@ class StitchingDialog(PersistentDialog):
         self._memory_label.setStyleSheet("font-size: 11px;")
         settings_layout.addWidget(self._memory_label, 4, 0, 1, 5)
 
+        # Row 5: rough queue-time estimate (sum across pending queue items).
+        self._time_label = QLabel("")
+        self._time_label.setTextFormat(Qt.RichText)
+        self._time_label.setStyleSheet("font-size: 11px;")
+        self._time_label.setToolTip(
+            "Approximate total wall time to stitch the Pending items in the "
+            "queue.\nUses measured times from previous runs of similar settings "
+            "when available;\notherwise a rough guess. Accuracy improves as you "
+            "run more acquisitions."
+        )
+        settings_layout.addWidget(self._time_label, 5, 0, 1, 5)
+
         # Live "Output voxel" readout showing how Pixel size, Z step, and
         # the two downsample combos combine. Updated whenever any of those
         # four inputs change so the relationship is always visible.
@@ -582,7 +594,7 @@ class StitchingDialog(PersistentDialog):
             "chosen downsample factors. For 'iso', the factors are\n"
             "resolved from the native voxel and shown in parentheses."
         )
-        settings_layout.addWidget(self._voxel_readout_label, 5, 0, 1, 5)
+        settings_layout.addWidget(self._voxel_readout_label, 6, 0, 1, 5)
         self._pixel_size_spin.valueChanged.connect(self._update_voxel_readout)
         self._z_step_spin.valueChanged.connect(self._update_voxel_readout)
         self._downsample_xy_combo.currentIndexChanged.connect(
@@ -1111,6 +1123,10 @@ class StitchingDialog(PersistentDialog):
                 path_item.setToolTip(f"Error: {item['error']}")
             self._queue_table.setItem(i, 1, path_item)
 
+        # Status changes (item started/finished, re-queue) shift what's still
+        # Pending, so refresh the remaining-queue time estimate.
+        self._update_time_estimate()
+
     def _update_action_buttons(self):
         """Update Discover/Run button states based on queue."""
         has_pending = any(item["status"] == "pending" for item in self._queue)
@@ -1460,6 +1476,62 @@ class StitchingDialog(PersistentDialog):
             self._memory_label.setText("")
             self._last_mem_estimate = None
             self._update_memory_indicator()
+        # Time estimate shares the same triggers (config + discovery changes).
+        self._update_time_estimate()
+
+    def _update_time_estimate(self):
+        """Show a rough total wall-time estimate for the Pending queue items.
+
+        Sums per-acquisition estimates: a measured total from the timing cache
+        when a similar config has run before, otherwise a clearly-labelled rough
+        guess. Excludes already-Done/Cancelled items, so during a run it reflects
+        the remaining queue. Best-effort — never raises into the UI.
+        """
+        if not hasattr(self, "_time_label"):
+            return
+        items = [
+            it
+            for it in self._queue
+            if it.get("tiles") and it.get("status") == "pending"
+        ]
+        if not items:
+            self._time_label.setText("")
+            return
+        try:
+            from flamingo_stitcher.multi_phase_estimator import _format_duration
+            from flamingo_stitcher.pipeline import (
+                build_timing_key,
+                rough_run_seconds,
+            )
+            from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+            config = self._build_config()
+            cache = StitchingTimingCache()
+            total_s = 0.0
+            measured = 0
+            for it in items:
+                key = build_timing_key(it["tiles"], config)
+                cached = cache.get_total_s(key)
+                if cached:
+                    total_s += cached
+                    measured += 1
+                else:
+                    total_s += rough_run_seconds(it["tiles"], config)
+
+            n = len(items)
+            if measured == n:
+                note = f"from timings of {n} similar run{'s' if n != 1 else ''}"
+            elif measured == 0:
+                note = "rough guess — no timing history yet"
+            else:
+                note = f"{measured}/{n} measured, rest estimated"
+            self._time_label.setText(
+                f"Estimated queue time: <b>~{_format_duration(total_s)}</b> "
+                f"<span style='color:#888;'>({note})</span>"
+            )
+        except Exception as e:
+            self._logger.debug(f"Time estimate failed: {e}")
+            self._time_label.setText("")
 
     def _update_memory_indicator(self, _index=None):
         """Update the memory safety indicator next to the Memory Mode combo.

@@ -127,6 +127,67 @@ try:
 except Exception:
     _DASK_PROCESSING_CHUNKS = (64, 512, 512)
 
+
+# Rough cold-start time-estimate constants (seconds). Only used when the timing
+# cache has no measured total for a config — deliberately approximate (the user
+# is told it's a guess) and superseded by real timings as runs accumulate.
+#   _ROUGH_S_PER_TILE_CH : load + preprocess + registration share, per tile per
+#                          channel (weakly plane-dependent, folded into below).
+#   _ROUGH_S_PER_OUT_UNIT: fuse + write, per (tile × plane × channel) of OUTPUT
+#                          voxels, i.e. after XY/Z downsampling.
+_ROUGH_S_PER_TILE_CH = 4.0
+_ROUGH_S_PER_OUT_UNIT = 0.08
+
+
+def build_timing_key(tiles, config):
+    """Build the StitchingTimingKey for a set of tiles + config.
+
+    Single source of truth for the cache key, shared by the live estimator
+    (``_build_estimator``) and the GUI's pre-run queue-time estimate so both
+    look up the same cached totals.
+    """
+    from flamingo_stitcher.timing_cache import StitchingTimingKey
+
+    n_tiles = len(tiles)
+    n_channels = len(sorted({ch for t in tiles for ch in t.channels}))
+    planes = max((t.n_planes for t in tiles), default=1)
+    # pyramid_levels: None means auto — bucket "auto" (-1) separately from 0/N.
+    pyramid_levels = (
+        -1 if config.pyramid_levels is None else int(config.pyramid_levels)
+    )
+    fusion_method = "content_based" if config.content_based_fusion else "cosine"
+    return StitchingTimingKey(
+        n_tiles=n_tiles,
+        n_channels=n_channels,
+        n_pyramid_levels=pyramid_levels,
+        n_timepoints=1,  # multi-timepoint not yet a config axis
+        output_format=config.output_format,
+        fusion_method=fusion_method,
+        skip_registration=bool(config.skip_registration),
+        planes_per_tile=planes,
+    )
+
+
+def rough_run_seconds(tiles, config) -> float:
+    """Very rough cold-start wall-time estimate (seconds) for one acquisition.
+
+    Used only when the timing cache has no measured total for this config.
+    Order-of-magnitude at best — two terms: a per-tile-per-channel cost
+    (load + preprocess + registration) plus a per-output-voxel cost (fuse +
+    write) that shrinks with XY/Z downsampling. Real measured timings replace
+    this for any config that has run before.
+    """
+    n_tiles = len(tiles)
+    n_channels = max(1, len(sorted({ch for t in tiles for ch in t.channels})))
+    planes = max((t.n_planes for t in tiles), default=1)
+    ds_xy = max(1, getattr(config, "downsample_xy", 1) or 1)
+    ds_z = max(1, getattr(config, "downsample_z", 1) or 1)
+
+    load_register = _ROUGH_S_PER_TILE_CH * n_tiles * n_channels
+    out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
+    fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
+    return load_register + fuse_write
+
 # Raw filename pattern: S000_t000000_V000_R0000_X000_Y000_C{ch}_I{illum}_D{det}_P{planes}.raw
 RAW_FILE_PATTERN = re.compile(
     r"S\d+_t\d+_V\d+_R\d+_X\d+_Y\d+_C(\d+)_I(\d+)_D(\d+)_P(\d+)\.raw$"
@@ -1431,34 +1492,9 @@ class StitchingPipeline:
         from flamingo_stitcher.multi_phase_estimator import (
             MultiPhaseEstimator,
         )
-        from flamingo_stitcher.timing_cache import (
-            StitchingTimingCache,
-            StitchingTimingKey,
-        )
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
 
-        n_tiles = len(tiles)
-        n_channels = len(sorted({ch for t in tiles for ch in t.channels}))
-        planes = max((t.n_planes for t in tiles), default=1)
-        # pyramid_levels: None means auto -- we still want a stable key,
-        # so we bucket "auto" separately from explicit 0/N.
-        pyramid_levels = (
-            -1
-            if self.config.pyramid_levels is None
-            else int(self.config.pyramid_levels)
-        )
-        fusion_method = (
-            "content_based" if self.config.content_based_fusion else "cosine"
-        )
-        key = StitchingTimingKey(
-            n_tiles=n_tiles,
-            n_channels=n_channels,
-            n_pyramid_levels=pyramid_levels,
-            n_timepoints=1,  # multi-timepoint not yet a config axis
-            output_format=self.config.output_format,
-            fusion_method=fusion_method,
-            skip_registration=bool(self.config.skip_registration),
-            planes_per_tile=planes,
-        )
+        key = build_timing_key(tiles, self.config)
         self.logger.info(f"Stitching ETA key: {key.serialize()}")
         return MultiPhaseEstimator(StitchingTimingCache(), key)
 
