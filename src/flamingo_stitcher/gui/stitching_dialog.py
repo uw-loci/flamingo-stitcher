@@ -827,7 +827,8 @@ class StitchingDialog(PersistentDialog):
         self._setup_env_btn.setToolTip(
             "Install isolated environment for flat-field correction\n"
             "and Leonardo dual-illumination fusion.\n\n"
-            "Downloads ~3 GB (torch, basicpy, leonardo-toolset).\n"
+            "Downloads ~6 GB GPU / ~3 GB CPU (torch+jax, basicpy,\n"
+            "leonardo-toolset). GPU default — Leonardo needs it.\n"
             "Only needed once."
         )
         self._setup_env_btn.clicked.connect(self._on_setup_env)
@@ -2571,10 +2572,11 @@ class StitchingDialog(PersistentDialog):
         reply = QMessageBox.question(
             self,
             "Setup Preprocessing Environment",
-            "This will download and install ~3 GB of packages:\n"
-            "  - PyTorch (CPU)\n"
+            "This will download and install ~6 GB (GPU) of packages:\n"
+            "  - PyTorch + JAX (CUDA GPU by default; Leonardo needs a GPU)\n"
             "  - basicpy (flat-field correction)\n"
             "  - leonardo-toolset (dual-illumination fusion)\n\n"
+            "For a CPU-only machine, set FLAMINGO_PREPROC_DEVICE=cpu first.\n"
             "This only needs to be done once. Continue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
