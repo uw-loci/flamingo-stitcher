@@ -419,6 +419,12 @@ class StitchingConfig:
     pixel_size_um: float = 0.406  # XY pixel size in micrometers
     # Z step: computed from data if None, otherwise override
     z_step_um: Optional[float] = None
+    # Raw frame (camera AOI) override in pixels. None = auto-detect per
+    # acquisition from Workflow.txt `AOI width`/`AOI height`, cross-checked
+    # against the actual file size. Set both to force a frame size (e.g. when
+    # metadata is missing or wrong).
+    frame_width: Optional[int] = None
+    frame_height: Optional[int] = None
 
     # Registration
     skip_registration: bool = False  # Use stage positions only (no phase correlation)
@@ -649,6 +655,7 @@ def estimate_memory_usage(
     n_planes = max(t.n_planes for t in tiles)
     ds_xy = config.downsample_xy
     ds_z = config.downsample_z
+    frame_w, frame_h = _resolve_frame_size(tiles, config)
 
     # Estimate output spatial extent from tile positions
     x_vals = [t.x_mm for t in tiles]
@@ -657,7 +664,7 @@ def estimate_memory_usage(
     y_range_mm = max(y_vals) - min(y_vals) if len(y_vals) > 1 else 0
 
     # FOV per tile in mm (approx: pixel_size * frame_width)
-    fov_mm = config.pixel_size_um * FRAME_WIDTH / 1000.0
+    fov_mm = config.pixel_size_um * frame_w / 1000.0
 
     # Output dimensions in pixels (downsampled)
     out_x_px = int((x_range_mm + fov_mm) / config.pixel_size_um * 1000.0) // ds_xy
@@ -695,7 +702,7 @@ def estimate_memory_usage(
     # Tile data (preprocessed volumes) persists throughout the pipeline.
     # On top of that, the stacked output array is built, then pyramids are
     # generated during write.
-    tile_gb = n_planes * FRAME_WIDTH * FRAME_HEIGHT * bpv / (1024**3)
+    tile_gb = n_planes * frame_w * frame_h * bpv / (1024**3)
     per_channel_gb = output_gb / max(n_channels, 1)
     pyramid_overhead_gb = output_gb * 0.33
     compute_overhead_gb = per_channel_gb + tile_gb * 2  # dask working set
@@ -703,8 +710,8 @@ def estimate_memory_usage(
     # Tile data footprint
     ds_any = ds_xy > 1 or ds_z > 1
     ds_tile_planes = n_planes // ds_z if ds_z > 1 else n_planes
-    ds_tile_w = FRAME_WIDTH // ds_xy if ds_xy > 1 else FRAME_WIDTH
-    ds_tile_h = FRAME_HEIGHT // ds_xy if ds_xy > 1 else FRAME_HEIGHT
+    ds_tile_w = frame_w // ds_xy if ds_xy > 1 else frame_w
+    ds_tile_h = frame_h // ds_xy if ds_xy > 1 else frame_h
     n_tiles = len(tiles)
     if ds_any:
         tile_data_gb = (
@@ -784,12 +791,197 @@ class RawTileInfo:
     raw_files: Dict[int, Dict[int, Path]] = field(default_factory=dict)
     channels: List[int] = field(default_factory=list)
     illumination_sides: List[int] = field(default_factory=list)
+    # Raw frame (camera AOI) dimensions in pixels. Resolved per-acquisition
+    # from the Workflow.txt `AOI width`/`AOI height`, cross-checked against the
+    # actual on-disk file size (the file always wins — see _resolve_tile_frame_dims).
+    # Defaulting to the module FRAME_WIDTH/HEIGHT keeps older call sites valid.
+    frame_width: int = FRAME_WIDTH
+    frame_height: int = FRAME_HEIGHT
 
     @property
     def z_step_mm(self) -> float:
         if self.n_planes <= 1:
             return 0.0
         return (self.z_max_mm - self.z_min_mm) / (self.n_planes - 1)
+
+
+# ---------------------------------------------------------------------------
+# Frame (camera AOI) size resolution
+# ---------------------------------------------------------------------------
+def _read_aoi_from_workflow(workflow_file: Path) -> Optional[Tuple[int, int]]:
+    """Read `AOI width`/`AOI height` (camera sensor crop) from a Workflow.txt.
+
+    Returns (width, height) in pixels, or None if the file/fields are absent.
+    """
+    try:
+        if not workflow_file.exists():
+            return None
+        content = workflow_file.read_text(errors="replace")
+    except OSError:
+        return None
+    w = re.search(r"AOI width\s*=\s*(\d+)", content)
+    h = re.search(r"AOI height\s*=\s*(\d+)", content)
+    if w and h:
+        return (int(w.group(1)), int(h.group(1)))
+    return None
+
+
+def _resolve_tile_frame_dims(
+    raw_file: Path, n_planes: int, aoi: Optional[Tuple[int, int]]
+) -> Tuple[int, int]:
+    """Determine the (width, height) of the raw frames for one tile.
+
+    The on-disk file size is the ground truth: ``bytes / (n_planes * 2)`` is the
+    exact pixel count per plane (uint16). The AOI metadata only disambiguates
+    non-square frames. This catches the case where the camera AOI was cropped
+    (e.g. 1024×1024) but the metadata or a stale hardware config still says
+    2048×2048 — the data wins, so cropped acquisitions load correctly.
+    """
+    import math
+
+    fallback = aoi or (FRAME_WIDTH, FRAME_HEIGHT)
+    try:
+        nbytes = raw_file.stat().st_size
+    except OSError:
+        return fallback
+    if n_planes <= 0 or nbytes <= 0:
+        return fallback
+
+    px_per_plane = nbytes // (n_planes * 2)
+    # If the AOI metadata reproduces the file size exactly, trust it (handles
+    # non-square frames that the square-inference branch below cannot).
+    if aoi and aoi[0] * aoi[1] == px_per_plane:
+        return aoi
+
+    # Flamingo AOIs are square; infer the side from the file.
+    side = math.isqrt(px_per_plane)
+    if side > 0 and side * side == px_per_plane:
+        if aoi and (aoi[0], aoi[1]) != (side, side):
+            logger.warning(
+                f"{raw_file.name}: AOI metadata {aoi[0]}×{aoi[1]} disagrees with "
+                f"file size ({side}×{side} for {n_planes} planes) — using "
+                f"file-derived {side}×{side}."
+            )
+        return (side, side)
+
+    logger.warning(
+        f"{raw_file.name}: cannot derive a square frame size from "
+        f"{nbytes} bytes / {n_planes} planes; using {fallback[0]}×{fallback[1]}."
+    )
+    return fallback
+
+
+def _resolve_frame_size(
+    tiles: List["RawTileInfo"], config: Optional["StitchingConfig"] = None
+) -> Tuple[int, int]:
+    """Frame (AOI) width/height to use for geometry and memory math.
+
+    Precedence: explicit config override → first tile's resolved dims →
+    module default.
+    """
+    if config is not None:
+        cw = getattr(config, "frame_width", None)
+        ch = getattr(config, "frame_height", None)
+        if cw and ch:
+            return int(cw), int(ch)
+    for t in tiles or []:
+        if getattr(t, "frame_width", None) and getattr(t, "frame_height", None):
+            return int(t.frame_width), int(t.frame_height)
+    return FRAME_WIDTH, FRAME_HEIGHT
+
+
+# ---------------------------------------------------------------------------
+# Optics / acquisition-flag parsing (objective, capture mode, angles)
+# ---------------------------------------------------------------------------
+def _sensor_pixel_size_um() -> float:
+    """Physical camera sensor pixel pitch in µm (objective-independent)."""
+    try:
+        from flamingo_stitcher.config_loader import get_hardware_config
+
+        return float(get_hardware_config().sensor_pixel_size_um)
+    except Exception:
+        return 6.5
+
+
+def _find_acquisition_file(acquisition_dir: Path, name: str) -> Optional[Path]:
+    """Locate a metadata file (e.g. ScopeSettings.txt / Workflow.txt) near an
+    acquisition, searching the dir, its parent, and one level of children."""
+    acq = Path(acquisition_dir)
+    candidates = [acq / name, acq.parent / name]
+    try:
+        for child in sorted(acq.iterdir()):
+            if child.is_dir():
+                candidates.append(child / name)
+    except OSError:
+        pass
+    for c in candidates:
+        try:
+            if c.is_file():
+                return c
+        except OSError:
+            continue
+    return None
+
+
+def read_objective_magnification(acquisition_dir: Path) -> Optional[float]:
+    """Read `Objective lens magnification` from the acquisition's ScopeSettings.txt.
+
+    This is the system magnification the microscope recorded at capture time, so
+    it tracks objective swaps that the static hardware config does not.
+    """
+    f = _find_acquisition_file(acquisition_dir, "ScopeSettings.txt")
+    if f is None:
+        return None
+    try:
+        content = f.read_text(errors="replace")
+    except OSError:
+        return None
+    m = re.search(r"Objective lens magnification\s*=\s*([\d.]+)", content)
+    if m:
+        try:
+            mag = float(m.group(1))
+            return mag if mag > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def suggested_pixel_size_um(acquisition_dir: Path) -> Optional[float]:
+    """Effective XY pixel size implied by the acquisition's ScopeSettings.txt.
+
+    pixel = sensor_pixel_size / objective_magnification. Returns None when the
+    file or field is absent.
+    """
+    mag = read_objective_magnification(acquisition_dir)
+    if not mag:
+        return None
+    return _sensor_pixel_size_um() / mag
+
+
+def _read_capture_and_angles(workflow_file: Optional[Path]) -> Dict[str, object]:
+    """Read partial-capture and multi-angle flags from a Workflow.txt.
+
+    Returns a dict with `capture_modes` (list of int per camera),
+    `capture_percents` (list of int), and `n_angles` (int).
+    """
+    out: Dict[str, object] = {"capture_modes": [], "capture_percents": [], "n_angles": 1}
+    if workflow_file is None or not workflow_file.exists():
+        return out
+    try:
+        content = workflow_file.read_text(errors="replace")
+    except OSError:
+        return out
+    modes = [int(m) for m in re.findall(r"Camera \d+ capture mode[^=]*=\s*(\d+)", content)]
+    pcts = [int(p) for p in re.findall(r"Camera \d+ capture percentage\s*=\s*(\d+)", content)]
+    out["capture_modes"] = modes
+    out["capture_percents"] = pcts
+    na = re.search(r"Number of angles\s*=\s*(\d+)", content)
+    if na:
+        try:
+            out["n_angles"] = max(1, int(na.group(1)))
+        except ValueError:
+            pass
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -874,6 +1066,12 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
         logger.warning(f"No .raw files in {folder.name}")
         return None
 
+    # Resolve the raw frame (AOI) size: prefer Workflow.txt metadata, but let
+    # the actual file size override it (handles cropped-AOI acquisitions).
+    aoi = _read_aoi_from_workflow(folder / "Workflow.txt")
+    _sample = next(iter(next(iter(raw_files.values())).values()))
+    frame_w, frame_h = _resolve_tile_frame_dims(_sample, n_planes, aoi)
+
     return RawTileInfo(
         folder=folder,
         x_mm=x_mm,
@@ -884,6 +1082,8 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
         raw_files=raw_files,
         channels=sorted(channels),
         illumination_sides=sorted(illum_sides),
+        frame_width=frame_w,
+        frame_height=frame_h,
     )
 
 
@@ -1003,6 +1203,14 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
     if not root_wf.exists():
         root_wf = raw_dir / "Workflow.txt"
 
+    # Grid extent for the position fallback, derived from the discovered tile
+    # indices themselves rather than an ambiguous Workflow.txt field.
+    n_tiles_x = max(x for x, _ in tile_groups) + 1
+    n_tiles_y = max(y for _, y in tile_groups) + 1
+
+    # AOI metadata is shared across the flat acquisition (one camera setting).
+    flat_aoi = _read_aoi_from_workflow(root_wf)
+
     tiles = []
     for (x_idx, y_idx), files in sorted(tile_groups.items()):
         # Find a _Settings.txt companion (from first raw file in group)
@@ -1018,7 +1226,9 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
             pos = _read_position_from_settings(settings_file)
         elif root_wf.exists():
             # Fallback: compute from root Workflow.txt grid
-            pos = _compute_grid_position(root_wf, x_idx, y_idx)
+            pos = _compute_grid_position(
+                root_wf, x_idx, y_idx, n_tiles_x, n_tiles_y
+            )
         else:
             logger.warning(
                 f"No _Settings.txt or Workflow.txt for tile X{x_idx}_Y{y_idx}, "
@@ -1050,6 +1260,9 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
         if not raw_files_dict:
             continue
 
+        _sample = next(iter(next(iter(raw_files_dict.values())).values()))
+        frame_w, frame_h = _resolve_tile_frame_dims(_sample, n_planes, flat_aoi)
+
         tiles.append(
             RawTileInfo(
                 folder=raw_dir,
@@ -1061,6 +1274,8 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                 raw_files=raw_files_dict,
                 channels=sorted(channels),
                 illumination_sides=sorted(illum_sides),
+                frame_width=frame_w,
+                frame_height=frame_h,
             )
         )
 
@@ -1070,12 +1285,18 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
 
 
 def _compute_grid_position(
-    workflow_file: Path, x_idx: int, y_idx: int
+    workflow_file: Path,
+    x_idx: int,
+    y_idx: int,
+    n_tiles_x: int = 1,
+    n_tiles_y: int = 1,
 ) -> Dict[str, float]:
     """Compute tile position from root Workflow.txt grid parameters.
 
-    Uses Start/End Position and Overlap % to compute the position of
-    tile (x_idx, y_idx) in the grid.
+    Uses Start/End Position to interpolate the position of tile
+    (x_idx, y_idx) in an ``n_tiles_x`` × ``n_tiles_y`` grid. The grid extent
+    is passed in (derived from the discovered tile indices) rather than parsed
+    from an ambiguous Workflow.txt field.
     """
     content = workflow_file.read_text(errors="replace")
 
@@ -1106,15 +1327,9 @@ def _compute_grid_position(
     if ey:
         end_y = float(ey.group(1))
 
-    # Read number of tiles in each direction
-    n_tiles_x = 1
-    n_tiles_y = 1
-    ntx = re.search(r"Number of tiles X\s*=\s*(\d+)", content)
-    if ntx:
-        n_tiles_x = max(1, int(ntx.group(1)))
-    nty = re.search(r"Number of tiles Y\s*=\s*(\d+)", content)
-    if nty:
-        n_tiles_y = max(1, int(nty.group(1)))
+    # Grid extent comes from the caller (derived from discovered tile indices).
+    n_tiles_x = max(1, int(n_tiles_x))
+    n_tiles_y = max(1, int(n_tiles_y))
 
     # Compute step per tile
     step_x = (end_x - start_x) / max(1, n_tiles_x - 1) if n_tiles_x > 1 else 0.0
@@ -1131,25 +1346,35 @@ def _compute_grid_position(
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_raw_volume(path: Path, n_planes: int) -> np.ndarray:
+def load_raw_volume(
+    path: Path,
+    n_planes: int,
+    frame_width: int = FRAME_WIDTH,
+    frame_height: int = FRAME_HEIGHT,
+) -> np.ndarray:
     """Memory-map a raw uint16 file as (Z, Y, X) array.
 
-    Does NOT load data into RAM — returns a read-only memmap.
+    Does NOT load data into RAM — returns a read-only memmap. ``frame_width``/
+    ``frame_height`` are the camera AOI dimensions for this acquisition; pass
+    the per-tile resolved values so cropped-AOI data is not misread as a
+    truncated full-frame stack.
     """
-    expected_bytes = n_planes * FRAME_HEIGHT * FRAME_WIDTH * 2
+    plane_bytes = frame_height * frame_width * 2
+    expected_bytes = n_planes * plane_bytes
     actual_bytes = path.stat().st_size
 
     if actual_bytes != expected_bytes:
-        # Recompute planes from actual file size
-        actual_planes = actual_bytes // (FRAME_HEIGHT * FRAME_WIDTH * 2)
+        # Recompute planes from actual file size (frame size is authoritative)
+        actual_planes = actual_bytes // plane_bytes
         logger.warning(
-            f"{path.name}: expected {n_planes} planes ({expected_bytes} bytes), "
+            f"{path.name}: expected {n_planes} planes "
+            f"({expected_bytes} bytes @ {frame_width}×{frame_height}), "
             f"got {actual_bytes} bytes → using {actual_planes} planes"
         )
         n_planes = actual_planes
 
     return np.memmap(
-        path, dtype=np.uint16, mode="r", shape=(n_planes, FRAME_HEIGHT, FRAME_WIDTH)
+        path, dtype=np.uint16, mode="r", shape=(n_planes, frame_height, frame_width)
     )
 
 
@@ -1639,6 +1864,9 @@ class StitchingPipeline:
             raise FileNotFoundError(f"No tile folders found in {acquisition_dir}")
 
         self._log_tile_summary(tiles)
+
+        # --- Resolve / verify acquisition geometry (frame size, optics, flags) ---
+        self._apply_and_log_geometry(tiles, acquisition_dir)
 
         # --- Build the multi-phase ETA estimator ---
         # Built after discover so we know tile count + planes. The
@@ -2517,7 +2745,9 @@ class StitchingPipeline:
                 # Load each illumination side
                 illum_volumes = {}
                 for illum_side, raw_path in illum_files.items():
-                    vol = load_raw_volume(raw_path, tile.n_planes)
+                    vol = load_raw_volume(
+                    raw_path, tile.n_planes, tile.frame_width, tile.frame_height
+                )
                     illum_volumes[illum_side] = vol
 
                 # Fuse illumination sides
@@ -3726,6 +3956,88 @@ class StitchingPipeline:
                 msg += f"  [warning: {missing} files could not be stat'd]"
             self.logger.info(msg)
 
+    def _apply_and_log_geometry(
+        self, tiles: List[RawTileInfo], acquisition_dir: Path
+    ) -> None:
+        """Resolve frame size, verify pixel size against the objective, and warn
+        about partial-capture / multi-angle acquisitions.
+
+        Runs once at the start of run(), after tiles are known. Mutates tile
+        frame dims only when the user forced an override in the config.
+        """
+        # 1) Frame size (camera AOI). A manual config override wins over the
+        #    auto-detected per-tile dims (which already prefer the file size).
+        if self.config.frame_width and self.config.frame_height:
+            for t in tiles:
+                t.frame_width = int(self.config.frame_width)
+                t.frame_height = int(self.config.frame_height)
+            self.logger.info(
+                f"Frame size (AOI): {self.config.frame_width}×"
+                f"{self.config.frame_height} px (manual override)"
+            )
+        else:
+            fw, fh = _resolve_frame_size(tiles)
+            distinct = sorted({(t.frame_width, t.frame_height) for t in tiles})
+            if len(distinct) > 1:
+                self.logger.warning(
+                    f"Frame size (AOI): tiles disagree {distinct}; using {fw}×{fh}. "
+                    f"Check for mixed acquisitions."
+                )
+            else:
+                self.logger.info(f"Frame size (AOI): {fw}×{fh} px (from data)")
+            if (fw, fh) != (FRAME_WIDTH, FRAME_HEIGHT):
+                self.logger.info(
+                    f"  (differs from hardware-config default "
+                    f"{FRAME_WIDTH}×{FRAME_HEIGHT} — cropped/binned acquisition)"
+                )
+
+        # 2) Pixel size sanity-check against the recorded objective.
+        try:
+            mag = read_objective_magnification(acquisition_dir)
+            suggested = suggested_pixel_size_um(acquisition_dir)
+            if mag and suggested:
+                self.logger.info(
+                    f"Objective (ScopeSettings.txt): {mag:.3f}× → effective pixel "
+                    f"~{suggested:.3f} µm (sensor {_sensor_pixel_size_um():.2f} µm)"
+                )
+                cur = self.config.pixel_size_um
+                if cur > 0 and abs(cur - suggested) / suggested > 0.15:
+                    self.logger.warning(
+                        f"Configured XY pixel size {cur:.3f} µm differs from the "
+                        f"objective-derived ~{suggested:.3f} µm by "
+                        f"{abs(cur - suggested) / suggested * 100:.0f}%. If the "
+                        f"objective changed, tiles will be placed by stage spacing "
+                        f"but rendered at the wrong scale (gaps/overlap). Verify the "
+                        f"XY pixel size. [Note: a stale value may reflect the known "
+                        f"nominal-vs-system magnification ambiguity.]"
+                    )
+        except Exception as e:  # never let diagnostics break a run
+            self.logger.debug(f"Objective/pixel-size check skipped: {e}")
+
+        # 3) Partial-capture & multi-angle flags.
+        try:
+            wf = acquisition_dir / "Workflow.txt"
+            if not wf.exists():
+                wf = tiles[0].folder / "Workflow.txt"
+            flags = _read_capture_and_angles(wf if wf.exists() else None)
+            modes = flags.get("capture_modes") or []
+            pcts = flags.get("capture_percents") or []
+            if any(m not in (0, 3) for m in modes) or any(p < 100 for p in pcts):
+                self.logger.warning(
+                    f"Partial Z-capture detected (capture modes={modes}, "
+                    f"percentages={pcts}). Saved planes are a sub-range of the full "
+                    f"stack; 'from back' (mode 2) captures shift the Z origin. Tiles "
+                    f"are placed from the Start-Position Z, so verify Z alignment."
+                )
+            if int(flags.get("n_angles", 1) or 1) > 1:
+                self.logger.warning(
+                    f"Multi-angle acquisition (Number of angles="
+                    f"{flags.get('n_angles')}). This stitcher fuses a single angle "
+                    f"only — rotation between angles is not applied."
+                )
+        except Exception as e:
+            self.logger.debug(f"Capture/angle check skipped: {e}")
+
     def _log_preflight(
         self,
         tiles: List[RawTileInfo],
@@ -3826,10 +4138,11 @@ class StitchingPipeline:
         ds_xy = max(self.config.downsample_xy, 1)
         ds_z = max(self.config.downsample_z, 1)
         n_planes = max(t.n_planes for t in tiles)
+        frame_w, frame_h = _resolve_frame_size(tiles, self.config)
         tile_bytes = (
             (n_planes // ds_z if ds_z > 1 else n_planes)
-            * (FRAME_WIDTH // ds_xy if ds_xy > 1 else FRAME_WIDTH)
-            * (FRAME_HEIGHT // ds_xy if ds_xy > 1 else FRAME_HEIGHT)
+            * (frame_w // ds_xy if ds_xy > 1 else frame_w)
+            * (frame_h // ds_xy if ds_xy > 1 else frame_h)
             * bpv
         )
         # Streaming spills one channel of tiles at a time, then fuses

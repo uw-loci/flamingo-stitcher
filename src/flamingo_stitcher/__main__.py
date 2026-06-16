@@ -56,14 +56,28 @@ def main():
     voxel_group.add_argument(
         "--pixel-size-um",
         type=float,
-        default=0.406,
-        help="XY pixel size in micrometers (default: 0.406)",
+        default=None,
+        help="XY pixel size in micrometers (default: derived from the "
+        "objective in ScopeSettings.txt, else 0.406)",
     )
     voxel_group.add_argument(
         "--z-step-um",
         type=float,
         default=None,
         help="Z step in micrometers (default: computed from Workflow.txt)",
+    )
+    voxel_group.add_argument(
+        "--frame-width",
+        type=int,
+        default=None,
+        help="Raw frame (camera AOI) width override in px "
+        "(default: auto-detected from the file size / Workflow.txt AOI)",
+    )
+    voxel_group.add_argument(
+        "--frame-height",
+        type=int,
+        default=None,
+        help="Raw frame (camera AOI) height override in px (default: auto-detected)",
     )
 
     # Preprocessing
@@ -243,10 +257,32 @@ def main():
         )
         sys.exit(0)
 
+    # Resolve XY pixel size: explicit flag wins, else derive from the
+    # acquisition's objective (ScopeSettings.txt), else the legacy default.
+    pixel_size_um = args.pixel_size_um
+    if pixel_size_um is None:
+        from .pipeline import suggested_pixel_size_um
+
+        suggested = suggested_pixel_size_um(acq_dir)
+        if suggested:
+            pixel_size_um = round(suggested, 4)
+            print(
+                f"Using objective-derived XY pixel size: {pixel_size_um} µm "
+                f"(from ScopeSettings.txt). Override with --pixel-size-um."
+            )
+        else:
+            pixel_size_um = 0.406
+            print(
+                "No objective found in ScopeSettings.txt; using default XY pixel "
+                "size 0.406 µm. Set --pixel-size-um if this is wrong."
+            )
+
     # Build config
     config = StitchingConfig(
-        pixel_size_um=args.pixel_size_um,
+        pixel_size_um=pixel_size_um,
         z_step_um=args.z_step_um,
+        frame_width=args.frame_width,
+        frame_height=args.frame_height,
         illumination_fusion=args.illumination_fusion,
         flat_field_correction=args.flat_field,
         destripe=args.destripe,

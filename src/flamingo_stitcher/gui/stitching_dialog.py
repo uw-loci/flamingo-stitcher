@@ -600,6 +600,12 @@ class StitchingDialog(PersistentDialog):
             "resolved from the native voxel and shown in parentheses."
         )
         settings_layout.addWidget(self._voxel_readout_label, 6, 0, 1, 5)
+        # Track whether the user has manually set the XY pixel size, so the
+        # ScopeSettings-derived auto-fill on discover doesn't clobber a
+        # deliberate choice. A guard distinguishes programmatic setValue.
+        self._pixel_size_user_set = False
+        self._setting_pixel_programmatically = False
+        self._pixel_size_spin.valueChanged.connect(self._on_pixel_size_changed)
         self._pixel_size_spin.valueChanged.connect(self._update_voxel_readout)
         self._z_step_spin.valueChanged.connect(self._update_voxel_readout)
         self._downsample_xy_combo.currentIndexChanged.connect(
@@ -1216,6 +1222,13 @@ class StitchingDialog(PersistentDialog):
                 self._z_step_spin.setValue(z_um)
                 self._log(f"Auto-detected Z step: {z_um:.3f} µm (from tile metadata)")
 
+        # Auto-fill XY pixel size from the recorded objective (ScopeSettings.txt).
+        self._autofill_pixel_size()
+
+        # Surface the detected frame (AOI) size, especially when it differs from
+        # the hardware-config default (cropped/binned acquisition).
+        self._log_detected_frame_size()
+
         # Show memory estimate across ALL discovered queue items (worst case).
         if any(it["tiles"] for it in self._queue):
             self._update_memory_estimate()
@@ -1240,6 +1253,77 @@ class StitchingDialog(PersistentDialog):
         if pending:
             self._bg_zero_panel.set_thresholds(pending)
             self._pending_bg_zero_thresholds = {}
+
+    def _on_pixel_size_changed(self, _value):
+        """Mark the XY pixel size as user-set unless we set it ourselves."""
+        if not self._setting_pixel_programmatically:
+            self._pixel_size_user_set = True
+
+    def _autofill_pixel_size(self):
+        """Auto-fill XY pixel size from the acquisition's recorded objective.
+
+        Reads `Objective lens magnification` from ScopeSettings.txt so an
+        objective swap doesn't silently keep a stale pixel size (which places
+        tiles by stage spacing but renders them at the wrong scale → gaps).
+        Respects a manual override; warns instead of overwriting in that case.
+        """
+        from flamingo_stitcher.pipeline import (
+            read_objective_magnification,
+            suggested_pixel_size_um,
+        )
+
+        first_item = next((it for it in self._queue if it.get("tiles")), None)
+        if first_item is None:
+            return
+        acq = Path(first_item["path"])
+        try:
+            suggested = suggested_pixel_size_um(acq)
+        except Exception as e:
+            self._logger.debug(f"pixel-size auto-fill skipped: {e}")
+            return
+        if not suggested:
+            return
+        mag = read_objective_magnification(acq)
+        mag_str = f"{mag:.2f}×" if mag else "?"
+        cur = self._pixel_size_spin.value()
+        if not self._pixel_size_user_set:
+            self._setting_pixel_programmatically = True
+            self._pixel_size_spin.setValue(round(suggested, 4))
+            self._setting_pixel_programmatically = False
+            self._log(
+                f"Auto-detected XY pixel size: {suggested:.3f} µm "
+                f"(objective {mag_str} from ScopeSettings.txt)"
+            )
+        elif cur > 0 and abs(cur - suggested) / suggested > 0.15:
+            self._log(
+                f"⚠ XY pixel size {cur:.3f} µm differs from the objective-derived "
+                f"~{suggested:.3f} µm ({mag_str}). Verify before stitching — a wrong "
+                f"pixel size causes gaps/overlap between tiles."
+            )
+
+    def _log_detected_frame_size(self):
+        """Report the resolved raw frame (AOI) size across discovered tiles."""
+        from flamingo_stitcher.pipeline import (
+            FRAME_HEIGHT,
+            FRAME_WIDTH,
+            _resolve_frame_size,
+        )
+
+        all_tiles = [t for it in self._queue if it.get("tiles") for t in it["tiles"]]
+        if not all_tiles:
+            return
+        distinct = sorted({(t.frame_width, t.frame_height) for t in all_tiles})
+        fw, fh = _resolve_frame_size(all_tiles)
+        if len(distinct) > 1:
+            self._log(
+                f"⚠ Frame (AOI) size varies across tiles: {distinct}. "
+                f"Using {fw}×{fh}. Check for mixed acquisitions."
+            )
+        elif (fw, fh) != (FRAME_WIDTH, FRAME_HEIGHT):
+            self._log(
+                f"Detected frame (AOI) size: {fw}×{fh} px "
+                f"(cropped/binned — differs from default {FRAME_WIDTH}×{FRAME_HEIGHT})"
+            )
 
     def _discover_tiles_for_path(self, acq_path: Path):
         """Discover tiles in an acquisition directory.
@@ -2866,7 +2950,12 @@ class StitchingDialog(PersistentDialog):
             self._output_dir_edit.setText(output_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
+        # Restoring a persisted value must not count as a manual override —
+        # auto-fill from the acquisition's objective should still win on discover.
+        self._setting_pixel_programmatically = True
         self._pixel_size_spin.setValue(pixel_size)
+        self._setting_pixel_programmatically = False
+        self._pixel_size_user_set = False
 
         z_step = s.value("z_step", 0.0, type=float)
         self._z_step_spin.setValue(z_step)
@@ -3101,7 +3190,12 @@ class NativeStitchingDialog(StitchingDialog):
             self._output_dir_edit.setText(output_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
+        # Restoring a persisted value must not count as a manual override —
+        # auto-fill from the acquisition's objective should still win on discover.
+        self._setting_pixel_programmatically = True
         self._pixel_size_spin.setValue(pixel_size)
+        self._setting_pixel_programmatically = False
+        self._pixel_size_user_set = False
 
         z_step = s.value("z_step", 0.0, type=float)
         self._z_step_spin.setValue(z_step)
