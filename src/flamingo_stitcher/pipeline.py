@@ -542,6 +542,16 @@ class StitchingConfig:
     # Resource constraints
     max_memory_gb: Optional[float] = None  # None = auto (50% of system RAM)
 
+    # Hard resource guard — abort BEFORE processing an item whose projected
+    # peak RAM (for the chosen mode, incl. writer overhead) or output+spill
+    # disk footprint would exceed a safety fraction of what's available. This
+    # turns a machine-killing mid-run OOM / disk-full into a clean, explanatory
+    # failure for that item. Set ``resource_guard_enabled=False`` (or raise the
+    # fractions) to override for an intentionally tight run.
+    resource_guard_enabled: bool = True
+    resource_guard_ram_fraction: float = 0.95  # fraction of AVAILABLE RAM
+    resource_guard_disk_fraction: float = 0.95  # fraction of free output-drive
+
     # Streaming mode — writes fused output chunk-by-chunk instead of
     # materializing the full volume into RAM. Required for TB-scale datasets.
     #   None  = auto-detect based on estimated output size vs available RAM
@@ -1949,6 +1959,12 @@ class StitchingPipeline:
 
         self._log_preflight(
             tiles, process_channels, output_path, mem_est, use_streaming
+        )
+
+        # Hard abort before committing any resources if this item would blow
+        # past available RAM or disk (prevents machine-killing OOM/ENOSPC).
+        self._enforce_resource_limits(
+            tiles, output_path, mem_est, use_streaming
         )
 
         if use_streaming:
@@ -4173,3 +4189,88 @@ class StitchingPipeline:
                 )
         except OSError as e:
             self.logger.debug(f"Could not probe output drive free space: {e}")
+
+    def _enforce_resource_limits(
+        self,
+        tiles: List[RawTileInfo],
+        output_path: Path,
+        mem_est: Dict[str, float],
+        use_streaming: bool,
+    ) -> None:
+        """Abort this item before any allocation if it would exhaust RAM/disk.
+
+        Raises ``RuntimeError`` (caught per-item by the batch worker, so the
+        rest of the queue survives) when the projected peak RAM for the chosen
+        mode — plus writer overhead — exceeds ``resource_guard_ram_fraction`` of
+        AVAILABLE RAM, or the output + tile-spill + fused-memmap footprint
+        exceeds ``resource_guard_disk_fraction`` of free space on the output
+        drive. The measurement is skipped (not failed) when psutil/shutil are
+        unavailable.
+        """
+        if not getattr(self.config, "resource_guard_enabled", True):
+            return
+        try:
+            import shutil as _shutil
+
+            import psutil as _psutil
+        except ImportError:
+            return  # cannot measure — let the run proceed as before
+
+        ram_frac = float(getattr(self.config, "resource_guard_ram_fraction", 0.95))
+        disk_frac = float(getattr(self.config, "resource_guard_disk_fraction", 0.95))
+        output_gb = float(mem_est.get("output_gb", 0.0))
+
+        # --- RAM ---
+        peak_gb = float(
+            mem_est.get("streaming_gb" if use_streaming else "in_memory_gb", 0.0)
+        )
+        if self.config.output_format == "imaris":
+            peak_gb += output_gb * 0.25  # PyImarisWriter scratch (see _log_preflight)
+        try:
+            avail_ram_gb = _psutil.virtual_memory().available / (1024**3)
+        except Exception:
+            avail_ram_gb = 0.0
+        if avail_ram_gb > 0 and peak_gb > avail_ram_gb * ram_frac:
+            mode = "streaming" if use_streaming else "in-memory"
+            raise RuntimeError(
+                f"Aborting before run: projected peak RAM ~{peak_gb:.0f} GB "
+                f"({mode} mode) exceeds the safety limit "
+                f"{ram_frac * 100:.0f}% of {avail_ram_gb:.0f} GB available. "
+                f"Remedies: increase downsample (XY/Z), force Streaming mode, "
+                f"split the acquisition, close other apps, or — if the XY pixel "
+                f"size looks wrong (too small → giant output), fix it. Override "
+                f"with resource_guard_enabled=False to force the run."
+            )
+
+        # --- Disk (output + spill + fused memmap, mirrors _log_preflight) ---
+        try:
+            bpv = 2
+            ds_xy = max(self.config.downsample_xy, 1)
+            ds_z = max(self.config.downsample_z, 1)
+            n_planes = max(t.n_planes for t in tiles)
+            frame_w, frame_h = _resolve_frame_size(tiles, self.config)
+            tile_bytes = (
+                (n_planes // ds_z if ds_z > 1 else n_planes)
+                * (frame_w // ds_xy if ds_xy > 1 else frame_w)
+                * (frame_h // ds_xy if ds_xy > 1 else frame_h)
+                * bpv
+            )
+            spill_gb = (len(tiles) * tile_bytes / (1024**3)) if use_streaming else 0.0
+            fused_memmap_gb = output_gb if use_streaming else 0.0
+            needed_gb = output_gb + spill_gb + fused_memmap_gb
+            output_path.mkdir(parents=True, exist_ok=True)
+            free_gb = _shutil.disk_usage(output_path).free / (1024**3)
+            if free_gb > 0 and needed_gb > free_gb * disk_frac:
+                raise RuntimeError(
+                    f"Aborting before run: needs ~{needed_gb:.0f} GB on the output "
+                    f"drive ({output_gb:.0f} GB output"
+                    + (f" + {spill_gb:.0f} GB spill + {fused_memmap_gb:.0f} GB "
+                       f"fused memmap" if use_streaming else "")
+                    + f") but only {free_gb:.0f} GB free (limit "
+                    f"{disk_frac * 100:.0f}%). Remedies: point output to a larger "
+                    f"drive, increase downsample, or fix the XY pixel size if the "
+                    f"output looks far too large. Override with "
+                    f"resource_guard_enabled=False."
+                )
+        except OSError as e:
+            self.logger.debug(f"Disk guard probe failed (allowing run): {e}")

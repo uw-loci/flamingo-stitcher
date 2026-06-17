@@ -32,12 +32,51 @@ def _user_config_dir() -> Path:
     return d
 
 
+def _setup_logging() -> Path:
+    """Configure console + persistent file logging. Returns the log file path.
+
+    A per-launch timestamped file under ``<config dir>/logs/`` captures the
+    full run log so it survives a hard crash / power loss (the GUI text panel
+    is RAM-only). ``logging.FileHandler`` flushes after every record, so all
+    but the last fraction of a line is on disk even on an abrupt shutdown.
+    Old logs are pruned to the most recent 20.
+    """
+    from datetime import datetime
+
+    fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+
+    console = logging.StreamHandler()
+    console.setFormatter(fmt)
+    root.addHandler(console)
+
+    log_path = None
+    try:
+        log_dir = _user_config_dir() / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        # Prune to the 19 newest so this launch's file makes 20.
+        existing = sorted(log_dir.glob("flamingo-stitcher_*.log"))
+        for stale in existing[:-19]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_path = log_dir / f"flamingo-stitcher_{stamp}.log"
+        fh = logging.FileHandler(log_path, encoding="utf-8")
+        fh.setFormatter(fmt)
+        root.addHandler(fh)
+    except Exception as e:  # never let logging setup break startup
+        logging.getLogger(__name__).warning(f"File logging unavailable: {e}")
+    return log_path
+
+
 def main() -> int:
     """Launch the standalone stitching GUI. Returns the Qt exit code."""
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-    )
+    log_path = _setup_logging()
+    if log_path:
+        logging.getLogger(__name__).info(f"Log file: {log_path}")
 
     from PyQt5.QtCore import QSettings, QTimer
     from PyQt5.QtWidgets import (

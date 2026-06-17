@@ -394,6 +394,27 @@ class StitchingDialog(PersistentDialog):
         )
         settings_layout.addWidget(self._z_step_spin, 0, 3)
 
+        # Frame (camera AOI) size override. "Auto" derives the true frame size
+        # from the on-disk file size (robust to cropped AOIs and missing/wrong
+        # Workflow.txt metadata). Force a fixed crop when files may be truncated
+        # or the auto-inference is ambiguous.
+        settings_layout.addWidget(QLabel("Frame (AOI):"), 0, 4)
+        self._frame_size_combo = QComboBox()
+        for label, value in [
+            ("Auto (from file)", None),
+            ("1024 × 1024", 1024),
+            ("2048 × 2048", 2048),
+        ]:
+            self._frame_size_combo.addItem(label, value)
+        self._frame_size_combo.setToolTip(
+            "Raw frame (camera AOI) size.\n"
+            "Auto: inferred from each file's size (bytes / planes / 2 → "
+            "square side) — recommended.\n"
+            "Fix to 1024/2048 to force a crop when files may be partial or the "
+            "AOI metadata is missing/wrong."
+        )
+        settings_layout.addWidget(self._frame_size_combo, 0, 5)
+
         # Row 1: Downsample XY/Z + Illumination fusion
         settings_layout.addWidget(QLabel("Downsample:"), 1, 0)
         ds_layout = QHBoxLayout()
@@ -1725,6 +1746,10 @@ class StitchingDialog(PersistentDialog):
         z_step = self._z_step_spin.value()
         config.pixel_size_um = self._pixel_size_spin.value()
         config.z_step_um = z_step if z_step > 0 else None
+        # Frame (AOI) override: None = auto-detect from file size.
+        _frame = self._frame_size_combo.currentData()
+        config.frame_width = _frame
+        config.frame_height = _frame
         config.illumination_fusion = self._fusion_combo.currentData()
         config.output_format = self._format_combo.currentData()
         config.flat_field_correction = self._flat_field_cb.isChecked()
@@ -2901,6 +2926,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -2983,6 +3009,10 @@ class StitchingDialog(PersistentDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+
+        frame_idx = s.value("frame_size_idx", 0, type=int)
+        if 0 <= frame_idx < self._frame_size_combo.count():
+            self._frame_size_combo.setCurrentIndex(frame_idx)
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)
@@ -3141,6 +3171,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -3223,6 +3254,10 @@ class NativeStitchingDialog(StitchingDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+
+        frame_idx = s.value("frame_size_idx", 0, type=int)
+        if 0 <= frame_idx < self._frame_size_combo.count():
+            self._frame_size_combo.setCurrentIndex(frame_idx)
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)
