@@ -1800,6 +1800,84 @@ class StitchingDialog(PersistentDialog):
         except ValueError:
             return None
 
+    def _confirm_pixel_size(self, pending, config) -> bool:
+        """Block the run if the XY pixel size badly mismatches the objective.
+
+        Reads each pending item's `Objective lens magnification` from
+        ScopeSettings.txt and compares the implied pixel size to the configured
+        one. On a large divergence (>25%), forces an explicit choice — use the
+        objective-derived value (recommended), keep the current value, or
+        cancel — so a stale pixel size can't silently produce a gappy stitch.
+        Returns True to proceed, False to abort.
+        """
+        from flamingo_stitcher.pipeline import (
+            read_objective_magnification,
+            suggested_pixel_size_um,
+        )
+
+        cur = config.pixel_size_um
+        suggestions = []  # (pixel_um, magnification)
+        for it in pending:
+            if not it.get("tiles"):
+                continue
+            try:
+                s = suggested_pixel_size_um(Path(it["path"]))
+            except Exception:
+                s = None
+            if s and s > 0:
+                suggestions.append((s, read_objective_magnification(Path(it["path"]))))
+        if not suggestions or cur <= 0:
+            return True
+
+        # Worst (largest) divergence across the queue.
+        s, mag = max(suggestions, key=lambda sm: abs(cur - sm[0]) / sm[0])
+        if abs(cur - s) / s <= 0.25:
+            return True
+
+        mixed = len({round(v[0], 3) for v in suggestions}) > 1
+        mag_str = f"{mag:.2f}×" if mag else "?"
+        pct = abs(cur - s) / s * 100
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Pixel size doesn't match the objective")
+        text = (
+            f"XY pixel size is set to {cur:.3f} µm, but the objective recorded in "
+            f"ScopeSettings.txt ({mag_str}) implies ~{s:.3f} µm — a {pct:.0f}% "
+            f"difference.\n\n"
+            f"Stitching at {cur:.3f} µm places tiles by stage spacing but renders "
+            f"them at the wrong scale, producing gaps (or excessive overlap) "
+            f"between tiles."
+        )
+        if mixed:
+            text += (
+                "\n\n⚠ Queue items report different objectives; one pixel size is "
+                "used for the whole batch."
+            )
+        box.setText(text)
+        use_btn = box.addButton(f"Use {s:.3f} µm (recommended)", QMessageBox.AcceptRole)
+        box.addButton(f"Keep {cur:.3f} µm", QMessageBox.DestructiveRole)
+        cancel_btn = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(use_btn)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is cancel_btn:
+            return False
+        if clicked is use_btn:
+            config.pixel_size_um = round(s, 4)
+            self._setting_pixel_programmatically = True
+            self._pixel_size_spin.setValue(round(s, 4))
+            self._setting_pixel_programmatically = False
+            self._log(
+                f"Pixel size set to {s:.3f} µm from objective {mag_str} "
+                f"(was {cur:.3f} µm)."
+            )
+        else:
+            self._log(
+                f"Proceeding with pixel size {cur:.3f} µm despite objective "
+                f"mismatch (user override)."
+            )
+        return True
+
     def _on_run(self):
         """Start batch stitching of all pending queue items."""
         pending = [item for item in self._queue if item["status"] == "pending"]
@@ -1817,6 +1895,12 @@ class StitchingDialog(PersistentDialog):
             return
 
         config = self._build_config()
+
+        # Pre-flight: block if the XY pixel size clashes with the objective
+        # recorded in ScopeSettings.txt (the #1 cause of gappy/overlapping
+        # stitches). A log warning alone was too easy to run past.
+        if not self._confirm_pixel_size(pending, config):
+            return
 
         # Pre-flight: warn if flat-field is requested but basicpy missing
         if config.flat_field_correction:
