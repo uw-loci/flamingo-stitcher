@@ -89,6 +89,16 @@ def main():
         help="Dual-illumination fusion method (default: max)",
     )
     preproc_group.add_argument(
+        "--tile-overlap-fusion",
+        choices=["blend", "max"],
+        default="blend",
+        help=(
+            "How overlapping tiles are combined: 'blend' (weighted cosine, "
+            "default) or 'max' (pixel-wise maximum — best for sparse/sub-FOV "
+            "samples where blending dilutes signal against background)"
+        ),
+    )
+    preproc_group.add_argument(
         "--flat-field",
         action="store_true",
         help="Apply BaSiC flat-field correction (requires basicpy)",
@@ -284,6 +294,7 @@ def main():
         frame_width=args.frame_width,
         frame_height=args.frame_height,
         illumination_fusion=args.illumination_fusion,
+        tile_overlap_fusion=args.tile_overlap_fusion,
         flat_field_correction=args.flat_field,
         destripe=args.destripe,
         destripe_fast=args.destripe_fast,

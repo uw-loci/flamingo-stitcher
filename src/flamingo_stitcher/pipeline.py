@@ -470,6 +470,19 @@ class StitchingConfig:
     # time but improves fusion quality in overlap regions with uneven content.
     content_based_fusion: bool = False
 
+    # Tile-overlap fusion method — how overlapping tiles are combined.
+    #   "blend" : weighted-average (cosine) blending — seamless on dense,
+    #             well-flat-fielded samples, but in the overlap it averages
+    #             each tile against its neighbour, so a sparse sample on a
+    #             mostly-empty FOV (or any slight stage-only misregistration)
+    #             gets diluted against background → a dark dip at the seam.
+    #   "max"   : pixel-wise maximum (np.nanmax) across tiles — keeps the
+    #             brighter tile in the overlap, so signal can't be diluted by
+    #             a neighbour's background. Best for sparse / sub-FOV samples.
+    # NOTE: distinct from `illumination_fusion`, which combines left/right
+    # light-sheet illumination sides, not adjacent tiles.
+    tile_overlap_fusion: str = "blend"
+
     # OME-Zarr sharding options
     zarr_chunks: Tuple = (32, 256, 256)  # Inner chunk shape (~4 MB per chunk)
     zarr_shard_chunks: Tuple = (4, 4, 4)  # Chunks per shard per axis
@@ -3318,22 +3331,36 @@ class StitchingPipeline:
             blending_widths=self.config.blending_widths,
         )
 
-        if self.config.content_based_fusion:
-            try:
-                from multiview_stitcher.weights import content_based
+        if self.config.tile_overlap_fusion == "max":
+            # Pixel-wise maximum across tiles: keeps the brighter tile in the
+            # overlap so a sparse sample can't be diluted against a neighbour's
+            # background. max_fusion ignores blending/content weights (it has no
+            # blending_weights kwarg), so we skip them entirely.
+            from multiview_stitcher.fusion import max_fusion
 
-                fuse_kwargs["weights_func"] = content_based
-                # content_based defaults (sigma_1=5, sigma_2=11). Must be
-                # provided explicitly: fusion.fuse calls
-                # calculate_required_overlap(weights_func, weights_func_kwargs)
-                # which unconditionally dereferences kwargs["sigma_2"], so
-                # passing None here crashes with a NoneType subscript error.
-                fuse_kwargs["weights_func_kwargs"] = {"sigma_1": 5, "sigma_2": 11}
-                self.logger.info("  Using content-based tile-overlap weighting")
-            except ImportError:
-                self.logger.warning(
-                    "  content_based weights not available — using default blending"
-                )
+            fuse_kwargs["fusion_func"] = max_fusion
+            self.logger.info("  Tile-overlap fusion: maximum intensity (np.nanmax)")
+        else:
+            self.logger.info("  Tile-overlap fusion: weighted blend (cosine)")
+            if self.config.content_based_fusion:
+                try:
+                    from multiview_stitcher.weights import content_based
+
+                    fuse_kwargs["weights_func"] = content_based
+                    # content_based defaults (sigma_1=5, sigma_2=11). Must be
+                    # provided explicitly: fusion.fuse calls
+                    # calculate_required_overlap(weights_func, weights_func_kwargs)
+                    # which unconditionally dereferences kwargs["sigma_2"], so
+                    # passing None here crashes with a NoneType subscript error.
+                    fuse_kwargs["weights_func_kwargs"] = {
+                        "sigma_1": 5,
+                        "sigma_2": 11,
+                    }
+                    self.logger.info("  Using content-based tile-overlap weighting")
+                except ImportError:
+                    self.logger.warning(
+                        "  content_based weights not available — using default blending"
+                    )
 
         fused = self._fuse_with_fallback(fusion.fuse, sims, fuse_kwargs)
 

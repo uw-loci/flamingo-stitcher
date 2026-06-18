@@ -513,7 +513,42 @@ class StitchingDialog(PersistentDialog):
             ("Leonardo FUSE", "leonardo"),
         ]:
             self._fusion_combo.addItem(label, value)
+        self._fusion_combo.setToolTip(
+            "Combines the LEFT and RIGHT light-sheet illumination sides of a\n"
+            "single tile. Has no effect when only one illumination side was\n"
+            "acquired. This is NOT how adjacent tiles are combined — see\n"
+            "'Tile overlap'."
+        )
         settings_layout.addWidget(self._fusion_combo, 1, 3)
+
+        # Tile-overlap fusion (how adjacent TILES are combined — distinct from
+        # the illumination-side fusion above). Placed alongside it to make the
+        # distinction obvious.
+        tile_fuse_box = QHBoxLayout()
+        tile_fuse_box.setContentsMargins(0, 0, 0, 0)
+        tile_fuse_box.addWidget(QLabel("Tile overlap:"))
+        self._tile_fusion_combo = QComboBox()
+        for label, value in [
+            ("Blend", "blend"),
+            ("Maximum", "max"),
+        ]:
+            self._tile_fusion_combo.addItem(label, value)
+        self._tile_fusion_combo.setToolTip(
+            "How OVERLAPPING TILES are combined (distinct from 'Illum. fusion',\n"
+            "which combines left/right light-sheet sides of one tile):\n\n"
+            "  Blend   — weighted cosine blend. Seamless on dense, well\n"
+            "            flat-fielded samples. But in the overlap it averages\n"
+            "            each tile against its neighbour, so a sparse sample on\n"
+            "            a mostly-empty FOV (or any slight stage-only\n"
+            "            misregistration) gets diluted against background — a\n"
+            "            dark dip right at the seam.\n\n"
+            "  Maximum — pixel-wise maximum across tiles. Keeps the brighter\n"
+            "            tile in the overlap so signal can't be diluted. Best\n"
+            "            for sparse / sub-FOV samples (e.g. a thin object that\n"
+            "            doesn't fill the field of view)."
+        )
+        tile_fuse_box.addWidget(self._tile_fusion_combo)
+        settings_layout.addLayout(tile_fuse_box, 1, 4)
 
         # Row 2: Output format + Compression
         settings_layout.addWidget(QLabel("Output format:"), 2, 0)
@@ -1842,6 +1877,7 @@ class StitchingDialog(PersistentDialog):
         config.frame_width = _frame
         config.frame_height = _frame
         config.illumination_fusion = self._fusion_combo.currentData()
+        config.tile_overlap_fusion = self._tile_fusion_combo.currentData()
         config.output_format = self._format_combo.currentData()
         config.flat_field_correction = self._flat_field_cb.isChecked()
         config.destripe = self._destripe_cb.isChecked()
@@ -3100,6 +3136,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
@@ -3185,6 +3222,12 @@ class StitchingDialog(PersistentDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+
+        tile_fusion = s.value("tile_overlap_fusion", "", type=str)
+        if tile_fusion:
+            idx = self._tile_fusion_combo.findData(tile_fusion)
+            if idx >= 0:
+                self._tile_fusion_combo.setCurrentIndex(idx)
 
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():
@@ -3350,6 +3393,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
@@ -3435,6 +3479,12 @@ class NativeStitchingDialog(StitchingDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+
+        tile_fusion = s.value("tile_overlap_fusion", "", type=str)
+        if tile_fusion:
+            idx = self._tile_fusion_combo.findData(tile_fusion)
+            if idx >= 0:
+                self._tile_fusion_combo.setCurrentIndex(idx)
 
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():

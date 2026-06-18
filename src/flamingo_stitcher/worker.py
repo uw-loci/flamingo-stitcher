@@ -105,6 +105,7 @@ class StitchingWorker(QThread):
                 f"Output dir: {self._output_dir}\n"
                 f"Downsample: XY={self._config.downsample_xy}x Z={self._config.downsample_z}x\n"
                 f"Illumination fusion: {self._config.illumination_fusion}\n"
+                f"Tile overlap fusion: {self._config.tile_overlap_fusion}\n"
                 f"Flat-field correction: {self._config.flat_field_correction}\n"
                 f"Camera X inverted: {self._config.camera_x_inverted}\n"
                 f"Destripe: {self._config.destripe}"
