@@ -896,6 +896,16 @@ class StitchingDialog(PersistentDialog):
             "or technical setup required, just internet. CPU only; needed once."
         )
         self._setup_env_btn.clicked.connect(self._on_setup_env)
+        # The earlier _update_preprocessing_availability() (when the flat-field
+        # checkbox was built) ran before this button existed, so reflect the
+        # install state now. is_built() is a cheap file check (no backend probe).
+        try:
+            from flamingo_stitcher import preprocessing_env as _pe
+
+            if _pe.is_built():
+                self._setup_env_btn.setText("Reinstall flat-field…")
+        except Exception:
+            pass
         btn_layout.addWidget(self._setup_env_btn)
 
         self._help_btn = QPushButton("Help / Troubleshooting")
@@ -2690,15 +2700,18 @@ class StitchingDialog(PersistentDialog):
             )
 
         # Reflect install state in the setup button so it's clear when it's done.
-        if preprocessing_env.is_built():
-            self._setup_env_btn.setText("Reinstall flat-field…")
-            self._setup_env_btn.setToolTip(
-                f"Flat-field environment is installed at:\n"
-                f"{preprocessing_env.env_dir()}\n\n"
-                "Click only to repair it or move it to another drive."
-            )
-        else:
-            self._setup_env_btn.setText("Set up flat-field…")
+        # Guarded: this method is first called while the flat-field checkbox is
+        # built (to set its state), which is *before* the setup button exists.
+        if hasattr(self, "_setup_env_btn"):
+            if preprocessing_env.is_built():
+                self._setup_env_btn.setText("Reinstall flat-field…")
+                self._setup_env_btn.setToolTip(
+                    f"Flat-field environment is installed at:\n"
+                    f"{preprocessing_env.env_dir()}\n\n"
+                    "Click only to repair it or move it to another drive."
+                )
+            else:
+                self._setup_env_btn.setText("Set up flat-field…")
 
         # --- Destriping (pystripe) ---
         try:
