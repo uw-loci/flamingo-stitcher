@@ -25,6 +25,7 @@ from PyQt5.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTableWidget,
     QTableWidgetItem,
@@ -289,8 +290,11 @@ class StitchingDialog(PersistentDialog):
         self._batch_results = []  # List of (path, success, error_msg)
 
         self.setWindowTitle("Tile Stitching")
+        # Keep the width comfortable for the settings row, but allow a short
+        # window (laptops) — the upper controls live in a scroll area and the
+        # log collapses, so nothing squishes; it scrolls instead.
         self.setMinimumWidth(650)
-        self.setMinimumHeight(700)
+        self.setMinimumHeight(440)
         self.resize(720, 750)  # Default size before geometry restore
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
@@ -306,6 +310,20 @@ class StitchingDialog(PersistentDialog):
         """Create and layout UI components."""
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
+
+        # The configuration controls (queue, settings, processing options) live
+        # in a scroll area so they keep their natural size on small screens —
+        # the window scrolls rather than squishing fields below readability.
+        # The action buttons, log, and progress stay fixed below it.
+        _scroll = QScrollArea()
+        _scroll.setWidgetResizable(True)
+        _scroll.setFrameShape(QScrollArea.NoFrame)
+        _content = QWidget()
+        content_layout = QVBoxLayout(_content)
+        content_layout.setContentsMargins(0, 0, 0, 0)
+        content_layout.setSpacing(10)
+        _scroll.setWidget(_content)
+        layout.addWidget(_scroll, 1)
 
         # --- Batch queue ---
         queue_group = QGroupBox("Acquisition Queue")
@@ -366,7 +384,7 @@ class StitchingDialog(PersistentDialog):
         queue_btn_layout.addStretch()
         queue_layout.addLayout(queue_btn_layout)
         queue_group.setLayout(queue_layout)
-        layout.addWidget(queue_group)
+        content_layout.addWidget(queue_group)
 
         # --- Output directory ---
         out_layout = QHBoxLayout()
@@ -379,7 +397,7 @@ class StitchingDialog(PersistentDialog):
         out_browse_btn = QPushButton("Browse...")
         out_browse_btn.clicked.connect(self._browse_output_dir)
         out_layout.addWidget(out_browse_btn)
-        layout.addLayout(out_layout)
+        content_layout.addLayout(out_layout)
 
         # --- Settings group ---
         settings_group = QGroupBox("Settings")
@@ -670,7 +688,7 @@ class StitchingDialog(PersistentDialog):
 
         settings_group.setLayout(settings_layout)
         self._settings_group = settings_group
-        layout.addWidget(settings_group)
+        content_layout.addWidget(settings_group)
 
         # --- Collapsible processing options ---
         self._proc_toggle = QPushButton("\u25b6 Processing Options")
@@ -682,7 +700,7 @@ class StitchingDialog(PersistentDialog):
             "QPushButton:hover { color: #333; }"
         )
         self._proc_toggle.toggled.connect(self._on_proc_toggle)
-        layout.addWidget(self._proc_toggle)
+        content_layout.addWidget(self._proc_toggle)
 
         self._proc_widget = QGroupBox()
         self._proc_widget.setStyleSheet(
@@ -829,7 +847,7 @@ class StitchingDialog(PersistentDialog):
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
-        layout.addWidget(self._proc_widget)
+        content_layout.addWidget(self._proc_widget)
 
         # --- Background zeroing (lossy compression aid) ---
         self._bg_zero_panel = BackgroundZeroPanel()
@@ -843,7 +861,7 @@ class StitchingDialog(PersistentDialog):
                 "Background zeroing still works — set thresholds numerically.\n"
                 'Install with: pip install "flamingo-stitcher[preview]"'
             )
-        layout.addWidget(self._bg_zero_panel)
+        content_layout.addWidget(self._bg_zero_panel)
 
         # --- Action buttons ---
         btn_layout = QHBoxLayout()
@@ -891,18 +909,31 @@ class StitchingDialog(PersistentDialog):
         btn_layout.addWidget(self._help_btn)
         layout.addLayout(btn_layout)
 
-        # --- Log area ---
-        log_group = QGroupBox("Log")
+        # --- Log area (collapsible, collapsed by default to save space) ---
+        self._log_toggle = QPushButton("▶ Log")
+        self._log_toggle.setCheckable(True)
+        self._log_toggle.setChecked(False)
+        self._log_toggle.setStyleSheet(
+            "QPushButton { text-align: left; border: none; "
+            "padding: 4px 2px; font-weight: bold; color: #555; }"
+            "QPushButton:hover { color: #333; }"
+        )
+        self._log_toggle.toggled.connect(self._on_log_toggle)
+        layout.addWidget(self._log_toggle)
+
+        self._log_group = QGroupBox()
         log_layout = QVBoxLayout()
+        log_layout.setContentsMargins(0, 0, 0, 0)
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
-        self._log_text.setMinimumHeight(150)
+        self._log_text.setMinimumHeight(120)
         self._log_text.setStyleSheet(
             "QTextEdit { font-family: monospace; font-size: 11px; }"
         )
         log_layout.addWidget(self._log_text)
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
+        self._log_group.setLayout(log_layout)
+        self._log_group.setVisible(False)  # collapsed initially
+        layout.addWidget(self._log_group)
 
         # --- Progress: step list + detail ---
         # A single 0–100% bar is misleading here because step costs are
@@ -1394,6 +1425,29 @@ class StitchingDialog(PersistentDialog):
         )
         self._log("")
         self._log("Ready to stitch. Click 'Run Stitching' to begin.")
+
+    def _on_log_toggle(self, checked: bool):
+        """Show/hide the log panel."""
+        self._log_group.setVisible(checked)
+        self._log_toggle.setText(("▼ " if checked else "▶ ") + "Log")
+
+    def _expand_log(self):
+        """Ensure the log is visible (called when a run starts)."""
+        if not self._log_toggle.isChecked():
+            self._log_toggle.setChecked(True)
+
+    def _set_config_controls_enabled(self, enabled: bool):
+        """Enable/disable every config control as a unit for run locking.
+
+        Covers the settings grid, output dir, processing-options panel (and its
+        toggle), and the background-zeroing panel so none can be changed while a
+        stitch is in progress.
+        """
+        self._settings_group.setEnabled(enabled)
+        self._output_dir_edit.setEnabled(enabled)
+        self._proc_toggle.setEnabled(enabled)
+        self._proc_widget.setEnabled(enabled)
+        self._bg_zero_panel.setEnabled(enabled)
 
     def _on_proc_toggle(self, checked: bool):
         """Show/hide the processing options panel and resize the dialog.
@@ -1945,6 +1999,7 @@ class StitchingDialog(PersistentDialog):
             return
 
         self._log_text.clear()
+        self._expand_log()
         self._reset_step_progress()
         n_pending = len(pending)
         self._log(f"Starting batch stitching: {n_pending} directories\n")
@@ -1955,9 +2010,10 @@ class StitchingDialog(PersistentDialog):
         self._batch_channels = self._parse_channels()
         self._batch_results = []
 
-        # Lock settings during run
-        self._settings_group.setEnabled(False)
-        self._output_dir_edit.setEnabled(False)
+        # Lock all config controls during the run (settings, processing
+        # options, background zeroing) so they can't be toggled mid-stitch —
+        # the config is already captured and changing them would mislead.
+        self._set_config_controls_enabled(False)
         self._update_action_buttons()
 
         # Start processing
@@ -2389,8 +2445,7 @@ class StitchingDialog(PersistentDialog):
         self._batch_channels = None
 
         # Re-enable UI
-        self._settings_group.setEnabled(True)
-        self._output_dir_edit.setEnabled(True)
+        self._set_config_controls_enabled(True)
         self._cancel_btn.setEnabled(False)
         self._update_action_buttons()
 
@@ -2590,6 +2645,22 @@ class StitchingDialog(PersistentDialog):
 
     # --- Preprocessing environment ---
 
+    def showEvent(self, event):
+        """Refresh flat-field availability when this tab/dialog becomes visible.
+
+        Lets an env built from the *other* tab light up here without a restart.
+        Re-probes only while flat-field still looks unavailable, so it doesn't
+        spawn a probe on every show once it's known good.
+        """
+        super().showEvent(event)
+        if getattr(self, "_flat_field_cb", None) is not None and (
+            not self._flat_field_cb.isEnabled()
+        ):
+            try:
+                self._update_preprocessing_availability()
+            except Exception:
+                pass
+
     def _update_preprocessing_availability(self):
         """Grey out processing options whose backend isn't importable.
 
@@ -2599,6 +2670,7 @@ class StitchingDialog(PersistentDialog):
         how to get it.
         """
         # --- Flat-field correction (basicpy, direct or isolated env) ---
+        from flamingo_stitcher import preprocessing_env
         from flamingo_stitcher.flat_field import is_available as _ff_available
 
         if _ff_available():
@@ -2616,6 +2688,17 @@ class StitchingDialog(PersistentDialog):
                 "Click 'Set up flat-field…' to install it\n"
                 "in an isolated environment."
             )
+
+        # Reflect install state in the setup button so it's clear when it's done.
+        if preprocessing_env.is_built():
+            self._setup_env_btn.setText("Reinstall flat-field…")
+            self._setup_env_btn.setToolTip(
+                f"Flat-field environment is installed at:\n"
+                f"{preprocessing_env.env_dir()}\n\n"
+                "Click only to repair it or move it to another drive."
+            )
+        else:
+            self._setup_env_btn.setText("Set up flat-field…")
 
         # --- Destriping (pystripe) ---
         try:
@@ -2743,6 +2826,41 @@ class StitchingDialog(PersistentDialog):
         else:
             QDesktopServices.openUrl(QUrl(self._TROUBLESHOOTING_URL))
 
+    def _choose_install_location(self) -> bool:
+        """Confirm or change where the flat-field env installs. Persists the
+        choice. Returns True to proceed, False to cancel.
+        """
+        from flamingo_stitcher import preprocessing_env
+
+        current = preprocessing_env.install_root()
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Flat-field install location")
+        box.setText(
+            f"The flat-field environment (~2–4 GB incl. package cache) will "
+            f"install to:\n\n{current}\n\nInstall here, or choose another "
+            f"drive/folder if space is limited?"
+        )
+        here = box.addButton("Install here", QMessageBox.AcceptRole)
+        box.addButton("Choose folder…", QMessageBox.ActionRole)
+        cancel = box.addButton("Cancel", QMessageBox.RejectRole)
+        box.setDefaultButton(here)
+        box.exec_()
+        clicked = box.clickedButton()
+        if clicked is cancel:
+            return False
+        if clicked is not here:  # "Choose folder…"
+            start = str(current if current.exists() else current.parent)
+            chosen = QFileDialog.getExistingDirectory(
+                self, "Choose flat-field install folder", start
+            )
+            if not chosen:
+                return False
+            target = Path(chosen) / "FlamingoFlatField"
+            preprocessing_env.set_install_root(target)
+            self._log(f"Flat-field will install to: {target}")
+        return True
+
     def _on_setup_env(self):
         """Build the flat-field environment with pixi (no system Python needed).
 
@@ -2756,26 +2874,19 @@ class StitchingDialog(PersistentDialog):
                 self,
                 "Flat-field environment exists",
                 "The flat-field environment is already installed.\n\n"
-                "Rebuild it? (Re-runs the install; usually only needed if it's "
-                "broken.)",
+                "Reinstall it (e.g. to move it to another drive or repair it)?",
                 QMessageBox.Yes | QMessageBox.No,
                 QMessageBox.No,
             )
             if reply != QMessageBox.Yes:
                 return
 
-        reply = QMessageBox.question(
-            self,
-            "Set up flat-field correction",
-            "This installs a one-time, self-contained environment for flat-field "
-            "correction (basicpy). It downloads ~1–2 GB and needs no Python "
-            "pre-installed — just an internet connection.\n\nContinue?",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
+        # Let the user choose where it installs (the default may be on a
+        # space-limited C: drive). Persisted for the runtime to find it.
+        if not self._choose_install_location():
             return
 
+        self._expand_log()
         self._log("\n=== Setting up flat-field environment (pixi) ===")
         self._setup_env_btn.setEnabled(False)
         self._setup_env_btn.setText("Setting up…")
@@ -2983,6 +3094,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
+        s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
         s.setValue("bg_zero_expanded", self._bg_zero_panel.expanded())
         s.setValue(
@@ -3110,6 +3222,7 @@ class StitchingDialog(PersistentDialog):
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
+        self._log_toggle.setChecked(s.value("log_expanded", False, type=bool))
 
         bg_zero_enabled = s.value("bg_zero_enabled", False, type=bool)
         self._bg_zero_panel.set_enabled_state(bg_zero_enabled)
@@ -3228,6 +3341,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
+        s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
         s.setValue("bg_zero_expanded", self._bg_zero_panel.expanded())
         s.setValue(
@@ -3354,6 +3468,7 @@ class NativeStitchingDialog(StitchingDialog):
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
+        self._log_toggle.setChecked(s.value("log_expanded", False, type=bool))
 
         bg_zero_enabled = s.value("bg_zero_enabled", False, type=bool)
         self._bg_zero_panel.set_enabled_state(bg_zero_enabled)

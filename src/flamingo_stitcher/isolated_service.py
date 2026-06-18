@@ -29,6 +29,25 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+
+def _no_window_kwargs() -> dict:
+    """subprocess kwargs that prevent a console window flashing on Windows.
+
+    Each isolated-env subprocess (import probe, worker launch) would otherwise
+    pop a visible python.exe console — alarming when several fire at startup or
+    once per tile during a run. CREATE_NO_WINDOW + a hidden STARTUPINFO suppress
+    it. No-op on non-Windows.
+    """
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
 # Load timeout defaults from stitching config
 try:
     from flamingo_stitcher.config_loader import get_stitching_value as _get_sv
@@ -195,6 +214,7 @@ class IsolatedPreprocessingService:
                 [str(self._worker_python), "-c", f"import {module}"],
                 capture_output=True,
                 timeout=_IMPORT_CHECK_TIMEOUT,
+                **_no_window_kwargs(),
             )
             available = result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
@@ -251,6 +271,7 @@ class IsolatedPreprocessingService:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                **_no_window_kwargs(),
             )
             stdout, stderr = proc.communicate(
                 input=json.dumps(task_spec), timeout=timeout

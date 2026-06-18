@@ -46,26 +46,85 @@ def _noop(_msg: str) -> None:
     pass
 
 
+def _no_window_kwargs() -> dict:
+    """subprocess kwargs that prevent a console window flashing on Windows."""
+    if sys.platform != "win32":
+        return {}
+    startupinfo = subprocess.STARTUPINFO()
+    startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    startupinfo.wShowWindow = subprocess.SW_HIDE
+    return {
+        "creationflags": subprocess.CREATE_NO_WINDOW,
+        "startupinfo": startupinfo,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Locations
 # ---------------------------------------------------------------------------
-def base_dir() -> Path:
-    """Root for the shared Flamingo preprocessing assets (pixi + env)."""
+def _default_base() -> Path:
+    """Default root for Flamingo preprocessing assets (under the user profile)."""
     if sys.platform == "win32":
         root = os.environ.get("APPDATA") or str(Path.home() / "AppData" / "Roaming")
         return Path(root) / "Flamingo"
     return Path.home() / ".flamingo"
 
 
+def _pointer_file() -> Path:
+    """Tiny file (always in the default base) recording the chosen install root.
+
+    Kept at a fixed location so both the GUI builder and the runtime service
+    resolve the same env even when the user installed it on another drive.
+    """
+    return _default_base() / "install_location.txt"
+
+
+def install_root() -> Path:
+    """Root under which the pixi binary + flat-field env live.
+
+    The user can relocate this (e.g. to a drive with more space); the choice is
+    persisted via :func:`set_install_root`. Falls back to the default base.
+    """
+    try:
+        ptr = _pointer_file()
+        if ptr.is_file():
+            chosen = Path(ptr.read_text(encoding="utf-8").strip())
+            if str(chosen):
+                return chosen
+    except Exception:
+        pass
+    return _default_base()
+
+
+def set_install_root(path: Path) -> None:
+    """Persist the chosen install root (created lazily). Pass a directory."""
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    ptr = _pointer_file()
+    ptr.parent.mkdir(parents=True, exist_ok=True)
+    ptr.write_text(str(path), encoding="utf-8")
+
+
+# Back-compat alias.
+def base_dir() -> Path:
+    return install_root()
+
+
 def pixi_exe() -> Path:
     """Path to the (bundled-or-downloaded) pixi binary."""
     name = "pixi.exe" if sys.platform == "win32" else "pixi"
-    return base_dir() / "pixi" / name
+    return install_root() / "pixi" / name
 
 
 def env_dir() -> Path:
     """Pixi project directory for the flat-field environment."""
-    return base_dir() / "flatfield_env"
+    return install_root() / "flatfield_env"
+
+
+def pixi_cache_dir() -> Path:
+    """Package cache dir — kept under install_root so the chosen drive holds
+    everything (the conda/PyPI cache is multi-GB and would otherwise land on C:)."""
+    return install_root() / "pixi_cache"
 
 
 def env_python() -> Path:
@@ -158,8 +217,10 @@ def ensure_pixi(progress: Optional[ProgressFn] = None) -> Path:
     try:
         with urllib.request.urlopen(url) as resp:  # noqa: S310 (trusted host)
             total = int(resp.headers.get("Content-Length", 0))
+            if total:
+                progress(f"Downloading pixi ({total // 1_000_000} MB)…")
             got = 0
-            last_mb = -1
+            last_quarter = 0
             with open(tmp, "wb") as f:
                 while True:
                     chunk = resp.read(1 << 16)
@@ -167,10 +228,12 @@ def ensure_pixi(progress: Optional[ProgressFn] = None) -> Path:
                         break
                     f.write(chunk)
                     got += len(chunk)
-                    mb = got // 1_000_000
-                    if total and mb != last_mb:  # report at most once per MB
-                        last_mb = mb
-                        progress(f"Downloading pixi … {mb}/{total // 1_000_000} MB")
+                    # Report only at 25% milestones (≤3 lines), not every MB.
+                    if total:
+                        quarter = int(got * 4 / total)
+                        if quarter != last_quarter and quarter < 4:
+                            last_quarter = quarter
+                            progress(f"  pixi download {quarter * 25}%…")
         tmp.replace(exe)
     except Exception:
         try:
@@ -216,16 +279,22 @@ def build_env(progress: Optional[ProgressFn] = None) -> Path:
     cmd = [str(exe), "install", "--manifest-path", str(proj / "pixi.toml")]
     logger.info(f"Running: {' '.join(cmd)}")
 
+    # Keep pixi's (multi-GB) package cache on the chosen drive too.
+    sub_env = dict(os.environ)
+    sub_env["PIXI_CACHE_DIR"] = str(pixi_cache_dir())
+
     # Stream pixi output line-by-line into the progress log.
     captured: list[str] = []
     try:
         proc = subprocess.Popen(
             cmd,
             cwd=str(proj),
+            env=sub_env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            **_no_window_kwargs(),
         )
     except OSError as e:
         raise RuntimeError(f"Could not launch pixi: {e}") from e
