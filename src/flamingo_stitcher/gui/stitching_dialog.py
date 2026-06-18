@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt5.QtCore import QProcess, QSettings, Qt, pyqtSignal
+from PyQt5.QtCore import QProcess, QSettings, Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -226,6 +226,27 @@ class BackgroundZeroPanel(QWidget):
 
     def set_expanded(self, expanded: bool) -> None:
         self._toggle.setChecked(bool(expanded))
+
+
+class _FlatFieldSetupThread(QThread):
+    """Builds the pixi flat-field environment off the UI thread.
+
+    Emits ``progress`` lines as pixi downloads Python + basicpy, then ``done``
+    with (success, message). All the heavy lifting lives in
+    ``preprocessing_env.build_env`` — this just bridges it to Qt signals.
+    """
+
+    progress = pyqtSignal(str)
+    done = pyqtSignal(bool, str)
+
+    def run(self):
+        try:
+            from flamingo_stitcher import preprocessing_env
+
+            preprocessing_env.build_env(self.progress.emit)
+            self.done.emit(True, "")
+        except Exception as e:  # surfaced to the user in _on_setup_finished
+            self.done.emit(False, str(e))
 
 
 class StitchingDialog(PersistentDialog):
@@ -850,13 +871,11 @@ class StitchingDialog(PersistentDialog):
 
         btn_layout.addStretch()
 
-        self._setup_env_btn = QPushButton("Setup Preprocessing...")
+        self._setup_env_btn = QPushButton("Set up flat-field…")
         self._setup_env_btn.setToolTip(
-            "Install isolated environment for flat-field correction\n"
-            "and Leonardo dual-illumination fusion.\n\n"
-            "Downloads ~6 GB GPU / ~3 GB CPU (torch+jax, basicpy,\n"
-            "leonardo-toolset). GPU default — Leonardo needs it.\n"
-            "Only needed once."
+            "One-click install of flat-field correction (basicpy).\n\n"
+            "Downloads a self-contained environment (~1–2 GB) — no Python\n"
+            "or technical setup required, just internet. CPU only; needed once."
         )
         self._setup_env_btn.clicked.connect(self._on_setup_env)
         btn_layout.addWidget(self._setup_env_btn)
@@ -2594,7 +2613,7 @@ class StitchingDialog(PersistentDialog):
             self._flat_field_cb.setEnabled(False)
             self._flat_field_cb.setToolTip(
                 "Flat-field correction requires basicpy.\n"
-                "Click 'Setup Preprocessing...' to install it\n"
+                "Click 'Set up flat-field…' to install it\n"
                 "in an isolated environment."
             )
 
@@ -2659,7 +2678,7 @@ class StitchingDialog(PersistentDialog):
                     item.setToolTip(
                         "Leonardo FUSE requires leonardo-toolset in the\n"
                         "isolated preprocessing environment.\n"
-                        "Click 'Setup Preprocessing...' to install it."
+                        "Click 'Set up flat-field…' to install it."
                     )
             # If the current selection is Leonardo but it's now disabled,
             # fall back to Max so the run doesn't pick an unavailable mode.
@@ -2725,134 +2744,72 @@ class StitchingDialog(PersistentDialog):
             QDesktopServices.openUrl(QUrl(self._TROUBLESHOOTING_URL))
 
     def _on_setup_env(self):
-        """Run the preprocessing environment setup script."""
-        import sys
+        """Build the flat-field environment with pixi (no system Python needed).
 
-        from flamingo_stitcher.isolated_service import (
-            IsolatedPreprocessingService,
-        )
+        Downloads pixi + Python + basicpy in a background thread, streaming
+        progress to the log. The user does nothing technical — one click.
+        """
+        from flamingo_stitcher import preprocessing_env
 
-        service = IsolatedPreprocessingService()
-        if service.is_available():
-            status_parts = []
-            if service.has_basicpy():
-                status_parts.append("basicpy")
-            if service.has_leonardo():
-                status_parts.append("leonardo-toolset")
-            if status_parts:
-                reply = QMessageBox.question(
-                    self,
-                    "Environment Exists",
-                    f"Preprocessing environment already exists with: "
-                    f"{', '.join(status_parts)}.\n\n"
-                    f"Reinstall? (This will recreate the environment.)",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply != QMessageBox.Yes:
-                    return
-                # Delete existing env so script recreates it
-                import shutil
-
-                env_path = service.env_path()
-                self._log(f"Removing existing environment: {env_path}")
-                try:
-                    shutil.rmtree(env_path)
-                except Exception as e:
-                    self._log(f"ERROR: Could not remove environment: {e}")
-                    return
+        if preprocessing_env.is_built():
+            reply = QMessageBox.question(
+                self,
+                "Flat-field environment exists",
+                "The flat-field environment is already installed.\n\n"
+                "Rebuild it? (Re-runs the install; usually only needed if it's "
+                "broken.)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
 
         reply = QMessageBox.question(
             self,
-            "Setup Preprocessing Environment",
-            "This will download and install ~6 GB (GPU) of packages:\n"
-            "  - PyTorch + JAX (CUDA GPU by default; Leonardo needs a GPU)\n"
-            "  - basicpy (flat-field correction)\n"
-            "  - leonardo-toolset (dual-illumination fusion)\n\n"
-            "For a CPU-only machine, set FLAMINGO_PREPROC_DEVICE=cpu first.\n"
-            "This only needs to be done once. Continue?",
+            "Set up flat-field correction",
+            "This installs a one-time, self-contained environment for flat-field "
+            "correction (basicpy). It downloads ~1–2 GB and needs no Python "
+            "pre-installed — just an internet connection.\n\nContinue?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.Yes,
         )
         if reply != QMessageBox.Yes:
             return
 
-        # Find the setup script
-        script_dir = Path(__file__).resolve().parents[2] / "scripts"
-        if sys.platform == "win32":
-            script = script_dir / "create_preprocessing_env.bat"
-        else:
-            script = script_dir / "create_preprocessing_env.sh"
-
-        if not script.is_file():
-            # Try relative to package root
-            from importlib import resources
-
-            script_dir = Path(__file__).resolve().parents[3] / "scripts"
-            if sys.platform == "win32":
-                script = script_dir / "create_preprocessing_env.bat"
-            else:
-                script = script_dir / "create_preprocessing_env.sh"
-
-        if not script.is_file():
-            QMessageBox.warning(
-                self,
-                "Script Not Found",
-                f"Could not find setup script.\n"
-                f"Expected at: {script}\n\n"
-                f"Run it manually from the scripts/ directory.",
-            )
-            return
-
-        self._log(f"\n=== Setting up preprocessing environment ===")
-        self._log(f"Script: {script}")
+        self._log("\n=== Setting up flat-field environment (pixi) ===")
         self._setup_env_btn.setEnabled(False)
-        self._setup_env_btn.setText("Setting up...")
+        self._setup_env_btn.setText("Setting up…")
 
-        self._env_process = QProcess(self)
-        self._env_process.setProcessChannelMode(QProcess.MergedChannels)
-        self._env_process.readyReadStandardOutput.connect(self._on_env_process_output)
-        self._env_process.finished.connect(self._on_env_process_finished)
+        self._env_thread = _FlatFieldSetupThread(self)
+        self._env_thread.progress.connect(self._log)
+        self._env_thread.done.connect(self._on_setup_finished)
+        self._env_thread.start()
 
-        if sys.platform == "win32":
-            self._env_process.start("cmd.exe", ["/c", str(script)])
-        else:
-            self._env_process.start("bash", [str(script)])
-
-    def _on_env_process_output(self):
-        """Read and display output from the setup process."""
-        data = self._env_process.readAllStandardOutput()
-        text = bytes(data).decode("utf-8", errors="replace").strip()
-        if text:
-            for line in text.splitlines():
-                self._log(line)
-
-    def _on_env_process_finished(self, exit_code, _exit_status):
-        """Handle setup process completion."""
+    def _on_setup_finished(self, success: bool, error: str):
+        """Handle completion of the pixi flat-field setup thread."""
         self._setup_env_btn.setEnabled(True)
-        self._setup_env_btn.setText("Setup Preprocessing...")
+        self._setup_env_btn.setText("Set up flat-field…")
 
-        if exit_code == 0:
-            self._log("\n=== Preprocessing environment setup complete ===")
-            # Clear cached availability checks
+        if success:
+            self._log("\n=== Flat-field environment ready ===")
             from flamingo_stitcher.isolated_service import (
                 IsolatedPreprocessingService,
             )
 
             service = IsolatedPreprocessingService()
             service.clear_cache()
-
-            # Refresh UI availability
             self._update_preprocessing_availability()
             self._log(
                 f"  basicpy: {'available' if service.has_basicpy() else 'not found'}"
             )
-            self._log(
-                f"  leonardo: {'available' if service.has_leonardo() else 'not found'}"
-            )
         else:
-            self._log(f"\n=== Setup failed (exit code {exit_code}) ===")
-            self._log("Check the log above for errors.")
+            self._log("\n=== Setup failed ===")
+            self._log(error)
+            QMessageBox.warning(
+                self,
+                "Flat-field setup failed",
+                f"Could not build the flat-field environment:\n\n{error}",
+            )
 
     # --- Background-zero preview ---
 

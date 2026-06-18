@@ -133,12 +133,44 @@ class IsolatedPreprocessingService:
         return cls._LINUX_ENV
 
     def _find_worker_python(self) -> Optional[Path]:
-        """Locate the isolated venv's Python executable."""
+        """Locate the isolated environment's Python executable.
+
+        Prefers the one-click pixi flat-field env (preprocessing_env); falls
+        back to a legacy hand-built venv so older setups keep working.
+        """
+        try:
+            from flamingo_stitcher import preprocessing_env
+
+            if preprocessing_env.is_built():
+                return preprocessing_env.env_python()
+        except Exception:
+            pass
         if sys.platform == "win32":
             p = self._WINDOWS_ENV / "Scripts" / "python.exe"
         else:
             p = self._LINUX_ENV / "bin" / "python"
         return p if p.is_file() else None
+
+    def _worker_command(self) -> List[str]:
+        """Build the command that launches the worker in the isolated env.
+
+        For the pixi env, run the staged standalone worker script by path
+        (``flamingo_stitcher`` is not importable there). For a legacy venv,
+        fall back to ``-m flamingo_stitcher.isolated_worker``.
+        """
+        py = str(self._worker_python)
+        try:
+            from flamingo_stitcher import preprocessing_env
+
+            staged = preprocessing_env.staged_worker()
+            if (
+                self._worker_python == preprocessing_env.env_python()
+                and staged.is_file()
+            ):
+                return [py, str(staged)]
+        except Exception:
+            pass
+        return [py, "-m", "flamingo_stitcher.isolated_worker"]
 
     def is_available(self) -> bool:
         """Whether the isolated environment exists and has a Python executable."""
@@ -210,7 +242,7 @@ class IsolatedPreprocessingService:
             "params": params or {},
         }
 
-        cmd = [str(self._worker_python), "-m", "flamingo_stitcher.isolated_worker"]
+        cmd = self._worker_command()
 
         try:
             proc = subprocess.Popen(

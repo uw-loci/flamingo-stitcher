@@ -79,13 +79,17 @@ for pkg in collect_pkgs:
     except Exception as exc:  # a missing optional pkg should not break the build
         print(f"[spec] collect_all({pkg!r}) skipped: {exc}")
 
-# Bundle the vendored config YAMLs so config_loader finds them at runtime.
+# Bundle the vendored config YAMLs so config_loader finds them at runtime,
+# plus the pixi manifest for the one-click flat-field environment.
 datas += collect_data_files(
-    "flamingo_stitcher", includes=["configs/*.yaml", "docs/*.md"]
+    "flamingo_stitcher", includes=["configs/*.yaml", "docs/*.md", "preprocessing/*.toml"]
 )
-# App icon + preprocessing-env setup scripts.
+# App icon + legacy preprocessing scripts + the standalone worker source.
+# isolated_worker.py is shipped as a data file (not just bundled bytecode) so
+# preprocessing_env can stage it into the pixi env and run it by path.
 datas += [
     (os.path.join(ROOT, "src/flamingo_stitcher/gui/flamingo_icon.png"), "flamingo_stitcher/gui"),
+    (os.path.join(ROOT, "src/flamingo_stitcher/isolated_worker.py"), "flamingo_stitcher"),
     (os.path.join(ROOT, "scripts/create_preprocessing_env.bat"), "scripts"),
     (os.path.join(ROOT, "scripts/create_preprocessing_env.sh"), "scripts"),
 ]

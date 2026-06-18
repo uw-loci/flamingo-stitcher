@@ -1,0 +1,28 @@
+# Pixi manifest for the isolated flat-field-correction environment.
+#
+# basicpy hard-pins scipy<1.13 while the stitcher needs scipy>=1.14, so
+# flat-field runs in this separate environment. Pixi downloads its own Python
+# (the user needs nothing pre-installed) and basicpy is pulled from PyPI along
+# with its jax/scikit-image backend.
+#
+# CPU only — flat-field does not need a GPU. (Leonardo dual-illumination fusion,
+# which does need CUDA, is intentionally not included here.)
+#
+# Resolved on the target machine at install time. setuptools is capped <81 to
+# avoid the pkg_resources removal that breaks transitive imports (see the QPSC
+# Appose lockfile notes).
+
+[workspace]
+name = "flamingo-flatfield"
+channels = ["conda-forge"]
+platforms = ["win-64", "linux-64", "osx-arm64"]
+
+[dependencies]
+python = "3.11.*"
+pip = ">=23.0"
+setuptools = ">=65,<81"
+
+[pypi-dependencies]
+basicpy = "==2.0.0"
+scipy = "<1.13"
+numpy = "<2.0"
