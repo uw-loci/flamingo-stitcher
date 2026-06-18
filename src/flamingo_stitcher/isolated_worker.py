@@ -8,21 +8,28 @@ Communication protocol:
     - Receives a JSON task spec on stdin
     - Attaches to named shared memory blocks for input arrays
     - Runs the requested task (flat_field_estimate, flat_field_apply, leonardo_fuse)
-    - Writes output arrays to new shared memory blocks
+    - Writes output arrays to temporary .npy files
     - Prints a JSON response to stdout
 
 The main process owns and cleans up input shared memory.
-Output shared memory is created here but cleaned up by the main process
-after reading the results.
+
+Output arrays are written to temp ``.npy`` files (not shared memory) on
+purpose: a shared-memory block is destroyed when the last open handle is
+closed, and this worker is the only process holding the output block. On
+Windows the main process calls ``communicate()``, which only returns *after*
+the worker has already exited — so the output block would be gone before it
+could be attached. A temp file persists independent of process lifetime and
+works identically on Windows and POSIX. The main process reads then deletes it.
 """
 
 import json
+import os
 import sys
+import tempfile
 import time
-import uuid
-from multiprocessing.shared_memory import SharedMemory
 
 import numpy as np
+from multiprocessing.shared_memory import SharedMemory
 
 
 def _attach_arrays(inputs: dict) -> tuple:
@@ -41,19 +48,19 @@ def _attach_arrays(inputs: dict) -> tuple:
     return arrays, handles
 
 
-def _create_output_shm(arr: np.ndarray, key: str) -> tuple:
-    """Copy *arr* into a new shared memory block.
+def _write_output_file(arr: np.ndarray, key: str, out_dir: str = None) -> dict:
+    """Write *arr* to a temporary ``.npy`` file the main process will read.
 
-    Returns (metadata_dict, shm_handle).
+    Returns a metadata dict ``{"path", "shape", "dtype"}``. Unlike a shared
+    memory block, the file outlives this worker process, so the main process
+    can read it after ``communicate()`` returns (i.e. after we have exited).
     """
-    name = f"flamingo_out_{key}_{uuid.uuid4().hex[:6]}"
-    shm = SharedMemory(create=True, size=arr.nbytes, name=name)
-    view = np.ndarray(arr.shape, dtype=arr.dtype, buffer=shm.buf)
-    view[:] = arr
-    return (
-        {"name": name, "shape": list(arr.shape), "dtype": str(arr.dtype)},
-        shm,
+    fd, path = tempfile.mkstemp(
+        prefix=f"flamingo_out_{key}_", suffix=".npy", dir=out_dir or None
     )
+    os.close(fd)
+    np.save(path, arr, allow_pickle=False)
+    return {"path": path, "shape": list(arr.shape), "dtype": str(arr.dtype)}
 
 
 # ---------------------------------------------------------------------------
@@ -173,13 +180,11 @@ def main():
         sys.stdout.flush()
         sys.exit(1)
 
-    # Write output arrays to shared memory
+    # Write output arrays to temp files (persist past our exit; see module docstring)
+    out_dir = params.get("output_dir") or None
     output_info = {}
-    output_handles = []
     for key, arr in result_arrays.items():
-        meta, shm = _create_output_shm(arr, key)
-        output_info[key] = meta
-        output_handles.append(shm)
+        output_info[key] = _write_output_file(arr, key, out_dir)
 
     # Respond with success
     json.dump(
@@ -192,7 +197,7 @@ def main():
     for h in input_handles:
         h.close()
 
-    # Don't close/unlink output handles — main process will read then cleanup
+    # Output files are read and deleted by the main process.
 
 
 if __name__ == "__main__":

@@ -2032,12 +2032,30 @@ class StitchingPipeline:
                     return output_path
 
                 if models:
+                    for ch_id, model in models.items():
+                        try:
+                            ff = np.asarray(model.flatfield)
+                            self.logger.info(
+                                f"  Channel {ch_id}: flat-field model "
+                                f"(range {float(ff.min()):.3f}–{float(ff.max()):.3f})"
+                            )
+                        except Exception:
+                            pass
                     self._progress_fn(38, "Applying flat-field correction...")
+                    self.logger.info(
+                        f"  Applying flat-field correction to "
+                        f"{len(models)} channel(s)..."
+                    )
                     apply_flat_field(
                         channel_tile_data, models, progress_fn=_ff_progress
                     )
+                    self.logger.info("  Flat-field correction applied.")
                 else:
-                    self.logger.warning("  No flat-field models — skipping correction")
+                    self.logger.warning(
+                        "  No flat-field models produced — skipping correction. "
+                        "BaSiCPy estimation returned nothing (see the log file in "
+                        "%APPDATA%/FlamingoStitcher/logs/ for the underlying error)."
+                    )
 
         # --- Step 3: Register using reference channel ---
         if self.config.skip_registration:

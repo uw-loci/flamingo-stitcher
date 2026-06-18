@@ -140,6 +140,30 @@ def staged_worker() -> Path:
     return env_dir() / "flamingo_isolated_worker.py"
 
 
+def ensure_worker_staged() -> Optional[Path]:
+    """Refresh the staged worker script from the (bundled) source if stale.
+
+    The worker is copied into the env dir at *build* time, so an env built by
+    an older app version keeps that older worker on disk — an app update alone
+    would not pick up worker fixes without a manual "Reinstall flat-field…".
+    Re-staging here (a tiny file copy) guarantees the running app always uses
+    its own bundled worker. No-op if the env dir does not exist yet.
+    """
+    try:
+        dst = staged_worker()
+        if not dst.parent.is_dir():
+            return None
+        src = worker_source()
+        new = src.read_bytes()
+        if not dst.is_file() or dst.read_bytes() != new:
+            dst.write_bytes(new)
+            logger.info(f"Re-staged isolated worker -> {dst}")
+        return dst
+    except Exception as e:  # never let staging break a run
+        logger.warning(f"Could not re-stage isolated worker: {e}")
+        return None
+
+
 def is_built() -> bool:
     """True once the environment's Python interpreter exists."""
     return env_python().is_file()

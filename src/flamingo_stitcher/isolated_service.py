@@ -17,6 +17,7 @@ which runs scripts/create_preprocessing_env.bat (or .sh).
 
 import json
 import logging
+import os
 import subprocess
 import sys
 import uuid
@@ -181,12 +182,14 @@ class IsolatedPreprocessingService:
         try:
             from flamingo_stitcher import preprocessing_env
 
-            staged = preprocessing_env.staged_worker()
-            if (
-                self._worker_python == preprocessing_env.env_python()
-                and staged.is_file()
-            ):
-                return [py, str(staged)]
+            if self._worker_python == preprocessing_env.env_python():
+                # Refresh the staged copy so worker fixes ship with the app,
+                # not only on a manual "Reinstall flat-field…".
+                staged = preprocessing_env.ensure_worker_staged()
+                if staged is None:
+                    staged = preprocessing_env.staged_worker()
+                if staged.is_file():
+                    return [py, str(staged)]
         except Exception:
             pass
         return [py, "-m", "flamingo_stitcher.isolated_worker"]
@@ -294,11 +297,24 @@ class IsolatedPreprocessingService:
             )
 
     def _collect_output(self, result: dict, key: str) -> np.ndarray:
-        """Read an output array from worker result and cleanup its shared memory."""
+        """Read an output array from the worker's temp file, then delete it.
+
+        The worker writes outputs to temp ``.npy`` files rather than shared
+        memory: a shared-memory block is freed when the last handle closes, and
+        the worker (its only holder) has already exited by the time
+        ``communicate()`` returns — so attaching by name fails on Windows
+        (and the POSIX resource-tracker unlinks it on Linux). A file outlives
+        the worker on both platforms.
+        """
         info = result["outputs"][key]
-        sa = SharedArray.attach(info["name"], tuple(info["shape"]), info["dtype"])
-        arr = sa.to_array()
-        sa.close(unlink=True)
+        path = info["path"]
+        try:
+            arr = np.load(path, allow_pickle=False)
+        finally:
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
         return arr
 
     # ------------------------------------------------------------------
