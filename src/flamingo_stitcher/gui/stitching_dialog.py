@@ -934,6 +934,14 @@ class StitchingDialog(PersistentDialog):
         self._log_group = QGroupBox()
         log_layout = QVBoxLayout()
         log_layout.setContentsMargins(0, 0, 0, 0)
+        self._verbose_log_cb = QCheckBox("Verbose log (include Python output)")
+        self._verbose_log_cb.setToolTip(
+            "Include behind-the-scenes Python output (flat-field, Imaris/Zarr\n"
+            "writers, isolated environment, etc.) in this log. Off by default\n"
+            "for a concise run log; turn on to troubleshoot a failed/odd run.\n"
+            "Takes effect on the next run."
+        )
+        log_layout.addWidget(self._verbose_log_cb)
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setMinimumHeight(120)
@@ -2221,6 +2229,7 @@ class StitchingDialog(PersistentDialog):
             channels=self._batch_channels,
             tiles=item["tiles"],
             parent=self,
+            verbose=self._verbose_log_cb.isChecked(),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.log_message.connect(self._on_log_message)
@@ -3092,6 +3101,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
+        s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -3179,6 +3189,8 @@ class StitchingDialog(PersistentDialog):
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():
             self._frame_size_combo.setCurrentIndex(frame_idx)
+
+        self._verbose_log_cb.setChecked(s.value("verbose_log", False, type=bool))
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)
@@ -3339,6 +3351,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
+        s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -3426,6 +3439,8 @@ class NativeStitchingDialog(StitchingDialog):
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():
             self._frame_size_combo.setCurrentIndex(frame_idx)
+
+        self._verbose_log_cb.setChecked(s.value("verbose_log", False, type=bool))
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)

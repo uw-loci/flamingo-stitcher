@@ -3460,7 +3460,11 @@ class StitchingPipeline:
                         progress_callback=self._progress_fn,
                     )
             except Exception as e:
+                # 'imaris' is the sole requested format, so a failure here means
+                # no usable output — surface it so the item is marked failed
+                # instead of being reported as a successful run.
                 self.logger.error(f"  Imaris .ims write failed: {e}", exc_info=True)
+                raise RuntimeError(f"Imaris .ims write failed: {e}") from e
 
     def _write_multichannel_streaming(
         self,

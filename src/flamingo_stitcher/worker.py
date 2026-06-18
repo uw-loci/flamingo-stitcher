@@ -58,6 +58,7 @@ class StitchingWorker(QThread):
         channels: Optional[List[int]] = None,
         tiles: Optional[List[RawTileInfo]] = None,
         parent=None,
+        verbose: bool = False,
     ):
         super().__init__(parent)
         self._config = config
@@ -66,6 +67,7 @@ class StitchingWorker(QThread):
         self._channels = channels
         self._tiles = tiles
         self._cancelled = False
+        self._verbose = verbose
 
     def cancel(self):
         """Request cancellation of the pipeline."""
@@ -73,12 +75,28 @@ class StitchingWorker(QThread):
 
     def run(self):
         """Execute the stitching pipeline on the worker thread."""
-        # Install a log handler that forwards to our signal
-        pipeline_logger = logging.getLogger("flamingo_stitcher.pipeline")
+        # Install a log handler that forwards log records to our signal.
+        #
+        # Normal mode: attach to the "flamingo_stitcher.pipeline" logger only,
+        # for a concise, user-facing run log.
+        #
+        # Verbose mode: attach to the parent "flamingo_stitcher" logger, which
+        # also receives records (via propagation) from flat_field,
+        # isolated_service, the writers (imaris/zarr/tiff), etc. — the
+        # behind-the-scenes Python output that's invaluable for troubleshooting
+        # (e.g. the real reason a flat-field or Imaris write failed). We attach
+        # to the parent *instead of* the pipeline logger so pipeline lines
+        # aren't duplicated. The name prefix makes the source clear.
+        if self._verbose:
+            log_logger = logging.getLogger("flamingo_stitcher")
+            fmt = logging.Formatter("%(name)s: %(message)s")
+        else:
+            log_logger = logging.getLogger("flamingo_stitcher.pipeline")
+            fmt = logging.Formatter("%(message)s")
         handler = _SignalLogHandler(self.log_message)
-        handler.setFormatter(logging.Formatter("%(message)s"))
-        pipeline_logger.addHandler(handler)
-        pipeline_logger.setLevel(logging.DEBUG)
+        handler.setFormatter(fmt)
+        log_logger.addHandler(handler)
+        log_logger.setLevel(logging.DEBUG)
 
         try:
             self.progress.emit(0, "Initializing pipeline...")
@@ -128,4 +146,4 @@ class StitchingWorker(QThread):
             self.error.emit(msg)
 
         finally:
-            pipeline_logger.removeHandler(handler)
+            log_logger.removeHandler(handler)

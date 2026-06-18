@@ -273,6 +273,22 @@ def write_imaris_streaming(
 
     callback = _ImarisProgressCallback(progress_callback)
 
+    # PyImarisWriter opens output_path for writing at construction. A leftover
+    # .ims from a previous run — especially one still open in Imaris — can make
+    # the native layer fail in confusing ways (often only surfacing as an
+    # access violation at Destroy()). Remove a stale file up front and give a
+    # clear, actionable error if it's locked, instead of a cryptic crash later.
+    if output_path.exists():
+        try:
+            output_path.unlink()
+            logger.info(f"  Removed existing .ims before write: {output_path}")
+        except OSError as e:
+            raise RuntimeError(
+                f"Cannot overwrite the existing Imaris file:\n  {output_path}\n"
+                "It is probably open in Imaris (or another program). Close it, "
+                f"then re-run.\n(underlying error: {e})"
+            ) from e
+
     logger.info(
         f"Creating ImarisWriter: {output_path} shape=(C={n_channels}, "
         f"Z={z}, Y={y}, X={x}) block_size_xyz={block_size_xyz} "
@@ -292,6 +308,7 @@ def write_imaris_streaming(
         callback,
     )
 
+    finished = False
     try:
         total_blocks = (
             -(-image_size.x // block_size.x)
@@ -357,13 +374,30 @@ def write_imaris_streaming(
             color_infos,
             adjust_color_range=True,
         )
+        finished = True
         logger.info(f".ims write complete: {output_path}")
 
         if progress_callback:
             progress_callback(100, ".ims write complete")
 
     finally:
-        converter.Destroy()
+        # Some PyImarisWriter versions invalidate the converter inside Finish(),
+        # so the explicit Destroy() double-frees and raises an access violation.
+        # When Finish() already succeeded the .ims is complete and usable, so a
+        # Destroy() crash must NOT fail the write — downgrade it to a warning.
+        # If Finish() did not complete, the real error from the try block still
+        # propagates (we only swallow Destroy()'s own exception here).
+        try:
+            converter.Destroy()
+        except Exception as de:
+            if finished:
+                logger.warning(
+                    "  PyImarisWriter Destroy() raised after a successful "
+                    "Finish() — the .ims file is complete and usable; ignoring "
+                    f"the cleanup error: {de}"
+                )
+            else:
+                logger.error(f"  PyImarisWriter Destroy() also failed: {de}")
 
     return output_path
 
