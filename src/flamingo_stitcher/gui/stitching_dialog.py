@@ -528,9 +528,11 @@ class StitchingDialog(PersistentDialog):
         tile_fuse_box.setContentsMargins(0, 0, 0, 0)
         tile_fuse_box.addWidget(QLabel("Tile overlap:"))
         self._tile_fusion_combo = QComboBox()
+        # Maximum first → it is the default on a fresh install (best for this
+        # rig's light-sheet data; Blend available for dense/registered data).
         for label, value in [
-            ("Blend", "blend"),
             ("Maximum", "max"),
+            ("Blend", "blend"),
         ]:
             self._tile_fusion_combo.addItem(label, value)
         self._tile_fusion_combo.setToolTip(
@@ -2457,7 +2459,18 @@ class StitchingDialog(PersistentDialog):
 
     def _on_item_finished(self):
         """Handle worker thread completion for a queue item."""
+        # Release the finished worker and reclaim its memory BEFORE the next
+        # item's resource check reads available RAM. Critical on the failure
+        # path: an in-memory fusion OOM raises a MemoryError whose traceback
+        # holds the giant tile/output arrays in a reference cycle, so without
+        # an explicit gc the next items see ~0 GB free and falsely abort
+        # (cascading one failure into all remaining items).
+        if self._worker is not None:
+            self._worker.deleteLater()
         self._worker = None
+        import gc
+
+        gc.collect()
         # If the item is still 'stitching', it was cancelled mid-run
         if 0 <= self._queue_index < len(self._queue):
             item = self._queue[self._queue_index]

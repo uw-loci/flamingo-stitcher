@@ -481,7 +481,10 @@ class StitchingConfig:
     #             a neighbour's background. Best for sparse / sub-FOV samples.
     # NOTE: distinct from `illumination_fusion`, which combines left/right
     # light-sheet illumination sides, not adjacent tiles.
-    tile_overlap_fusion: str = "blend"
+    # Default "max": on this hardware's light-sheet data (structured tissue,
+    # stage-only registration) weighted blending produced visible dark seam
+    # dips; max holds up and is also lighter on memory than blend.
+    tile_overlap_fusion: str = "max"
 
     # OME-Zarr sharding options
     zarr_chunks: Tuple = (32, 256, 256)  # Inner chunk shape (~4 MB per chunk)
@@ -721,36 +724,36 @@ def estimate_memory_usage(
         _streaming_threshold = 0.6
         _streaming_workers = 4
 
-    # In-memory peak: tile data + stacked output + compute/pyramid overhead.
-    # Tile data (preprocessed volumes) persists throughout the pipeline.
-    # On top of that, the stacked output array is built, then pyramids are
-    # generated during write.
-    tile_gb = n_planes * frame_w * frame_h * bpv / (1024**3)
-    per_channel_gb = output_gb / max(n_channels, 1)
+    # In-memory peak. Three terms dominate:
+    #   1. held tiles — every preprocessed tile for all channels stays resident
+    #      throughout the in-memory pipeline (uint16).
+    #   2. fusion float64 working set — THE term the old estimate missed.
+    #      multiview-stitcher's block fusion does `sim.astype(float)` on each
+    #      overlapping source tile (full-tile float64 materialisation), and the
+    #      threaded dask scheduler can have most tiles converted concurrently.
+    #      For many-tile / high-overlap grids this is the largest term and is
+    #      what made a "~24 GB" 20-tile/25%-overlap job actually peak ~134 GB.
+    #   3. the stacked output array + pyramid generation during write.
     pyramid_overhead_gb = output_gb * 0.33
-    compute_overhead_gb = per_channel_gb + tile_gb * 2  # dask working set
+    per_channel_gb = output_gb / max(n_channels, 1)
 
-    # Tile data footprint
     ds_any = ds_xy > 1 or ds_z > 1
     ds_tile_planes = n_planes // ds_z if ds_z > 1 else n_planes
     ds_tile_w = frame_w // ds_xy if ds_xy > 1 else frame_w
     ds_tile_h = frame_h // ds_xy if ds_xy > 1 else frame_h
     n_tiles = len(tiles)
-    if ds_any:
-        tile_data_gb = (
-            n_tiles
-            * n_channels
-            * ds_tile_planes
-            * ds_tile_w
-            * ds_tile_h
-            * bpv
-            / (1024**3)
-        )
-    else:
-        tile_data_gb = 2 * tile_gb  # memmaps, demand-paged
+
+    held_tiles_gb = (
+        n_tiles * n_channels * ds_tile_planes * ds_tile_w * ds_tile_h * bpv
+    ) / (1024**3)
+    # float64 fusion copies (8 bytes vs the source's `bpv`).
+    fusion_float_gb = held_tiles_gb * (8.0 / bpv)
 
     in_memory_gb = (
-        tile_data_gb + output_gb + max(compute_overhead_gb, pyramid_overhead_gb)
+        held_tiles_gb
+        + fusion_float_gb
+        + output_gb
+        + max(pyramid_overhead_gb, per_channel_gb)
     )
 
     # Streaming peak: one channel's tile working set + dask chunk buffers.
@@ -772,6 +775,7 @@ def estimate_memory_usage(
         )
     else:
         # Memmaps — OS demand-pages, count ~2 tiles active at a time
+        tile_gb = n_planes * frame_w * frame_h * bpv / (1024**3)
         tile_data_gb = 2 * tile_gb
     # Plus chunk buffers during zarr/TIFF write
     chunk_z = config.output_chunksize.get("z", 128)

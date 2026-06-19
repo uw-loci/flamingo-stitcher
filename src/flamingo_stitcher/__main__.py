@@ -91,7 +91,7 @@ def main():
     preproc_group.add_argument(
         "--tile-overlap-fusion",
         choices=["blend", "max"],
-        default="blend",
+        default="max",
         help=(
             "How overlapping tiles are combined: 'blend' (weighted cosine, "
             "default) or 'max' (pixel-wise maximum — best for sparse/sub-FOV "
