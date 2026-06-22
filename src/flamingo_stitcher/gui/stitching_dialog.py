@@ -40,6 +40,9 @@ logger = logging.getLogger(__name__)
 
 # QSettings keys
 _SETTINGS_GROUP = "StitchingDialog"
+# Shared (cross-dialog) key for the last folder browsed to via "Add…", so the
+# file picker reopens there even when the queue is empty.
+_LAST_BROWSE_KEY = "StitchingShared/last_browse_dir"
 
 
 def _napari_available() -> bool:
@@ -1047,6 +1050,7 @@ class StitchingDialog(PersistentDialog):
             self, "Select Acquisition Directory", start
         )
         if folder:
+            self._remember_browse_dir(Path(folder).parent)
             self._add_path_to_queue(Path(folder))
 
     def _add_folder_to_queue(self):
@@ -1058,6 +1062,7 @@ class StitchingDialog(PersistentDialog):
         if not parent:
             return
 
+        self._remember_browse_dir(parent)
         parent_path = Path(parent)
         added = 0
         for child in sorted(parent_path.iterdir()):
@@ -1080,10 +1085,23 @@ class StitchingDialog(PersistentDialog):
                 if start.parent != start:
                     start = start.parent
             return str(start)
+        # Fall back to the last folder the user browsed to — survives an empty
+        # queue (e.g. after processing + clearing) so "Add…" reopens there.
+        last_browse = QSettings().value(_LAST_BROWSE_KEY, "", type=str)
+        if last_browse and Path(last_browse).exists():
+            return last_browse
         output = self._output_dir_edit.text()
         if output and Path(output).parent.exists():
             return str(Path(output).parent)
         return str(Path.home())
+
+    def _remember_browse_dir(self, folder: str) -> None:
+        """Persist the folder the user just browsed to (shared across dialogs)."""
+        try:
+            if folder:
+                QSettings().setValue(_LAST_BROWSE_KEY, str(folder))
+        except Exception:
+            pass
 
     def _looks_like_acquisition(self, path: Path) -> bool:
         """Check if a directory looks like an acquisition folder.
@@ -1122,9 +1140,14 @@ class StitchingDialog(PersistentDialog):
         )
         self._update_queue_table()
 
-        # Auto-set output directory from first item
-        if len(self._queue) == 1 and not self._output_dir_edit.text().strip():
-            self._output_dir_edit.setText(str(path.parent))
+        # Auto-set output directory from first item. Also re-set if the field
+        # holds a stale path on a now-disconnected drive (otherwise the old
+        # value sticks and the user keeps writing to a dead location).
+        if len(self._queue) == 1:
+            out = self._output_dir_edit.text().strip()
+            out_unreachable = bool(out) and not Path(out).parent.exists()
+            if not out or out_unreachable:
+                self._output_dir_edit.setText(str(path.parent))
 
         self._update_action_buttons()
 
@@ -2830,9 +2853,10 @@ class StitchingDialog(PersistentDialog):
                     )
                 else:
                     item.setToolTip(
-                        "Leonardo FUSE requires leonardo-toolset in the\n"
-                        "isolated preprocessing environment.\n"
-                        "Click 'Set up flat-field…' to install it."
+                        "Leonardo FUSE requires leonardo-toolset (GPU/CUDA) in\n"
+                        "the isolated preprocessing environment. The flat-field\n"
+                        "setup does NOT install it — Leonardo needs a separate\n"
+                        "GPU env (see the preprocessing-env setup scripts)."
                     )
             # If the current selection is Leonardo but it's now disabled,
             # fall back to Max so the run doesn't pick an unavailable mode.
@@ -3198,7 +3222,9 @@ class StitchingDialog(PersistentDialog):
                 self._add_path_to_queue(Path(acq_dir))
 
         output_dir = s.value("output_dir", "", type=str)
-        if output_dir:
+        # Only restore if the location is still reachable. A persisted path on a
+        # disconnected drive would otherwise stick (and block the auto-set).
+        if output_dir and Path(output_dir).parent.exists():
             self._output_dir_edit.setText(output_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
@@ -3455,7 +3481,9 @@ class NativeStitchingDialog(StitchingDialog):
                 self._add_path_to_queue(Path(acq_dir))
 
         output_dir = s.value("output_dir", "", type=str)
-        if output_dir:
+        # Only restore if the location is still reachable. A persisted path on a
+        # disconnected drive would otherwise stick (and block the auto-set).
+        if output_dir and Path(output_dir).parent.exists():
             self._output_dir_edit.setText(output_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
