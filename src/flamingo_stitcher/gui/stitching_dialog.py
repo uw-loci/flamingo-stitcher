@@ -1028,7 +1028,7 @@ class StitchingDialog(PersistentDialog):
 
         self._status_label = QLabel("Ready")
         self._status_label.setStyleSheet("color: #555; font-size: 11px;")
-        # Wrap so the ETA tail "M:SS remaining (done at ~HH:MM)" stays visible
+        # Wrap so the ETA tail "M:SS remaining (Done at ~HH:MM)" stays visible
         # even when the phase prefix is long (e.g. multi-channel fuse).
         self._status_label.setWordWrap(True)
         progress_v.addWidget(self._status_label)

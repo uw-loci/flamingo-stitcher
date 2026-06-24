@@ -190,11 +190,11 @@ class MultiPhaseEstimator:
         return clock.strftime("%a %H:%M")
 
     def format_label(self) -> str:
-        """``"M:SS remaining (done at ~HH:MM)"`` or ``"estimating..."``."""
+        """``"M:SS remaining (Done at ~HH:MM)"`` or ``"estimating..."``."""
         rem = self.remaining_seconds()
         if rem is None:
             return "estimating..."
-        return f"{_format_duration(rem)} remaining (done at ~{self.format_eta()})"
+        return f"{_format_duration(rem)} remaining (Done at ~{self.format_eta()})"
 
 
 def _format_duration(seconds: float) -> str:

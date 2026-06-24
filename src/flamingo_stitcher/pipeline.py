@@ -360,7 +360,7 @@ class _TimeThrottledProgress(_DaskCallback):
                 if clock.date() == datetime.now().date()
                 else clock.strftime("%a %H:%M")
             )
-            tail = f" — {rem} remaining (done at ~{eta_str})"
+            tail = f" — {rem} remaining (Done at ~{eta_str})"
         else:
             tail = ""
         msg = f"{self._label}: {pct_local:.0f}%{tail}"
