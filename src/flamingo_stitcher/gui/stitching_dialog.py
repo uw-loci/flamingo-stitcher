@@ -402,10 +402,33 @@ class StitchingDialog(PersistentDialog):
         out_layout.addWidget(out_browse_btn)
         content_layout.addLayout(out_layout)
 
-        # --- Settings group ---
-        settings_group = QGroupBox("Settings")
+        # --- Settings, split into three plainly-named groups so a new user
+        # isn't met with one dense wall of controls. Advanced toggles stay in
+        # the collapsible "Processing Options" panel below. The three boxes
+        # live in a container assigned to self._settings_group, so the single
+        # setEnabled() that locks settings during a run still disables them all.
+        settings_container = QWidget()
+        settings_vbox = QVBoxLayout(settings_container)
+        settings_vbox.setContentsMargins(0, 0, 0, 0)
+        settings_vbox.setSpacing(10)
+
+        def _group_hint(text):
+            lbl = QLabel(text)
+            lbl.setWordWrap(True)
+            lbl.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+            return lbl
+
+        # ===== Group 1: "Tell me about your image" (facts about the data) =====
+        image_group = QGroupBox("Tell me about your image")
+        image_outer = QVBoxLayout()
+        self._image_hint = _group_hint(
+            "Detected automatically when you add an acquisition and press "
+            "Discover — usually you can leave these as they are."
+        )
+        image_outer.addWidget(self._image_hint)
         settings_layout = QGridLayout()
         settings_layout.setSpacing(6)
+        image_outer.addLayout(settings_layout)
 
         # Load hardware-derived pixel size default
         try:
@@ -456,6 +479,32 @@ class StitchingDialog(PersistentDialog):
             "AOI metadata is missing/wrong."
         )
         settings_layout.addWidget(self._frame_size_combo, 0, 5)
+
+        # Which channels to stitch — a fact about the acquisition, so it lives
+        # here with the other "about your image" inputs rather than with output.
+        settings_layout.addWidget(QLabel("Channels:"), 1, 0)
+        self._channels_edit = QLineEdit()
+        self._channels_edit.setPlaceholderText("All (or e.g. 0,1)")
+        self._channels_edit.setToolTip(
+            "Leave empty for all channels, or comma-separated list (e.g. 0,1)"
+        )
+        settings_layout.addWidget(self._channels_edit, 1, 1)
+
+        image_group.setLayout(image_outer)
+        settings_vbox.addWidget(image_group)
+
+        # ===== Group 2: "What kind of processing should we do?" =====
+        proc_basic_group = QGroupBox("What kind of processing should we do?")
+        proc_outer = QVBoxLayout()
+        proc_outer.addWidget(
+            _group_hint(
+                "The defaults are a good starting point for most samples. "
+                "Finer controls live under “Processing Options” below."
+            )
+        )
+        settings_layout = QGridLayout()
+        settings_layout.setSpacing(6)
+        proc_outer.addLayout(settings_layout)
 
         # Row 1: Downsample XY/Z + Illumination fusion
         settings_layout.addWidget(QLabel("Downsample:"), 1, 0)
@@ -555,6 +604,22 @@ class StitchingDialog(PersistentDialog):
         tile_fuse_box.addWidget(self._tile_fusion_combo)
         settings_layout.addLayout(tile_fuse_box, 1, 4)
 
+        proc_basic_group.setLayout(proc_outer)
+        settings_vbox.addWidget(proc_basic_group)
+
+        # ===== Group 3: "How should we save it?" =====
+        output_group = QGroupBox("How should we save it?")
+        output_outer = QVBoxLayout()
+        output_outer.addWidget(
+            _group_hint(
+                "OME-Zarr (Fiji compatible) is a safe default. The size, time, "
+                "and memory estimates below update as you change these."
+            )
+        )
+        settings_layout = QGridLayout()
+        settings_layout.setSpacing(6)
+        output_outer.addLayout(settings_layout)
+
         # Row 2: Output format + Compression
         settings_layout.addWidget(QLabel("Output format:"), 2, 0)
         self._format_combo = QComboBox()
@@ -640,16 +705,8 @@ class StitchingDialog(PersistentDialog):
         settings_layout.addWidget(self._compression_combo, 2, 4)
         self._update_compression_options()
 
-        # Row 3: Channels + Memory mode
-        settings_layout.addWidget(QLabel("Channels:"), 3, 0)
-        self._channels_edit = QLineEdit()
-        self._channels_edit.setPlaceholderText("All (or e.g. 0,1)")
-        self._channels_edit.setToolTip(
-            "Leave empty for all channels, or comma-separated list (e.g. 0,1)"
-        )
-        settings_layout.addWidget(self._channels_edit, 3, 1)
-
-        settings_layout.addWidget(QLabel("Memory mode:"), 3, 3)
+        # Row 3: Memory mode (Channels now lives in the "image" group above)
+        settings_layout.addWidget(QLabel("Memory mode:"), 3, 0)
         self._streaming_combo = QComboBox()
         self._streaming_combo.addItem("Auto", None)
         self._streaming_combo.addItem("In-memory (fast)", False)
@@ -660,7 +717,7 @@ class StitchingDialog(PersistentDialog):
             "Streaming: low RAM, required for TB-scale data."
         )
         self._streaming_combo.currentIndexChanged.connect(self._update_memory_indicator)
-        settings_layout.addWidget(self._streaming_combo, 3, 4)
+        settings_layout.addWidget(self._streaming_combo, 3, 1)
 
         # Memory safety indicator
         self._memory_indicator = QLabel("")
@@ -669,14 +726,34 @@ class StitchingDialog(PersistentDialog):
         self._last_mem_estimate = None
         settings_layout.addWidget(self._memory_indicator, 3, 2)
 
-        # Row 4: Memory estimate
+        # ===== Output information (live estimates) =====
+        # A separate, plainly-labelled box so the native→output resolution,
+        # memory, and time read-outs are easy to find instead of being buried
+        # under the save settings.
+        info_group = QGroupBox("Output information")
+        info_layout = QVBoxLayout()
+        info_layout.setSpacing(4)
+
+        # Native → output voxel size (how pixel size, Z step, and downsample
+        # combine). Shown first because it answers "what resolution do I get?".
+        self._voxel_readout_label = QLabel("")
+        self._voxel_readout_label.setStyleSheet("color: #444; font-size: 11px;")
+        self._voxel_readout_label.setToolTip(
+            "Native voxel (XY pixel × XY pixel × Z step) from the fields\n"
+            "above, then the resulting output voxel after applying the\n"
+            "chosen downsample factors. For 'iso', the factors are\n"
+            "resolved from the native voxel and shown in parentheses."
+        )
+        info_layout.addWidget(self._voxel_readout_label)
+
+        # Memory estimate (in-memory vs streaming peak, colour-coded).
         self._memory_label = QLabel("")
         # Rich text so per-term spans can carry their own colour.
         self._memory_label.setTextFormat(Qt.RichText)
         self._memory_label.setStyleSheet("font-size: 11px;")
-        settings_layout.addWidget(self._memory_label, 4, 0, 1, 5)
+        info_layout.addWidget(self._memory_label)
 
-        # Row 5: rough queue-time estimate (sum across pending queue items).
+        # Rough queue-time estimate (sum across pending queue items).
         self._time_label = QLabel("")
         self._time_label.setTextFormat(Qt.RichText)
         self._time_label.setStyleSheet("font-size: 11px;")
@@ -686,20 +763,9 @@ class StitchingDialog(PersistentDialog):
             "when available;\notherwise a rough guess. Accuracy improves as you "
             "run more acquisitions."
         )
-        settings_layout.addWidget(self._time_label, 5, 0, 1, 5)
+        info_layout.addWidget(self._time_label)
 
-        # Live "Output voxel" readout showing how Pixel size, Z step, and
-        # the two downsample combos combine. Updated whenever any of those
-        # four inputs change so the relationship is always visible.
-        self._voxel_readout_label = QLabel("")
-        self._voxel_readout_label.setStyleSheet("color: #444; font-size: 11px;")
-        self._voxel_readout_label.setToolTip(
-            "Native voxel (XY pixel × XY pixel × Z step) from the fields\n"
-            "above, then the resulting output voxel after applying the\n"
-            "chosen downsample factors. For 'iso', the factors are\n"
-            "resolved from the native voxel and shown in parentheses."
-        )
-        settings_layout.addWidget(self._voxel_readout_label, 6, 0, 1, 5)
+        info_group.setLayout(info_layout)
         # Track whether the user has manually set the XY pixel size, so the
         # ScopeSettings-derived auto-fill on discover doesn't clobber a
         # deliberate choice. A guard distinguishes programmatic setValue.
@@ -726,9 +792,14 @@ class StitchingDialog(PersistentDialog):
         self._format_combo.currentIndexChanged.connect(self._refresh_memory_estimate)
         self._channels_edit.textChanged.connect(self._refresh_memory_estimate)
 
-        settings_group.setLayout(settings_layout)
-        self._settings_group = settings_group
-        content_layout.addWidget(settings_group)
+        output_group.setLayout(output_outer)
+        settings_vbox.addWidget(output_group)
+        settings_vbox.addWidget(info_group)
+
+        # The group boxes share one container so the existing
+        # self._settings_group.setEnabled(False) during a run disables them all.
+        self._settings_group = settings_container
+        content_layout.addWidget(settings_container)
 
         # --- Collapsible processing options ---
         self._proc_toggle = QPushButton("\u25b6 Processing Options")
@@ -1254,8 +1325,7 @@ class StitchingDialog(PersistentDialog):
         event.acceptProposedAction()
         if added:
             self._log(
-                f"Added {added} folder(s) via drag-and-drop. "
-                f"Click Discover or Run."
+                f"Added {added} folder(s) via drag-and-drop. " f"Click Discover or Run."
             )
 
     def _update_queue_table(self):
@@ -1402,6 +1472,51 @@ class StitchingDialog(PersistentDialog):
         if pending:
             self._bg_zero_panel.set_thresholds(pending)
             self._pending_bg_zero_thresholds = {}
+
+        # Surface the auto-detected facts in the always-visible "image" group.
+        # The full detail is logged above, but the log panel is collapsed by
+        # default, so users miss what was detected (frame/AOI, pixel, Z, etc.).
+        self._update_image_detected_hint()
+
+    def _update_image_detected_hint(self):
+        """Refresh the always-visible "Tell me about your image" hint with the
+        values resolved on Discover: frame (camera AOI / ROI) size, XY pixel
+        size, Z step, channels, and tile count. Keeps the auto-detected facts
+        in front of the user without needing to expand the log.
+        """
+        if not hasattr(self, "_image_hint"):
+            return
+        all_tiles = [t for it in self._queue if it.get("tiles") for t in it["tiles"]]
+        if not all_tiles:
+            self._image_hint.setText(
+                "Detected automatically when you add an acquisition and press "
+                "Discover — usually you can leave these as they are."
+            )
+            return
+
+        try:
+            from flamingo_stitcher.pipeline import _resolve_frame_size
+
+            fw, fh = _resolve_frame_size(all_tiles)
+            frame_str = f"{fw}×{fh} px"
+            if len({(t.frame_width, t.frame_height) for t in all_tiles}) > 1:
+                frame_str += " (varies — check for mixed acquisitions!)"
+        except Exception:
+            frame_str = "auto"
+
+        channels = sorted({ch for t in all_tiles for ch in t.channels})
+        ch_str = ", ".join(str(c) for c in channels) if channels else "?"
+        px = self._pixel_size_spin.value()
+        z = self._z_step_spin.value()
+        z_str = f"{z:.3f} µm" if z > 0 else "auto"
+
+        self._image_hint.setTextFormat(Qt.RichText)
+        self._image_hint.setText(
+            f"<b>Detected:</b> frame/ROI <b>{frame_str}</b> · "
+            f"pixel <b>{px:.3f} µm</b> · Z step <b>{z_str}</b> · "
+            f"channel(s) <b>{ch_str}</b> · <b>{len(all_tiles)}</b> tiles. "
+            "Filled in from the acquisition — change only if you know a value is wrong."
+        )
 
     def _on_pixel_size_changed(self, _value):
         """Mark the XY pixel size as user-set unless we set it ourselves."""
@@ -2893,7 +3008,9 @@ class StitchingDialog(PersistentDialog):
         here = Path(__file__).resolve()
         candidates = [
             # Bundled in the package: src/flamingo_stitcher/docs/...
-            here.parent.parent / "docs" / "stitching_hardware_troubleshooting.md",
+            here.parent.parent
+            / "docs"
+            / "stitching_hardware_troubleshooting.md",
         ]
         if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
             candidates.append(

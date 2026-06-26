@@ -31,7 +31,12 @@ dependencies = [
     "tifffile>=2023.2.0,<2027",
     "zarr>=3.1.4,<4",
     "numcodecs>=0.14.0,<1",
-    "multiview-stitcher>=0.1.37,<0.2",
+    # >=0.1.56: earlier versions ignore the `output_chunksize` dict during
+    # block fusion and use a ~1024px XY block. On a heavily-downsampled grid
+    # that makes dozens of small tiles overlap one block, which the fuser then
+    # stacks as float64 (e.g. 81 views × 64×1024×1024 = 40.5 GiB per block) —
+    # a machine-killing OOM. 0.1.56 honours the 256px chunk we request.
+    "multiview-stitcher>=0.1.56,<0.2",
     # certifi gives urllib a CA bundle inside the frozen build (no system CA
     # store there), so the GUI updater's HTTPS calls to api.github.com verify.
     "certifi>=2023.7.22",

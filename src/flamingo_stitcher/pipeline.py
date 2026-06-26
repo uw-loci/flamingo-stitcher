@@ -84,8 +84,7 @@ def environment_summary() -> List[str]:
     git = _get_git_version() if not frozen else None
 
     lines = [
-        f"Flamingo Stitcher: {fs_version} ({build})"
-        + (f", git {git}" if git else ""),
+        f"Flamingo Stitcher: {fs_version} ({build})" + (f", git {git}" if git else ""),
         f"Python {platform.python_version()} on {platform.platform()}",
         "Key deps: "
         + ", ".join(
@@ -170,9 +169,7 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
     n_channels = len(sorted({ch for t in tiles for ch in t.channels}))
     planes = max((t.n_planes for t in tiles), default=1)
     # pyramid_levels: None means auto — bucket "auto" (-1) separately from 0/N.
-    pyramid_levels = (
-        -1 if config.pyramid_levels is None else int(config.pyramid_levels)
-    )
+    pyramid_levels = -1 if config.pyramid_levels is None else int(config.pyramid_levels)
     fusion_method = "content_based" if config.content_based_fusion else "cosine"
 
     src = acquisition_dir
@@ -213,6 +210,7 @@ def rough_run_seconds(tiles, config) -> float:
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
     fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
     return load_register + fuse_write
+
 
 # Raw filename pattern: S000_t000000_V000_R0000_X000_Y000_C{ch}_I{illum}_D{det}_P{planes}.raw
 RAW_FILE_PATTERN = re.compile(
@@ -681,6 +679,17 @@ def estimate_memory_usage(
     n_planes = max(t.n_planes for t in tiles)
     ds_xy = config.downsample_xy
     ds_z = config.downsample_z
+    # Resolve the "iso" sentinel (-1) to concrete factors. Otherwise the
+    # `// ds_xy` divisions below run on -1, which silently cancels in the X*Y
+    # product and reports the full-resolution size. Needs the Z step; if it's
+    # unknown here, fall back to no downsample (a conservative over-estimate).
+    if ds_xy == ISO_DOWNSAMPLE or ds_z == ISO_DOWNSAMPLE:
+        if config.z_step_um:
+            ds_xy, ds_z = compute_iso_downsample(config.pixel_size_um, config.z_step_um)
+        else:
+            ds_xy, ds_z = 1, 1
+    ds_xy = max(1, int(ds_xy))
+    ds_z = max(1, int(ds_z))
     frame_w, frame_h = _resolve_frame_size(tiles, config)
 
     # Estimate output spatial extent from tile positions
@@ -746,8 +755,25 @@ def estimate_memory_usage(
     held_tiles_gb = (
         n_tiles * n_channels * ds_tile_planes * ds_tile_w * ds_tile_h * bpv
     ) / (1024**3)
-    # float64 fusion copies (8 bytes vs the source's `bpv`).
-    fusion_float_gb = held_tiles_gb * (8.0 / bpv)
+    # float64 fusion working set. multiview-stitcher fuses block-by-block: for
+    # each output block it stacks EVERY source tile overlapping that block as a
+    # float64 array at the block's size, then reduces. Peak is therefore
+    #   (concurrent blocks) × (tiles overlapping one block) × (block voxels) × 8
+    # NOT the sum of downsampled tile sizes. Heavy downsampling shrinks tiles
+    # relative to the fixed output block, so many tiles overlap each block and
+    # this term dominates — the failure mode where an 8× job estimated at
+    # ~10 GB actually peaked ~190 GB. Model it with the output chunk we pass to
+    # fusion.fuse (block size) and how many tiles land in one block.
+    chunk_z = min(int(config.output_chunksize.get("z", 128)), max(out_z_px, 1))
+    chunk_y = min(int(config.output_chunksize.get("y", 256)), max(out_y_px, 1))
+    chunk_x = min(int(config.output_chunksize.get("x", 256)), max(out_x_px, 1))
+    tiles_per_block_x = min(n_tiles, (chunk_x + ds_tile_w - 1) // max(ds_tile_w, 1) + 1)
+    tiles_per_block_y = min(n_tiles, (chunk_y + ds_tile_h - 1) // max(ds_tile_h, 1) + 1)
+    views_per_block = min(n_tiles, tiles_per_block_x * tiles_per_block_y)
+    block_float_gb = views_per_block * chunk_z * chunk_y * chunk_x * 8 / (1024**3)
+    # Our fuse scheduler caps concurrency (see _pick_fuse_workers); budget a
+    # small fixed number of concurrent blocks as a safe upper bound.
+    fusion_float_gb = 4 * block_float_gb
 
     in_memory_gb = (
         held_tiles_gb
@@ -991,15 +1017,24 @@ def _read_capture_and_angles(workflow_file: Optional[Path]) -> Dict[str, object]
     Returns a dict with `capture_modes` (list of int per camera),
     `capture_percents` (list of int), and `n_angles` (int).
     """
-    out: Dict[str, object] = {"capture_modes": [], "capture_percents": [], "n_angles": 1}
+    out: Dict[str, object] = {
+        "capture_modes": [],
+        "capture_percents": [],
+        "n_angles": 1,
+    }
     if workflow_file is None or not workflow_file.exists():
         return out
     try:
         content = workflow_file.read_text(errors="replace")
     except OSError:
         return out
-    modes = [int(m) for m in re.findall(r"Camera \d+ capture mode[^=]*=\s*(\d+)", content)]
-    pcts = [int(p) for p in re.findall(r"Camera \d+ capture percentage\s*=\s*(\d+)", content)]
+    modes = [
+        int(m) for m in re.findall(r"Camera \d+ capture mode[^=]*=\s*(\d+)", content)
+    ]
+    pcts = [
+        int(p)
+        for p in re.findall(r"Camera \d+ capture percentage\s*=\s*(\d+)", content)
+    ]
     out["capture_modes"] = modes
     out["capture_percents"] = pcts
     na = re.search(r"Number of angles\s*=\s*(\d+)", content)
@@ -1253,9 +1288,7 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
             pos = _read_position_from_settings(settings_file)
         elif root_wf.exists():
             # Fallback: compute from root Workflow.txt grid
-            pos = _compute_grid_position(
-                root_wf, x_idx, y_idx, n_tiles_x, n_tiles_y
-            )
+            pos = _compute_grid_position(root_wf, x_idx, y_idx, n_tiles_x, n_tiles_y)
         else:
             logger.warning(
                 f"No _Settings.txt or Workflow.txt for tile X{x_idx}_Y{y_idx}, "
@@ -1980,9 +2013,7 @@ class StitchingPipeline:
 
         # Hard abort before committing any resources if this item would blow
         # past available RAM or disk (prevents machine-killing OOM/ENOSPC).
-        self._enforce_resource_limits(
-            tiles, output_path, mem_est, use_streaming
-        )
+        self._enforce_resource_limits(tiles, output_path, mem_est, use_streaming)
 
         if use_streaming:
             # ============================================================
@@ -2144,9 +2175,27 @@ class StitchingPipeline:
             )
 
             self._progress_fn(fuse_pct + 5, f"Computing channel {ch_id} into memory...")
-            self.logger.info(f"  Computing channel {ch_id} into memory...")
-            with dask.diagnostics.ProgressBar():
-                vol = np.asarray(fused_sim.data.compute())
+            # Bound the dask scheduler the same way the streaming path does.
+            # multiview-stitcher fuses block-by-block, stacking every source
+            # tile that overlaps a block as a float64 array at the block's
+            # size. With the default (unbounded) threaded scheduler, many such
+            # blocks materialise at once — on a heavily-downsampled grid (small
+            # tiles, many overlapping one block) that turned a "~10 GB" job into
+            # a 190 GB OOM. Capping concurrency keeps peak ≈ workers × one block.
+            fuse_workers = self._pick_fuse_workers(fused_sim.data)
+            if fuse_workers <= 1:
+                scheduler_cfg: Dict[str, Any] = {"scheduler": "synchronous"}
+                scheduler_name = "synchronous"
+            else:
+                scheduler_cfg = {"scheduler": "threads", "num_workers": fuse_workers}
+                scheduler_name = f"threads×{fuse_workers}"
+            self.logger.info(
+                f"  Computing channel {ch_id} into memory "
+                f"(scheduler={scheduler_name})..."
+            )
+            with dask.config.set(**scheduler_cfg):
+                with dask.diagnostics.ProgressBar():
+                    vol = np.asarray(fused_sim.data.compute())
             # Squeeze singleton dims from SpatialImage
             while vol.ndim > 3:
                 vol = vol[0]
@@ -2791,71 +2840,14 @@ class StitchingPipeline:
                 if ch_id not in tile.raw_files:
                     continue
 
-                illum_files = tile.raw_files[ch_id]
-
-                # Load each illumination side
-                illum_volumes = {}
-                for illum_side, raw_path in illum_files.items():
-                    vol = load_raw_volume(
-                    raw_path, tile.n_planes, tile.frame_width, tile.frame_height
-                )
-                    illum_volumes[illum_side] = vol
-
-                # Fuse illumination sides
-                if len(illum_volumes) > 1:
-                    self.logger.info(
-                        f"    Ch{ch_id}: fusing {len(illum_volumes)} illumination "
-                        f"sides ({self.config.illumination_fusion})"
-                    )
-                    volume = fuse_illumination_sides(
-                        illum_volumes, method=self.config.illumination_fusion
-                    )
-                else:
-                    volume = np.asarray(list(illum_volumes.values())[0])
-
-                # Depth-dependent attenuation correction
-                if self.config.depth_attenuation:
-                    from .depth_attenuation import correct_depth_attenuation
-
-                    z_step = self.config.z_step_um
-                    if z_step is None:
-                        z_step = tile.z_step_mm * 1000.0 if tile.z_step_mm else 10.0
-                    volume = correct_depth_attenuation(
-                        volume,
-                        mu=self.config.depth_attenuation_mu,
-                        z_step_um=z_step,
-                    )
-
-                # Destripe (before downsample — full resolution)
-                if self.config.destripe and not self.config.destripe_fast:
-                    volume = destripe_volume(
-                        volume, max_workers=self.config.destripe_workers
-                    )
-
-                # Deconvolution (per-tile, before stitching)
-                if self.config.deconvolution_enabled:
-                    volume = self._deconvolve_tile(volume, tile)
-
-                # Downsample
-                if self.config.downsample_xy > 1 or self.config.downsample_z > 1:
-                    volume = downsample_volume(
-                        volume, self.config.downsample_xy, self.config.downsample_z
-                    )
-
-                # Destripe (after downsample — fast mode)
-                if self.config.destripe and self.config.destripe_fast:
-                    volume = destripe_volume(
-                        volume, max_workers=self.config.destripe_workers
-                    )
-
-                # Flip X axis if camera is inverted relative to stage
-                # so tile image data aligns with stage-coordinate translations.
-                # Use a view (no copy/materialization) — dask handles negative
-                # strides when the volume is wrapped downstream.  This keeps
-                # memmapped tiles lazy so 66+ tiles don't exhaust RAM.
-                if self.config.camera_x_inverted:
-                    volume = volume[:, :, ::-1]
-
+                # Single shared preprocess path (load → illumination fuse →
+                # depth attenuation → destripe → deconvolution → downsample →
+                # camera-X flip). Both the in-memory and streaming modes go
+                # through _preprocess_single_tile so the two can never diverge
+                # again — they once did: the streaming copy dropped the frame
+                # (AOI) size args and loaded cropped tiles at the wrong 2048²
+                # default, scrambling the data.
+                volume = self._preprocess_single_tile(tile, ch_id)
                 result[ch_id].append((volume, tile))
 
         return result
@@ -2873,10 +2865,22 @@ class StitchingPipeline:
 
         illum_volumes = {}
         for illum_side, raw_path in illum_files.items():
-            vol = load_raw_volume(raw_path, tile.n_planes)
+            # Pass the per-tile frame (camera AOI) dims. Omitting them falls
+            # back to the 2048×2048 module default, which reinterprets a
+            # cropped 1024×1024 acquisition with the wrong stride — scrambled
+            # data and a wrong plane count (the streaming-mode corruption that
+            # produced blank/garbage Imaris output). The in-memory path passed
+            # these all along; this is now the single shared read.
+            vol = load_raw_volume(
+                raw_path, tile.n_planes, tile.frame_width, tile.frame_height
+            )
             illum_volumes[illum_side] = vol
 
         if len(illum_volumes) > 1:
+            self.logger.info(
+                f"    Ch{ch_id}: fusing {len(illum_volumes)} illumination "
+                f"sides ({self.config.illumination_fusion})"
+            )
             volume = fuse_illumination_sides(
                 illum_volumes, method=self.config.illumination_fusion
             )
@@ -4317,8 +4321,12 @@ class StitchingPipeline:
                 raise RuntimeError(
                     f"Aborting before run: needs ~{needed_gb:.0f} GB on the output "
                     f"drive ({output_gb:.0f} GB output"
-                    + (f" + {spill_gb:.0f} GB spill + {fused_memmap_gb:.0f} GB "
-                       f"fused memmap" if use_streaming else "")
+                    + (
+                        f" + {spill_gb:.0f} GB spill + {fused_memmap_gb:.0f} GB "
+                        f"fused memmap"
+                        if use_streaming
+                        else ""
+                    )
                     + f") but only {free_gb:.0f} GB free (limit "
                     f"{disk_frac * 100:.0f}%). Remedies: point output to a larger "
                     f"drive, increase downsample, or fix the XY pixel size if the "
