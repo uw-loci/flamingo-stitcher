@@ -772,6 +772,12 @@ class StitchingDialog(PersistentDialog):
         self._pixel_size_user_set = False
         self._setting_pixel_programmatically = False
         self._pixel_size_spin.valueChanged.connect(self._on_pixel_size_changed)
+        # Same guard for Z step: distinguish a deliberate in-session edit from a
+        # programmatic/restored value, so Discover re-detects Z from the data
+        # (overriding a stale persisted value) unless the user set it by hand.
+        self._z_step_user_set = False
+        self._setting_z_step_programmatically = False
+        self._z_step_spin.valueChanged.connect(self._on_z_step_changed)
         self._pixel_size_spin.valueChanged.connect(self._update_voxel_readout)
         self._z_step_spin.valueChanged.connect(self._update_voxel_readout)
         self._downsample_xy_combo.currentIndexChanged.connect(
@@ -1431,15 +1437,46 @@ class StitchingDialog(PersistentDialog):
         self._log(f"\nDiscovered {total} tiles across {ok}/{len(pending)} directories")
         self._update_action_buttons()
 
-        # Auto-fill Z step from first discovered tile if still "Auto".
-        # Each tile carries z_step_mm derived from its raw filenames +
-        # Workflow Z range, so we don't need to re-parse Workflow.txt.
-        if self._z_step_spin.value() == 0.0:
-            first_tiles = next((it["tiles"] for it in self._queue if it["tiles"]), None)
-            if first_tiles and first_tiles[0].z_step_mm:
-                z_um = first_tiles[0].z_step_mm * 1000.0
-                self._z_step_spin.setValue(z_um)
-                self._log(f"Auto-detected Z step: {z_um:.3f} µm (from tile metadata)")
+        # Auto-detect the Z step from the data on every Discover, overriding a
+        # stale persisted value. A non-zero restored Z step used to block this
+        # (the check was `== 0.0`), so a previous session's value silently rode
+        # through and squished/stretched the volume along Z. We now re-detect
+        # unless the user deliberately set Z by hand this session.
+        detected_z = None
+        first_item = next((it for it in self._queue if it.get("tiles")), None)
+        if first_item:
+            tiles0 = first_item["tiles"]
+            # Prefer the authoritative Workflow.txt "Plane spacing (um)" field;
+            # fall back to the z-range / plane-count value carried on the tile.
+            try:
+                from flamingo_stitcher.pipeline import _read_plane_spacing
+
+                for wf in (
+                    Path(first_item["path"]) / "Workflow.txt",
+                    tiles0[0].folder / "Workflow.txt",
+                ):
+                    if wf.exists():
+                        sp = _read_plane_spacing(wf)
+                        if sp:
+                            detected_z = float(sp)
+                        break
+            except Exception as e:
+                self._logger.debug(f"plane-spacing read skipped: {e}")
+            if detected_z is None and tiles0 and tiles0[0].z_step_mm:
+                detected_z = tiles0[0].z_step_mm * 1000.0
+
+        if detected_z:
+            if not self._z_step_user_set:
+                self._setting_z_step_programmatically = True
+                self._z_step_spin.setValue(detected_z)
+                self._setting_z_step_programmatically = False
+                self._log(f"Auto-detected Z step: {detected_z:.3f} µm")
+            elif abs(self._z_step_spin.value() - detected_z) > 0.05 * detected_z:
+                self._log(
+                    f"⚠ Z step {self._z_step_spin.value():.3f} µm differs from the "
+                    f"detected {detected_z:.3f} µm. Verify before stitching — a wrong "
+                    f"Z step stretches/squishes the volume along Z."
+                )
 
         # Auto-fill XY pixel size from the recorded objective (ScopeSettings.txt).
         self._autofill_pixel_size()
@@ -1522,6 +1559,13 @@ class StitchingDialog(PersistentDialog):
         """Mark the XY pixel size as user-set unless we set it ourselves."""
         if not self._setting_pixel_programmatically:
             self._pixel_size_user_set = True
+
+    def _on_z_step_changed(self, _value):
+        """Mark the Z step as user-set unless we set it ourselves (restore or
+        auto-detect), so Discover's auto-detection keeps overriding a stale
+        persisted value but never clobbers a deliberate manual entry."""
+        if not self._setting_z_step_programmatically:
+            self._z_step_user_set = True
 
     def _autofill_pixel_size(self):
         """Auto-fill XY pixel size from the acquisition's recorded objective.
@@ -3353,7 +3397,12 @@ class StitchingDialog(PersistentDialog):
         self._pixel_size_user_set = False
 
         z_step = s.value("z_step", 0.0, type=float)
+        # Restoring a persisted value must not count as a manual override —
+        # Discover's auto-detection from the data should still win.
+        self._setting_z_step_programmatically = True
         self._z_step_spin.setValue(z_step)
+        self._setting_z_step_programmatically = False
+        self._z_step_user_set = False
 
         ds_xy = s.value("downsample_xy", 0, type=int)
         if ds_xy:
@@ -3508,28 +3557,15 @@ class NativeStitchingDialog(StitchingDialog):
         self.setWindowTitle("Tile Stitching (Single Workflow)")
 
     def _discover_tiles_for_path(self, acq_path: Path):
-        """Discover tiles using flat-layout scanner."""
-        from flamingo_stitcher.pipeline import (
-            _read_plane_spacing,
-            discover_flat_tiles,
-        )
+        """Discover tiles using flat-layout scanner.
 
-        tiles = discover_flat_tiles(acq_path)
+        Z-step auto-detection is handled centrally in `_on_discover` (which
+        prefers the Workflow.txt plane spacing and respects the user-set
+        guard), so both dialogs share one path and can't disagree.
+        """
+        from flamingo_stitcher.pipeline import discover_flat_tiles
 
-        # Auto-set Z step from Workflow.txt if currently "Auto"
-        if tiles and self._z_step_spin.value() == 0.0:
-            for wf_candidate in [
-                acq_path / "Workflow.txt",
-                tiles[0].folder / "Workflow.txt",
-            ]:
-                if wf_candidate.exists():
-                    spacing = _read_plane_spacing(wf_candidate)
-                    if spacing:
-                        self._z_step_spin.setValue(spacing)
-                        self._log(f"Auto-detected Z step: {spacing} \u00b5m")
-                    break
-
-        return tiles
+        return discover_flat_tiles(acq_path)
 
     def _looks_like_acquisition(self, path: Path) -> bool:
         """Check if a directory looks like a flat-layout acquisition."""
@@ -3612,7 +3648,12 @@ class NativeStitchingDialog(StitchingDialog):
         self._pixel_size_user_set = False
 
         z_step = s.value("z_step", 0.0, type=float)
+        # Restoring a persisted value must not count as a manual override —
+        # Discover's auto-detection from the data should still win.
+        self._setting_z_step_programmatically = True
         self._z_step_spin.setValue(z_step)
+        self._setting_z_step_programmatically = False
+        self._z_step_user_set = False
 
         ds_xy = s.value("downsample_xy", 0, type=int)
         if ds_xy:
