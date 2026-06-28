@@ -1192,7 +1192,7 @@ class StitchingDialog(PersistentDialog):
         for child in path.iterdir():
             if child.is_dir() and (child / "Workflow.txt").exists():
                 return True
-            if child.suffix == ".raw":
+            if child.suffix.lower() in (".raw", ".tif", ".tiff", ".btf"):
                 return True
             checked += 1
             if checked >= 5:
@@ -3571,7 +3571,9 @@ class NativeStitchingDialog(StitchingDialog):
         """Check if a directory looks like a flat-layout acquisition."""
         if (path / "Workflow.txt").exists():
             return True
-        return any(path.glob("*.raw"))
+        from flamingo_stitcher.pipeline import _glob_tile_files
+
+        return bool(_glob_tile_files(path))
 
     def _save_settings(self):
         """Save dialog settings to QSettings (independent group)."""

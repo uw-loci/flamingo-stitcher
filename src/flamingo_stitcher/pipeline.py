@@ -212,15 +212,35 @@ def rough_run_seconds(tiles, config) -> float:
     return load_register + fuse_write
 
 
-# Raw filename pattern: S000_t000000_V000_R0000_X000_Y000_C{ch}_I{illum}_D{det}_P{planes}.raw
+# Tile file extensions the discovery + loader understand. The acquisition can
+# save tiles as raw uint16, TIFF, or BigTIFF (the microscope's output-format
+# dropdown). `.btf` is the conventional BigTIFF extension; tifffile also reads
+# BigTIFF transparently from a `.tif` name.
+TILE_EXTENSIONS = (".raw", ".tif", ".tiff", ".btf")
+_TIFF_EXTENSIONS = (".tif", ".tiff", ".btf")
+# Regex fragment matching any supported tile extension (case-insensitive).
+_TILE_EXT_RE = r"\.(?:raw|tiff?|btf)$"
+
+# Tile filename pattern: S000_t000000_V000_R0000_X000_Y000_C{ch}_I{illum}_D{det}_P{planes}.<ext>
 RAW_FILE_PATTERN = re.compile(
-    r"S\d+_t\d+_V\d+_R\d+_X\d+_Y\d+_C(\d+)_I(\d+)_D(\d+)_P(\d+)\.raw$"
+    r"S\d+_t\d+_V\d+_R\d+_X\d+_Y\d+_C(\d+)_I(\d+)_D(\d+)_P(\d+)" + _TILE_EXT_RE,
+    re.IGNORECASE,
 )
 
-# Flat-layout raw filename: captures X_idx, Y_idx, channel, illumination, detector, planes
+# Flat-layout filename: captures X_idx, Y_idx, channel, illumination, detector, planes
 FLAT_RAW_PATTERN = re.compile(
-    r"S\d+_t\d+_V\d+_R\d+_X(\d+)_Y(\d+)_C(\d+)_I(\d+)_D(\d+)_P(\d+)\.raw$"
+    r"S\d+_t\d+_V\d+_R\d+_X(\d+)_Y(\d+)_C(\d+)_I(\d+)_D(\d+)_P(\d+)" + _TILE_EXT_RE,
+    re.IGNORECASE,
 )
+
+
+def _glob_tile_files(directory: Path) -> List[Path]:
+    """All tile files (raw/tif/tiff/btf) directly inside ``directory``."""
+    files: List[Path] = []
+    for ext in TILE_EXTENSIONS:
+        files.extend(directory.glob(f"*{ext}"))
+    return files
+
 
 # Folder coordinate pattern: X{float}_Y{float} anywhere in name
 FOLDER_COORD_PATTERN = re.compile(r"X([-\d.]+)_Y([-\d.]+)")
@@ -879,6 +899,44 @@ def _read_aoi_from_workflow(workflow_file: Path) -> Optional[Tuple[int, int]]:
     return None
 
 
+def _read_tiff_shape(path: Path) -> Tuple[int, int, int]:
+    """Return ``(n_planes, height, width)`` of a (Big)TIFF tile stack from its
+    header — no pixel data is read. Page count is the plane count; the first
+    page's shape gives Y, X."""
+    import tifffile
+
+    with tifffile.TiffFile(str(path)) as tf:
+        n_planes = len(tf.pages)
+        shape = tf.pages[0].shape  # (Y, X) for a 2-D page
+        height, width = int(shape[0]), int(shape[1])
+    return n_planes, height, width
+
+
+def _resolve_tile_geometry(
+    sample_file: Path, n_planes: int, aoi: Optional[Tuple[int, int]]
+) -> Tuple[int, int, int]:
+    """Resolve ``(n_planes, frame_width, frame_height)`` for a tile.
+
+    For TIFF / BigTIFF everything is authoritative from the file header (page
+    count + page shape), so the AOI-from-file-size guesswork is not needed. For
+    raw, the plane count stays as parsed from the filename and the frame dims
+    come from the file size (the data wins over stale AOI metadata).
+    """
+    if sample_file.suffix.lower() in _TIFF_EXTENSIONS:
+        try:
+            tif_planes, height, width = _read_tiff_shape(sample_file)
+            return (tif_planes or n_planes), width, height
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"{sample_file.name}: could not read TIFF header ({e}); "
+                f"falling back to filename planes={n_planes} and AOI metadata."
+            )
+            fw, fh = aoi or (FRAME_WIDTH, FRAME_HEIGHT)
+            return n_planes, fw, fh
+    fw, fh = _resolve_tile_frame_dims(sample_file, n_planes, aoi)
+    return n_planes, fw, fh
+
+
 def _resolve_tile_frame_dims(
     raw_file: Path, n_planes: int, aoi: Optional[Tuple[int, int]]
 ) -> Tuple[int, int]:
@@ -1132,7 +1190,7 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
     # the actual file size override it (handles cropped-AOI acquisitions).
     aoi = _read_aoi_from_workflow(folder / "Workflow.txt")
     _sample = next(iter(next(iter(raw_files.values())).values()))
-    frame_w, frame_h = _resolve_tile_frame_dims(_sample, n_planes, aoi)
+    n_planes, frame_w, frame_h = _resolve_tile_geometry(_sample, n_planes, aoi)
 
     return RawTileInfo(
         folder=folder,
@@ -1232,15 +1290,15 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
 
     Returns list of RawTileInfo sorted by (Y, X).
     """
-    # Find the directory containing .raw files
+    # Find the directory containing tile files (raw / tif / tiff / btf)
     raw_dir = None
-    raw_files_found = list(acquisition_dir.glob("*.raw"))
+    raw_files_found = _glob_tile_files(acquisition_dir)
     if raw_files_found:
         raw_dir = acquisition_dir
     else:
         # Check one level deeper (date subdirectories)
         for sub in sorted(acquisition_dir.iterdir()):
-            if sub.is_dir() and list(sub.glob("*.raw")):
+            if sub.is_dir() and _glob_tile_files(sub):
                 raw_dir = sub
                 break
 
@@ -1321,7 +1379,7 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
             continue
 
         _sample = next(iter(next(iter(raw_files_dict.values())).values()))
-        frame_w, frame_h = _resolve_tile_frame_dims(_sample, n_planes, flat_aoi)
+        n_planes, frame_w, frame_h = _resolve_tile_geometry(_sample, n_planes, flat_aoi)
 
         tiles.append(
             RawTileInfo(
@@ -1436,6 +1494,46 @@ def load_raw_volume(
     return np.memmap(
         path, dtype=np.uint16, mode="r", shape=(n_planes, frame_height, frame_width)
     )
+
+
+def _load_tiff_volume(path: Path) -> np.ndarray:
+    """Load a (Big)TIFF tile stack as a (Z, Y, X) array.
+
+    Prefers a memory-map (no RAM cost, like the raw path) when the TIFF is
+    uncompressed and contiguous; falls back to a full read for compressed or
+    non-contiguous files. A single-page 2-D TIFF is promoted to a 1-plane stack.
+    """
+    import tifffile
+
+    try:
+        vol = tifffile.memmap(str(path), mode="r")
+    except (ValueError, MemoryError, NotImplementedError, OSError):
+        # Compressed / non-contiguous TIFF can't be memmapped — read it.
+        vol = np.asarray(tifffile.imread(str(path)))
+    if vol.ndim == 2:
+        vol = vol[np.newaxis, ...]
+    elif vol.ndim > 3:
+        # Collapse any leading singleton/sample axes to a plain (Z, Y, X).
+        vol = vol.reshape((-1,) + vol.shape[-2:])
+    return vol
+
+
+def load_tile_volume(
+    path: Path,
+    n_planes: int,
+    frame_width: int = FRAME_WIDTH,
+    frame_height: int = FRAME_HEIGHT,
+) -> np.ndarray:
+    """Load one tile's (Z, Y, X) volume, dispatching on file type.
+
+    ``.raw`` → raw uint16 memmap using the supplied per-tile frame dims.
+    ``.tif`` / ``.tiff`` / ``.btf`` → tifffile, with the shape taken from the
+    file header (the ``frame_*``/``n_planes`` args are ignored for TIFF since
+    the container is self-describing).
+    """
+    if path.suffix.lower() in _TIFF_EXTENSIONS:
+        return _load_tiff_volume(path)
+    return load_raw_volume(path, n_planes, frame_width, frame_height)
 
 
 def fuse_illumination_sides(
@@ -2865,13 +2963,13 @@ class StitchingPipeline:
 
         illum_volumes = {}
         for illum_side, raw_path in illum_files.items():
-            # Pass the per-tile frame (camera AOI) dims. Omitting them falls
-            # back to the 2048×2048 module default, which reinterprets a
-            # cropped 1024×1024 acquisition with the wrong stride — scrambled
-            # data and a wrong plane count (the streaming-mode corruption that
-            # produced blank/garbage Imaris output). The in-memory path passed
-            # these all along; this is now the single shared read.
-            vol = load_raw_volume(
+            # Dispatch on file type (.raw vs .tif/.tiff/.btf). For raw we pass
+            # the per-tile frame (camera AOI) dims — omitting them falls back to
+            # the 2048×2048 module default, which reinterprets a cropped
+            # 1024×1024 acquisition with the wrong stride (scrambled data, wrong
+            # plane count — the streaming-mode corruption that produced blank
+            # Imaris output). TIFF is self-describing, so the dims are ignored.
+            vol = load_tile_volume(
                 raw_path, tile.n_planes, tile.frame_width, tile.frame_height
             )
             illum_volumes[illum_side] = vol
