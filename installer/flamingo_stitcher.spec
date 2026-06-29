@@ -127,9 +127,28 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
+# Bootloader splash screen — the C bootloader shows this the instant the exe
+# launches, BEFORE any Python imports run, so the user gets immediate feedback
+# during the ~10-15 s heavy-import startup (numpy/scipy/dask/multiview-stitcher
+# /skimage/matplotlib/wasmtime). It is closed from app.main() once the window
+# is up, via the runtime `pyi_splash` module. The Tcl/Tk the splash needs is
+# bundled automatically by PyInstaller and is independent of the excluded
+# Python `tkinter` module.
+splash = Splash(
+    os.path.join(ROOT, "src/flamingo_stitcher/gui/splash.png"),
+    binaries=a.binaries,
+    datas=a.datas,
+    text_pos=(20, 272),
+    text_size=9,
+    text_color="#aab0c0",
+    text_default="Starting...",
+    always_on_top=True,
+)
+
 exe = EXE(
     pyz,
     a.scripts,
+    splash,  # splash target; in one-folder mode its binaries go in COLLECT
     [],
     exclude_binaries=True,
     name="FlamingoStitcher",
@@ -143,6 +162,7 @@ exe = EXE(
 
 coll = COLLECT(
     exe,
+    splash.binaries,
     a.binaries,
     a.datas,
     strip=False,

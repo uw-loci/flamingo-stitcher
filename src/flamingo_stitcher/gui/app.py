@@ -72,11 +72,37 @@ def _setup_logging() -> Path:
     return log_path
 
 
+def _splash_text(message: str) -> None:
+    """Update the PyInstaller bootloader splash status line, if present.
+
+    ``pyi_splash`` only exists inside the frozen build; in dev runs this is a
+    no-op. Best-effort — never let splash chrome break startup.
+    """
+    try:
+        import pyi_splash  # type: ignore
+
+        pyi_splash.update_text(message)
+    except Exception:
+        pass
+
+
+def _splash_close() -> None:
+    """Close the bootloader splash once the main window is up (frozen only)."""
+    try:
+        import pyi_splash  # type: ignore
+
+        pyi_splash.close()
+    except Exception:
+        pass
+
+
 def main() -> int:
     """Launch the standalone stitching GUI. Returns the Qt exit code."""
     log_path = _setup_logging()
     if log_path:
         logging.getLogger(__name__).info(f"Log file: {log_path}")
+
+    _splash_text("Loading the stitching engine...")
 
     from PyQt5.QtCore import QSettings, QTimer
     from PyQt5.QtWidgets import (
@@ -139,6 +165,9 @@ def main() -> int:
 
     window.resize(1100, 800)
     window.show()
+
+    # Window is up — tear down the bootloader splash.
+    _splash_close()
 
     # Re-apply a pending-update badge from a prior session, then run the
     # throttled launch auto-check once the event loop is up.
