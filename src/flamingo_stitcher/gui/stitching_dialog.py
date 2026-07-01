@@ -966,6 +966,30 @@ class StitchingDialog(PersistentDialog):
         self._proc_widget.setVisible(False)
         content_layout.addWidget(self._proc_widget)
 
+        # Processing options change the memory footprint too (content-based
+        # blending adds a per-block halo, deconvolution adds a float32 working
+        # set, chunk/frame size change the fusion block, etc.). Wire every one
+        # of them to the estimate so the readout updates live as they toggle.
+        # These widgets are created above line-by-line, so this block runs
+        # after they all exist (unlike the output-group wiring earlier).
+        for _cb in (
+            self._destripe_cb,
+            self._destripe_fast_cb,
+            self._content_fusion_cb,
+            self._deconv_cb,
+            self._flat_field_cb,
+            self._skip_reg_cb,
+        ):
+            _cb.toggled.connect(self._refresh_memory_estimate)
+        for _combo in (
+            self._frame_size_combo,
+            self._fusion_combo,
+            self._tile_fusion_combo,
+            self._reg_binning_combo,
+            self._chunk_size_combo,
+        ):
+            _combo.currentIndexChanged.connect(self._refresh_memory_estimate)
+
         # --- Background zeroing (lossy compression aid) ---
         self._bg_zero_panel = BackgroundZeroPanel()
         self._bg_zero_panel.preview_requested.connect(self._on_preview_background_zero)
@@ -1885,10 +1909,17 @@ class StitchingDialog(PersistentDialog):
                     )
                 except Exception:
                     worst_suffix = f" (worst of {len(tile_sets)} queued)"
+            fusion_note = ""
+            if est.get("fusion_gb") is not None:
+                fusion_note = (
+                    f"  Fusion working set: ~{est['fusion_gb']:.1f} GB "
+                    f"(~{est.get('views_per_block', '?')} tiles/block)\n"
+                )
             self._log(
                 f"Memory estimate{worst_suffix} (system RAM: {sys_ram:.0f} GB):\n"
                 f"  In-memory mode: ~{est['in_memory_gb']:.0f} GB peak\n"
                 f"  Streaming mode: ~{est['streaming_gb']:.1f} GB peak\n"
+                f"{fusion_note}"
                 f"  Output size:    ~{est['output_gb']:.0f} GB\n"
                 f"  Recommendation: {'Streaming (low memory)' if est['auto_streaming'] else 'In-memory (fast)'}"
             )

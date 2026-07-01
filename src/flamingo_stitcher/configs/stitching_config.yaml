@@ -341,6 +341,25 @@ memory:
   # More workers = faster but more memory. Should scale with CPU cores.
   streaming_workers: 4
 
+  # --- Fusion working-set model (derived per-block estimate) ---
+  # multiview_stitcher.fusion.fuse_np processes one output block at a time and
+  # casts every overlapping view to float64 (sim.astype(float)) resampled onto
+  # the block grid. Peak ~ concurrency × coexist × views/block × block_vox ×
+  # bytes. These tune that model; they do NOT change runtime behaviour, only
+  # the RAM estimate shown/used for mode selection and the resource guard.
+  #
+  # Bytes per fused voxel — 8 because the transformed views are float64.
+  fusion_float_bytes: 8.0
+  # Coexistence factor: within a block the per-view list, the np.array-stacked
+  # copy, and the blending/fusion weight arrays are live at once (~2.5×).
+  fusion_coexist_factor: 2.5
+  # Output blocks fused concurrently (dask thread pool; matches the
+  # _pick_fuse_workers auto cap).
+  fusion_concurrency: 4
+  # Deconvolution per-tile float32 working set as a multiple of tile voxels
+  # (in/out volumes + FFT scratch). Only added when deconvolution is enabled.
+  deconv_working_factor: 4.0
+
   # Dask chunk size for internal processing (tile loading, fusion).
   # These are NOT the output file chunk sizes — see zarr.chunks and
   # output.chunksize for those. These control the dask task graph

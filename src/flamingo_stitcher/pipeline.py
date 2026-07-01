@@ -693,6 +693,8 @@ def estimate_memory_usage(
             "streaming_gb": 0.0,
             "output_gb": 0.0,
             "auto_streaming": False,
+            "fusion_gb": 0.0,
+            "views_per_block": 0,
         }
 
     n_channels = len(channels)
@@ -747,22 +749,41 @@ def estimate_memory_usage(
         _streaming_workers = int(
             get_stitching_value("memory", "streaming_workers", default=4)
         )
+        # Fusion working-set model tunables (see the derived per-block cost
+        # below). Bytes-per-voxel is 8 because multiview_stitcher.fusion.fuse_np
+        # does ``sim.astype(float)`` (float64) on every overlapping view before
+        # resampling it onto the output block grid.
+        _fusion_float_bytes = float(
+            get_stitching_value("memory", "fusion_float_bytes", default=8.0)
+        )
+        # Coexistence factor: within one block fuse_np holds the per-view list
+        # AND the np.array-stacked copy AND (for weighted/content) the blending
+        # /fusion weight arrays simultaneously. ~2.5× the raw transformed stack.
+        _fusion_coexist = float(
+            get_stitching_value("memory", "fusion_coexist_factor", default=2.5)
+        )
+        # How many output blocks fuse concurrently (dask thread pool). Matches
+        # the _pick_fuse_workers auto cap.
+        _fusion_concurrency = int(
+            get_stitching_value("memory", "fusion_concurrency", default=4)
+        )
+        # Deconvolution per-tile float working set as a multiple of the tile's
+        # voxel count (float32 in/out + FFT scratch). 0 disables the term.
+        _deconv_working_factor = float(
+            get_stitching_value("memory", "deconv_working_factor", default=4.0)
+        )
     except Exception:
         _mem_multiplier = 2.5
         _fallback_ram = 64.0
         _streaming_threshold = 0.6
         _streaming_workers = 4
+        _fusion_float_bytes = 8.0
+        _fusion_coexist = 2.5
+        _fusion_concurrency = 4
+        _deconv_working_factor = 4.0
 
-    # In-memory peak. Three terms dominate:
-    #   1. held tiles — every preprocessed tile for all channels stays resident
-    #      throughout the in-memory pipeline (uint16).
-    #   2. fusion float64 working set — THE term the old estimate missed.
-    #      multiview-stitcher's block fusion does `sim.astype(float)` on each
-    #      overlapping source tile (full-tile float64 materialisation), and the
-    #      threaded dask scheduler can have most tiles converted concurrently.
-    #      For many-tile / high-overlap grids this is the largest term and is
-    #      what made a "~24 GB" 20-tile/25%-overlap job actually peak ~134 GB.
-    #   3. the stacked output array + pyramid generation during write.
+    import math
+
     pyramid_overhead_gb = output_gb * 0.33
     per_channel_gb = output_gb / max(n_channels, 1)
 
@@ -770,65 +791,103 @@ def estimate_memory_usage(
     ds_tile_planes = n_planes // ds_z if ds_z > 1 else n_planes
     ds_tile_w = frame_w // ds_xy if ds_xy > 1 else frame_w
     ds_tile_h = frame_h // ds_xy if ds_xy > 1 else frame_h
+    ds_tile_vox = ds_tile_planes * ds_tile_w * ds_tile_h
     n_tiles = len(tiles)
 
-    held_tiles_gb = (
-        n_tiles * n_channels * ds_tile_planes * ds_tile_w * ds_tile_h * bpv
-    ) / (1024**3)
-    # float64 fusion working set. multiview-stitcher fuses block-by-block: for
-    # each output block it stacks EVERY source tile overlapping that block as a
-    # float64 array at the block's size, then reduces. Peak is therefore
-    #   (concurrent blocks) × (tiles overlapping one block) × (block voxels) × 8
-    # NOT the sum of downsampled tile sizes. Heavy downsampling shrinks tiles
-    # relative to the fixed output block, so many tiles overlap each block and
-    # this term dominates — the failure mode where an 8× job estimated at
-    # ~10 GB actually peaked ~190 GB. Model it with the output chunk we pass to
-    # fusion.fuse (block size) and how many tiles land in one block.
+    # --- Derived fusion working set (dominant, and applies to BOTH modes) ---
+    # multiview_stitcher.fusion.fuse_np processes ONE output block at a time:
+    # for every source view overlapping that block it does
+    #   transform_sim(sim.astype(float), ...)  -> a float64 array at block size
+    # then np.array()-stacks them. Peak per block is therefore
+    #   coexist × (views overlapping the block) × (block voxels incl. halo) × 8
+    # The dask thread pool runs several blocks at once. This term — NOT the sum
+    # of tile sizes — is what made an 8× job estimated at ~10 GB peak ~190 GB.
     chunk_z = min(int(config.output_chunksize.get("z", 128)), max(out_z_px, 1))
     chunk_y = min(int(config.output_chunksize.get("y", 256)), max(out_y_px, 1))
     chunk_x = min(int(config.output_chunksize.get("x", 256)), max(out_x_px, 1))
-    tiles_per_block_x = min(n_tiles, (chunk_x + ds_tile_w - 1) // max(ds_tile_w, 1) + 1)
-    tiles_per_block_y = min(n_tiles, (chunk_y + ds_tile_h - 1) // max(ds_tile_h, 1) + 1)
-    views_per_block = min(n_tiles, tiles_per_block_x * tiles_per_block_y)
-    block_float_gb = views_per_block * chunk_z * chunk_y * chunk_x * 8 / (1024**3)
-    # Our fuse scheduler caps concurrency (see _pick_fuse_workers); budget a
-    # small fixed number of concurrent blocks as a safe upper bound.
-    fusion_float_gb = 4 * block_float_gb
 
+    # Content-based blending expands each block by a halo of 2×sigma_2 pixels
+    # (multiview_stitcher.weights.calculate_required_overlap); plain blend/max
+    # use no halo. The halo is resampled at float64 too, so it inflates the
+    # per-block cost super-linearly for small chunks.
+    content_based = bool(
+        getattr(config, "content_based_fusion", False)
+        and getattr(config, "tile_overlap_fusion", "max") != "max"
+    )
+    halo = 2 * 11 if content_based else 0  # 2 × default sigma_2
+    block_vox = (chunk_z + 2 * halo) * (chunk_y + 2 * halo) * (chunk_x + 2 * halo)
+
+    # Views overlapping one output block, from the ACTUAL tile grid pitch
+    # (median spacing between adjacent tile centres) rather than a tile-size
+    # heuristic — overlapping tiles have pitch < tile size, so more of them
+    # land in each block than "chunk / tile_size" would suggest.
+    def _pitch_px(values, px_per_unit):
+        uniq = sorted({round(v, 4) for v in values})
+        if len(uniq) < 2:
+            return None
+        gaps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
+        if not gaps:
+            return None
+        return (sorted(gaps)[len(gaps) // 2]) * px_per_unit, len(uniq)
+
+    px_per_mm_xy = 1000.0 / (config.pixel_size_um * ds_xy)
+    px_per_mm_z = 1000.0 / (config.pixel_size_um * ds_z)  # z pitch in xy-px units
+
+    def _views_along(vals, chunk_px, px_per_unit):
+        info = _pitch_px(vals, px_per_unit)
+        if info is None:
+            return 1
+        pitch, n_distinct = info
+        if pitch <= 0:
+            return 1
+        return min(n_distinct, int(math.ceil(chunk_px / pitch)) + 1)
+
+    vx = _views_along([t.x_mm for t in tiles], chunk_x, px_per_mm_xy)
+    vy = _views_along([t.y_mm for t in tiles], chunk_y, px_per_mm_xy)
+    # Z pitch: tiles may share one Z tier (→ 1) or be Z-tiled. z_step converts
+    # the block's Z pixels back to the pitch units used for x/y comparison.
+    z_vals = [getattr(t, "z_min_mm", 0.0) for t in tiles]
+    vz = _views_along(z_vals, chunk_z, px_per_mm_z)
+    views_per_block = min(n_tiles, max(1, vx) * max(1, vy) * max(1, vz))
+
+    block_float_gb = (
+        _fusion_coexist * views_per_block * block_vox * _fusion_float_bytes
+    ) / (1024**3)
+    fusion_gb = _fusion_concurrency * block_float_gb
+
+    # --- Preprocessing (materialize) working set, both modes ---
+    # Each preprocess worker holds ~2.5× the (downsampled) tile as uint16, plus
+    # a float32 deconvolution working set when deconvolution is enabled.
+    tile_bytes_ds = ds_tile_vox * bpv
+    deconv_extra = 0.0
+    if getattr(config, "deconvolution_enabled", False):
+        deconv_extra = _deconv_working_factor * ds_tile_vox * 4  # float32
+    per_worker_pp = 2.5 * tile_bytes_ds + deconv_extra
+    pp_workers = min(4, max(1, n_tiles))
+    materialize_gb = pp_workers * per_worker_pp / (1024**3)
+
+    # --- In-memory peak ---
+    # All channels' preprocessed tiles stay resident, plus the fusion working
+    # set, plus the stacked output array and pyramid overhead during write.
+    held_tiles_gb = (n_tiles * n_channels * ds_tile_vox * bpv) / (1024**3)
     in_memory_gb = (
         held_tiles_gb
-        + fusion_float_gb
+        + fusion_gb
         + output_gb
         + max(pyramid_overhead_gb, per_channel_gb)
     )
+    in_memory_gb = max(in_memory_gb, materialize_gb)
 
-    # Streaming peak: one channel's tile working set + dask chunk buffers.
-    # The fused output goes to an on-disk memmap (see `_run_streaming`),
-    # so no output-sized RAM allocation is counted here.
-    # With downsample, tiles are materialized at reduced size.
-    # Without downsample, tiles stay as memmaps (demand-paged).
-    n_tiles = len(tiles)
-    if ds_any:
-        # Materialized (downsampled) tiles for ONE channel + output
-        tile_data_gb = (
-            n_tiles
-            * 1  # streaming loads one channel at a time
-            * ds_tile_planes
-            * ds_tile_w
-            * ds_tile_h
-            * bpv
-            / (1024**3)
-        )
-    else:
-        # Memmaps — OS demand-pages, count ~2 tiles active at a time
-        tile_gb = n_planes * frame_w * frame_h * bpv / (1024**3)
-        tile_data_gb = 2 * tile_gb
-    # Plus chunk buffers during zarr/TIFF write
-    chunk_z = config.output_chunksize.get("z", 128)
-    chunk_y = config.output_chunksize.get("y", 256)
-    chunk_x = config.output_chunksize.get("x", 256)
-    chunk_buffer_gb = _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
-    streaming_gb = tile_data_gb + chunk_buffer_gb
+    # --- Streaming peak ---
+    # Tiles spill to an on-disk memmap and the fused output goes to an on-disk
+    # memmap (see _run_streaming), so neither is counted as hard RAM. The
+    # pipeline runs materialize THEN fuse per channel, so the peak is the max
+    # of the two phases, not their sum. A couple of chunk buffers ride along
+    # during the zarr/TIFF write.
+    chunk_buffer_gb = (
+        _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
+    )
+    streaming_gb = max(materialize_gb, fusion_gb + chunk_buffer_gb)
 
     # Auto-detect: stream if in-memory estimate exceeds available RAM
     try:
@@ -844,6 +903,8 @@ def estimate_memory_usage(
         "streaming_gb": round(streaming_gb, 1),
         "output_gb": round(output_gb, 1),
         "auto_streaming": auto_streaming,
+        "fusion_gb": round(fusion_gb, 1),
+        "views_per_block": int(views_per_block),
     }
 
 
@@ -2555,6 +2616,7 @@ class StitchingPipeline:
         all channels' tile data simultaneously.
         """
         import gc
+        import shutil
 
         import dask.diagnostics
 
@@ -2581,16 +2643,31 @@ class StitchingPipeline:
             )
             self.logger.info(
                 f"Step 2: Loading reference channel {ref_ch} "
-                f"({len(tiles)} tiles) [streaming]..."
+                f"({len(tiles)} tiles) [streaming, spill to disk]..."
             )
-            ref_data = self._load_and_preprocess(tiles, [ref_ch])
-            ref_tile_data = ref_data.get(ref_ch, [])
+            # Spill the reference channel to per-tile on-disk memmaps instead
+            # of holding it in RAM. _load_and_preprocess would return one full
+            # uint16 array per tile (~tile_bytes each) and keep ALL of them
+            # resident — e.g. 176 × 3.25 GiB ≈ 570 GB, which overruns the
+            # process commit limit and dies with "Unable to allocate 3.25 GiB"
+            # even on a ~900 GB box. Registration only reads the tiles lazily
+            # (and binned), so memmap-back them and let dask page in chunks.
+            reg_tmp_dir = output_path / ".stitch_tmp" / f"reg_ch{ref_ch:02d}"
+            probe = self._preprocess_single_tile(tiles[0], ref_ch)
+            ref_shape = probe.shape
+            del probe
+            gc.collect()
+            ref_tile_data = self._materialize_tiles_to_disk(
+                tiles, ref_ch, ref_shape, reg_tmp_dir
+            )
 
             if not ref_tile_data:
                 self.logger.error(f"No tiles loaded for reference channel {ref_ch}")
+                shutil.rmtree(reg_tmp_dir, ignore_errors=True)
                 return output_path
 
             if self._cancelled_fn():
+                shutil.rmtree(reg_tmp_dir, ignore_errors=True)
                 self.logger.info("Pipeline cancelled by user")
                 return output_path
 
@@ -2599,12 +2676,17 @@ class StitchingPipeline:
                 f"Step 3: Registering on reference channel {ref_ch} "
                 f"({len(ref_tile_data)} tiles)..."
             )
-            reg_params, transform_key = self._register_tiles(
-                ref_tile_data, voxel_size_um
-            )
-            # Free all registration data — fusion uses lazy tile loading
-            del ref_data, ref_tile_data
-            gc.collect()
+            try:
+                reg_params, transform_key = self._register_tiles(
+                    ref_tile_data, voxel_size_um
+                )
+            finally:
+                # Drop the lazy handles and delete the spill dir. The fusion
+                # loop below re-materialises each channel (this one included)
+                # into its own temp dir, so nothing downstream needs these.
+                del ref_tile_data
+                gc.collect()
+                shutil.rmtree(reg_tmp_dir, ignore_errors=True)
             self.logger.info("  Freed registration tile data")
 
         if self._cancelled_fn():
@@ -2616,8 +2698,6 @@ class StitchingPipeline:
         # written to a per-tile memmap under a temp dir. Fusion reads
         # chunks directly from the flat files, so output-chunk computes
         # never retrigger the full preprocess chain.
-        import shutil
-
         import dask
         import dask.array as da
 
