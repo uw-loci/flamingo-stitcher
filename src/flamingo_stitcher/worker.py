@@ -49,6 +49,10 @@ class StitchingWorker(QThread):
     log_message = pyqtSignal(str)
     completed = pyqtSignal(str)
     error = pyqtSignal(str)
+    # Emitted (queued, thread-safe) when the memory watchdog trips. Payload is
+    # the info dict from the pipeline: used_gb, projected_gb, margin, phase,
+    # mode. The dialog raises a non-blocking popup; the run keeps going.
+    memory_warning = pyqtSignal(dict)
 
     def __init__(
         self,
@@ -123,6 +127,7 @@ class StitchingWorker(QThread):
                 config=self._config,
                 cancelled_fn=lambda: self._cancelled,
                 progress_fn=self.progress.emit,
+                memory_warning_fn=self.memory_warning.emit,
             )
 
             output_path = pipeline.run(

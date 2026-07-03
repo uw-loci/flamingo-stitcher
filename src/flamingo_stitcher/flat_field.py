@@ -195,12 +195,15 @@ def apply_flat_field(
         n_tiles = len(tile_list)
         for tile_idx in range(n_tiles):
             volume, tile_info = tile_list[tile_idx]
-            vol = np.asarray(volume, dtype=np.float32)
 
-            for z in range(vol.shape[0]):
-                vol[z] = (vol[z] - darkfield) / flatfield
-
-            corrected = np.clip(vol, 0, 65535).astype(np.uint16)
+            # Upcast one Z-plane at a time into a uint16 output, rather than
+            # materialising the whole tile as float32 (~12 GB for a native
+            # tile). Bit-identical to the whole-volume expression; the per-plane
+            # loop was already there — only the whole-volume float32 cast wasn't.
+            corrected = np.empty(volume.shape, dtype=np.uint16)
+            for z in range(volume.shape[0]):
+                plane = (volume[z].astype(np.float32) - darkfield) / flatfield
+                corrected[z] = np.clip(plane, 0, 65535).astype(np.uint16)
             tile_list[tile_idx] = (corrected, tile_info)
 
         msg = f"Channel {ch_id}: corrected {n_tiles} tiles"

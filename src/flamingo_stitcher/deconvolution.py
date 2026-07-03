@@ -238,31 +238,41 @@ def _deconvolve_pycudadecon(
         z_slab = volume.shape[0]
 
     input_float = volume.astype(np.float32)
-    result = np.empty_like(input_float)
+    result = None  # allocated only on the slab path; full-volume reuses decon's output
 
     z_total = volume.shape[0]
     # Overlap between slabs to avoid edge artifacts
     overlap = min(psf.shape[0], 16)
 
     if z_slab >= z_total:
-        # Process entire volume at once
+        # Process entire volume at once. `decon` returns a fresh float32 array,
+        # so assign it directly instead of copying into a pre-allocated buffer —
+        # avoids holding a third full-volume float32 (~12 GB per native tile).
         try:
-            result[:] = decon(
+            # astype(float32, copy=False) makes the "decon returns float32"
+            # invariant explicit (no-op when it already is) so the later
+            # clip/cast can't silently change if a backend returns float64.
+            result = decon(
                 input_float,
                 psf,
                 n_iters=config.num_iterations,
                 dz=z_step_um,
                 dx=pixel_size_um,
-            )
+            ).astype(np.float32, copy=False)
         except RuntimeError as e:
             if "out of memory" in str(e).lower() or "cuda" in str(e).lower():
                 logger.warning(f"GPU OOM with full volume, trying half slabs: {e}")
-                z_slab = z_total // 2
+                # max(1, …): for a single-plane volume z_total//2 == 0, which
+                # would make the slab loop below never advance (pos += 0) and
+                # spin forever. A 1-plane slab is the smallest sensible fallback.
+                z_slab = max(1, z_total // 2)
             else:
                 raise
 
     if z_slab < z_total:
-        # Process in overlapping slabs
+        # Process in overlapping slabs (needs a separate output buffer: it reads
+        # input_float and writes result at shifted, overlapping ranges).
+        result = np.empty_like(input_float)
         pos = 0
         while pos < z_total:
             z0 = max(0, pos - overlap)

@@ -547,72 +547,117 @@ def write_ome_zarr_v2(
         f"chunks={chunks}, compression={compression}"
     )
 
-    # --- Generate pyramid via block averaging ---
-    pyramid = [np_data]
-    for i in range(pyramid_levels):
-        pyramid.append(_downsample_2x(pyramid[-1]))
-
     if progress_callback:
         progress_callback(30, "Writing Zarr v2 store...")
 
     # --- Write Zarr v2 store ---
     root = zarr.open_group(str(output_path), mode="w", zarr_format=2)
 
+    # Generate + write the pyramid level by level, streaming to disk. Each level
+    # is cascaded (downsample the previous level by 2x — bit-identical to the old
+    # `_downsample_2x` chain) into an on-disk memmap, and written to zarr in
+    # Z-slabs, so no whole downsampled level is held in RAM. The old code built
+    # `pyramid = [np_data, _downsample_2x(...), ...]` — a Python list holding
+    # ~0.5x the full output resident, a latent OOM on TB outputs (the same class
+    # of bug the OME-TIFF writer was already fixed for).
+    import gc as _gc
+    import shutil as _shutil
+
+    tmp_dir = output_path.parent / f".stitch_zpyr_tmp_{output_path.name}"
+    tmp_dir.mkdir(parents=True, exist_ok=True)
     datasets_meta = []
-    total_levels = len(pyramid)
-    for level_idx, level_data in enumerate(pyramid):
-        scale_factor = 2**level_idx
+    total_levels = pyramid_levels + 1
+    prev = np_data  # level-0 source (the fused memmap / input array)
+    prev_is_temp = False
+    level_data = None  # bound in the loop; declared so the finally can null it
+    next_mm = None  # last-level memmap; must be dropped before rmtree (Windows)
+    try:
+        for level_idx in range(total_levels):
+            level_data = prev
+            scale_factor = 2**level_idx
 
-        # Compute chunks — for 4D prepend channel dim
-        if is_4d:
-            spatial_chunks = tuple(
-                min(c, s) for c, s in zip(chunks, level_data.shape[-3:])
+            # Compute chunks — for 4D prepend channel dim
+            if is_4d:
+                spatial_chunks = tuple(
+                    min(c, s) for c, s in zip(chunks, level_data.shape[-3:])
+                )
+                level_chunks = (1,) + spatial_chunks
+            else:
+                level_chunks = tuple(
+                    min(c, s) for c, s in zip(chunks, level_data.shape)
+                )
+
+            arr = root.create_array(
+                str(level_idx),
+                shape=tuple(int(s) for s in level_data.shape),
+                chunks=level_chunks,
+                dtype=level_data.dtype,
+                compressors=compressor,
             )
-            level_chunks = (1,) + spatial_chunks
-        else:
-            level_chunks = tuple(min(c, s) for c, s in zip(chunks, level_data.shape))
+            # Write in Z-slabs (Z is axis -3) so RAM stays bounded to one slab
+            # regardless of how zarr handles a full-array assignment.
+            z_axis = level_data.ndim - 3
+            zlen = int(level_data.shape[z_axis])
+            zstep = max(1, int(level_chunks[z_axis]))
+            for z0 in range(0, zlen, zstep):
+                z1 = min(z0 + zstep, zlen)
+                if is_4d:
+                    arr[:, z0:z1] = np.asarray(level_data[:, z0:z1])
+                else:
+                    arr[z0:z1] = np.asarray(level_data[z0:z1])
 
-        # zarr-python >=3.1 raises "data parameter was used, but the dtype
-        # parameter was also used" when both are passed; data already carries
-        # its dtype, so skip the explicit kwarg.
-        root.create_array(
-            str(level_idx),
-            data=level_data,
-            chunks=level_chunks,
-            compressors=compressor,
-        )
+            # Build scale transform + metadata for this level (uses level_data
+            # before the next-level build may drop it).
+            spatial_scale = [
+                voxel_size_um["z"] * scale_factor,
+                voxel_size_um["y"] * scale_factor,
+                voxel_size_um["x"] * scale_factor,
+            ]
+            if is_4d:
+                scale_values = [1.0] + spatial_scale
+            else:
+                scale_values = spatial_scale
 
-        # Build scale transform
-        spatial_scale = [
-            voxel_size_um["z"] * scale_factor,
-            voxel_size_um["y"] * scale_factor,
-            voxel_size_um["x"] * scale_factor,
-        ]
-        if is_4d:
-            scale_values = [1.0] + spatial_scale
-        else:
-            scale_values = spatial_scale
+            datasets_meta.append(
+                {
+                    "path": str(level_idx),
+                    "coordinateTransformations": [
+                        {
+                            "type": "scale",
+                            "scale": scale_values,
+                        }
+                    ],
+                }
+            )
 
-        datasets_meta.append(
-            {
-                "path": str(level_idx),
-                "coordinateTransformations": [
-                    {
-                        "type": "scale",
-                        "scale": scale_values,
-                    }
-                ],
-            }
-        )
+            if progress_callback:
+                pct = 30 + int(60 * (level_idx + 1) / total_levels)
+                progress_callback(pct, f"Wrote level {level_idx}/{total_levels - 1}...")
 
-        if progress_callback:
-            pct = 30 + int(60 * (level_idx + 1) / total_levels)
-            progress_callback(pct, f"Wrote level {level_idx}/{total_levels - 1}...")
+            logger.info(
+                f"  Level {level_idx}: shape={level_data.shape}, "
+                f"chunks={level_chunks}, scale={scale_factor}x"
+            )
 
-        logger.info(
-            f"  Level {level_idx}: shape={level_data.shape}, "
-            f"chunks={level_chunks}, scale={scale_factor}x"
-        )
+            # Build the next level from this one, then drop this (temp) level.
+            if level_idx < total_levels - 1:
+                next_mm = _downsample_2x_to_memmap(
+                    level_data, tmp_dir / f"level_{level_idx + 1}.dat"
+                )
+                if prev_is_temp:
+                    del level_data
+                prev = next_mm
+                prev_is_temp = True
+    finally:
+        # Release memmaps before removing their backing files (Windows locks).
+        # `prev`, `level_data` and `next_mm` all alias the last-level memmap after
+        # the loop; nulling only `prev` leaves it mapped, so rmtree silently fails
+        # on Windows and leaks the temp dir. Drop every reference before gc.
+        prev = None
+        level_data = None
+        next_mm = None
+        _gc.collect()
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
 
     # --- Write OME-NGFF v0.4 metadata in .zattrs ---
     # v0.4: multiscales lives at root .zattrs (NOT under "ome" key)
@@ -702,6 +747,41 @@ def _downsample_2x_3d(arr: np.ndarray) -> np.ndarray:
         .mean(axis=(1, 3, 5))
         .astype(arr.dtype)
     )
+
+
+def _downsample_2x_to_memmap(src: np.ndarray, mm_path) -> np.ndarray:
+    """Bit-identical to :func:`_downsample_2x` but streamed to an on-disk
+    memmap, one output Z-plane (= 2 input planes) at a time, so no whole
+    downsampled level is ever held in RAM. Handles 3D (Z,Y,X) and 4D (C,Z,Y,X).
+    """
+    is_4d = src.ndim == 4
+    if is_4d:
+        c, z, y, x = src.shape
+    else:
+        z, y, x = src.shape
+        c = 1
+    sz, sy, sx = z - z % 2, y - y % 2, x - x % 2
+    oz, oy, ox = sz // 2, sy // 2, sx // 2
+    out_shape = (c, oz, oy, ox) if is_4d else (oz, oy, ox)
+    mm = np.memmap(str(mm_path), dtype=src.dtype, mode="w+", shape=out_shape)
+
+    def _oplane(block2):  # block2: (2, sy, sx) → (oy, ox), same reduction as 3d
+        return (
+            block2[:, :sy, :sx]
+            .reshape(2, oy, 2, ox, 2)
+            .mean(axis=(0, 2, 4))
+            .astype(src.dtype)
+        )
+
+    if is_4d:
+        for ci in range(c):
+            for zo in range(oz):
+                mm[ci, zo] = _oplane(src[ci, 2 * zo : 2 * zo + 2])
+    else:
+        for zo in range(oz):
+            mm[zo] = _oplane(src[2 * zo : 2 * zo + 2])
+    mm.flush()
+    return mm
 
 
 def write_ome_zarr_streaming(

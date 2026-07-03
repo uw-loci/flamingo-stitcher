@@ -726,6 +726,38 @@ class StitchingDialog(PersistentDialog):
         self._last_mem_estimate = None
         settings_layout.addWidget(self._memory_indicator, 3, 2)
 
+        # Scratch (temp) directory for streaming spill files.
+        settings_layout.addWidget(QLabel("Scratch dir:"), 3, 3)
+        self._scratch_dir_edit = QLineEdit()
+        self._scratch_dir_edit.setPlaceholderText("(default: alongside output)")
+        self._scratch_dir_edit.setToolTip(
+            "Where streaming's temporary spill files (.stitch_tmp: per-tile\n"
+            "memmaps + the fused memmap) are written.\n"
+            "\n"
+            "DEFAULT (blank): alongside the output — <output_dir>/.stitch_tmp.\n"
+            "\n"
+            "Point this at a FAST LOCAL disk (NVMe/SSD) when the input/output are\n"
+            "on a slow or network drive: streaming is I/O-bound on this spill, so\n"
+            "moving it off the busy drive can cut wall time a lot.\n"
+            "Cautions:\n"
+            "• No benefit if it is the SAME physical drive as the input/output\n"
+            "  (the run log warns in that case).\n"
+            "• It must have room for the tile spill + fused memmap (see the disk\n"
+            "  estimate); the run aborts up front if it lacks the space.\n"
+            "• The finished output still writes to the output folder, so the\n"
+            "  fused data crosses drives once (the normal fuse→write pass — NOT\n"
+            "  an extra copy of the result). .stitch_tmp is deleted at the end."
+        )
+        scratch_row = QHBoxLayout()
+        scratch_row.setContentsMargins(0, 0, 0, 0)
+        scratch_row.addWidget(self._scratch_dir_edit)
+        scratch_browse = QPushButton("Browse...")
+        scratch_browse.clicked.connect(self._browse_scratch_dir)
+        scratch_row.addWidget(scratch_browse)
+        scratch_wrap = QWidget()
+        scratch_wrap.setLayout(scratch_row)
+        settings_layout.addWidget(scratch_wrap, 3, 4)
+
         # ===== Output information (live estimates) =====
         # A separate, plainly-labelled box so the native→output resolution,
         # memory, and time read-outs are easy to find instead of being buried
@@ -1421,6 +1453,18 @@ class StitchingDialog(PersistentDialog):
         if folder:
             self._output_dir_edit.setText(str(Path(folder)))
 
+    def _browse_scratch_dir(self):
+        start = (
+            self._scratch_dir_edit.text()
+            or self._output_dir_edit.text()
+            or str(Path.home())
+        )
+        folder = QFileDialog.getExistingDirectory(
+            self, "Select Scratch (Temp) Directory — use a fast local disk", start
+        )
+        if folder:
+            self._scratch_dir_edit.setText(str(Path(folder)))
+
     # --- Tile discovery ---
 
     def _on_discover(self):
@@ -2106,6 +2150,7 @@ class StitchingDialog(PersistentDialog):
         config.package_ozx = self._ozx_cb.isChecked()
         config.tiff_pyramids = self._tiff_pyramids_cb.isChecked()
         config.streaming_mode = self._streaming_combo.currentData()
+        config.scratch_dir = self._scratch_dir_edit.text().strip() or None
         chunk = self._chunk_size_combo.currentData()
         if chunk:
             config.output_chunksize = dict(chunk)
@@ -2486,6 +2531,7 @@ class StitchingDialog(PersistentDialog):
         self._worker.log_message.connect(self._on_log_message)
         self._worker.completed.connect(self._on_item_completed)
         self._worker.error.connect(self._on_item_error)
+        self._worker.memory_warning.connect(self._on_memory_warning)
         self._worker.finished.connect(self._on_item_finished)
         self._worker.start()
 
@@ -2494,7 +2540,12 @@ class StitchingDialog(PersistentDialog):
         if self._worker:
             self._worker.cancel()
             self._status_label.setText("Cancelling...")
-            self._log("Cancellation requested...")
+            self._log(
+                "Cancellation requested — aborting the current compute "
+                "(stops within about one chunk)..."
+            )
+            # Immediate feedback + prevent repeat clicks; re-enabled on next run.
+            self._cancel_btn.setEnabled(False)
         # Mark remaining pending items as cancelled
         for item in self._queue:
             if item["status"] == "pending":
@@ -2669,6 +2720,37 @@ class StitchingDialog(PersistentDialog):
             self._batch_results.append((item["path"], False, error_msg))
             self._update_queue_table()
         self._log(f"\n\u2717 Error: {error_msg}")
+
+    def _on_memory_warning(self, info: dict):
+        """Show a non-blocking popup when the memory watchdog trips.
+
+        Warn-only: the run keeps going. We surface it visually (not just in the
+        log) so a long unattended run that's climbing toward an OOM gets noticed,
+        while never interrupting it. Shown once per run (the watchdog fires its
+        callback only on the first crossing).
+        """
+        used = info.get("used_gb", "?")
+        proj = info.get("projected_gb", "?")
+        phase = info.get("phase", "?")
+        mode = info.get("mode", "?")
+        line = (
+            f"⚠ Memory watchdog: using ~{used} GB (projected ~{proj} GB) "
+            f"during '{phase}' [{mode}]."
+        )
+        self._log(line)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("High memory use")
+        box.setText(
+            f"Stitching is using more memory than projected.\n\n"
+            f"Live: ~{used} GB   Projected: ~{proj} GB\n"
+            f"Phase: {phase}    Mode: {mode}\n\n"
+            f"The run is continuing. If it runs out of memory, cancel and "
+            f"re-run with Streaming mode and/or a higher downsample factor."
+        )
+        box.setStandardButtons(QMessageBox.Ok)
+        box.setModal(False)  # non-blocking — don't freeze the run/UI
+        box.show()
 
     def _on_item_finished(self):
         """Handle worker thread completion for a queue item."""
@@ -3360,6 +3442,7 @@ class StitchingDialog(PersistentDialog):
         paths = [str(item["path"]) for item in self._queue]
         s.setValue("queue_paths", paths)
         s.setValue("output_dir", self._output_dir_edit.text())
+        s.setValue("scratch_dir", self._scratch_dir_edit.text())
         s.setValue("pixel_size", self._pixel_size_spin.value())
         s.setValue("z_step", self._z_step_spin.value())
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
@@ -3418,6 +3501,13 @@ class StitchingDialog(PersistentDialog):
         # disconnected drive would otherwise stick (and block the auto-set).
         if output_dir and Path(output_dir).parent.exists():
             self._output_dir_edit.setText(output_dir)
+
+        # Scratch dir: only restore if still reachable; a stale path on a
+        # disconnected drive would otherwise stick. Blank => default (alongside
+        # output).
+        scratch_dir = s.value("scratch_dir", "", type=str)
+        if scratch_dir and Path(scratch_dir).exists():
+            self._scratch_dir_edit.setText(scratch_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
         # Restoring a persisted value must not count as a manual override —
@@ -3613,6 +3703,7 @@ class NativeStitchingDialog(StitchingDialog):
         paths = [str(item["path"]) for item in self._queue]
         s.setValue("queue_paths", paths)
         s.setValue("output_dir", self._output_dir_edit.text())
+        s.setValue("scratch_dir", self._scratch_dir_edit.text())
         s.setValue("pixel_size", self._pixel_size_spin.value())
         s.setValue("z_step", self._z_step_spin.value())
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
@@ -3671,6 +3762,13 @@ class NativeStitchingDialog(StitchingDialog):
         # disconnected drive would otherwise stick (and block the auto-set).
         if output_dir and Path(output_dir).parent.exists():
             self._output_dir_edit.setText(output_dir)
+
+        # Scratch dir: only restore if still reachable; a stale path on a
+        # disconnected drive would otherwise stick. Blank => default (alongside
+        # output).
+        scratch_dir = s.value("scratch_dir", "", type=str)
+        if scratch_dir and Path(scratch_dir).exists():
+            self._scratch_dir_edit.setText(scratch_dir)
 
         pixel_size = s.value("pixel_size", self._default_pixel_um, type=float)
         # Restoring a persisted value must not count as a manual override —

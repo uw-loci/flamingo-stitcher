@@ -222,14 +222,19 @@ _TIFF_EXTENSIONS = (".tif", ".tiff", ".btf")
 _TILE_EXT_RE = r"\.(?:raw|tiff?|btf)$"
 
 # Tile filename pattern: S000_t000000_V000_R0000_X000_Y000_C{ch}_I{illum}_D{det}_P{planes}.<ext>
+# Named groups so the view (V) and rotation-index (R) fields — previously parsed
+# and discarded — can be captured for multi-view acquisitions without renumbering
+# the positional groups their consumers rely on.
 RAW_FILE_PATTERN = re.compile(
-    r"S\d+_t\d+_V\d+_R\d+_X\d+_Y\d+_C(\d+)_I(\d+)_D(\d+)_P(\d+)" + _TILE_EXT_RE,
+    r"S\d+_t\d+_V(?P<view>\d+)_R(?P<rot>\d+)_X\d+_Y\d+"
+    r"_C(?P<ch>\d+)_I(?P<illum>\d+)_D(?P<det>\d+)_P(?P<planes>\d+)" + _TILE_EXT_RE,
     re.IGNORECASE,
 )
 
-# Flat-layout filename: captures X_idx, Y_idx, channel, illumination, detector, planes
+# Flat-layout filename: captures X_idx, Y_idx, view, rotation, channel, illum, det, planes
 FLAT_RAW_PATTERN = re.compile(
-    r"S\d+_t\d+_V\d+_R\d+_X(\d+)_Y(\d+)_C(\d+)_I(\d+)_D(\d+)_P(\d+)" + _TILE_EXT_RE,
+    r"S\d+_t\d+_V(?P<view>\d+)_R(?P<rot>\d+)_X(?P<xidx>\d+)_Y(?P<yidx>\d+)"
+    r"_C(?P<ch>\d+)_I(?P<illum>\d+)_D(?P<det>\d+)_P(?P<planes>\d+)" + _TILE_EXT_RE,
     re.IGNORECASE,
 )
 
@@ -426,6 +431,72 @@ class _TimeThrottledProgress(_DaskCallback):
         )
 
 
+class PipelineCancelled(Exception):
+    """Raised inside a dask compute to abort it promptly on user cancel.
+
+    The pipeline polls the cancel flag between stages, but a single big
+    fuse/write ``compute()`` / ``da.store()`` can run for minutes-to-hours
+    with no stage boundary in between — so cancelling "requested" but the run
+    kept going. This exception, raised from :class:`_CancelCallback` before
+    each dask task, tears the running compute down at the next task boundary
+    (≈ one chunk), turning cancel into a near-immediate stop.
+    """
+
+
+class _CancelCallback(_DaskCallback):
+    """Dask callback that aborts a running compute/store when the user cancels.
+
+    Registered (as a context manager) around the whole pipeline body, so EVERY
+    dask compute — in-memory fuse, streaming ``da.store``, the various writers —
+    becomes cancellable at chunk granularity without wrapping each call site.
+
+    Note: dask callbacks register process-globally for the duration of the
+    ``with`` block, so any *other* dask compute running concurrently in this
+    process would also honour this cancel flag. During a stitch run (which owns
+    the machine) that is not a concern in practice.
+    """
+
+    def __init__(self, cancelled_fn):
+        super().__init__()
+        self._cancelled_fn = cancelled_fn
+
+    def _pretask(self, key, dsk, state):
+        # Called by the scheduler before each task starts; raising here stops
+        # the compute at the next task boundary.
+        if self._cancelled_fn():
+            raise PipelineCancelled()
+
+
+def _scratch_base_dir(config, output_path) -> Path:
+    """Directory that holds the ``.stitch_tmp`` scratch folder.
+
+    ``config.scratch_dir`` when set (put temp on a fast local disk), else the
+    output directory (default — ``<output_dir>/.stitch_tmp``, unchanged).
+    """
+    scratch = getattr(config, "scratch_dir", None)
+    return Path(scratch) if scratch else Path(output_path)
+
+
+def _same_volume(a, b) -> Optional[bool]:
+    """True if ``a`` and ``b`` live on the same physical volume/drive.
+
+    Returns None when it can't be determined. Walks up to the nearest existing
+    ancestor so it works before the scratch dir is created.
+    """
+    import os
+
+    def _dev(p):
+        p = Path(p)
+        while not p.exists() and p != p.parent:
+            p = p.parent
+        return os.stat(p).st_dev
+
+    try:
+        return _dev(a) == _dev(b)
+    except OSError:
+        return None
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -473,6 +544,15 @@ class StitchingConfig:
     output_chunksize: Dict[str, int] = field(
         default_factory=lambda: {"z": 128, "y": 256, "x": 256}
     )
+    # Fusion super-block batching (item E): fuse the output in spatial regions
+    # of this many output-chunks per axis, instead of building ONE dask graph
+    # for the whole output. Bounds fusion graph memory to O(region) rather than
+    # O(total output blocks) ≈ O(mosaic area) — the term that grows ~0.4 MB/tile
+    # and becomes GBs on huge mosaics. Regions are chunk-aligned, which makes
+    # the result BIT-IDENTICAL to whole-output fusion for max/blend/content
+    # (see tests/test_superblock_fusion.py). 0 = disabled (whole-output, the
+    # historical path); a value like 8 fuses 8×8×8-chunk regions at a time.
+    fusion_superblock_chunks: int = 0
     # Cosine fade-out blending widths (µm) — controls the smooth transition
     # zone at tile boundaries.  Inspired by BigStitcher's cosine-weighted
     # blending (Hörl et al., Nature Methods 2019).  multiview-stitcher
@@ -543,6 +623,9 @@ class StitchingConfig:
 
     # Deconvolution
     deconvolution_enabled: bool = False
+    # Run deconvolution AFTER downsample (fewer voxels, smaller PSF → much
+    # faster, lower quality). Mirrors destripe_fast. Off = native-res (default).
+    deconvolution_fast: bool = False
     deconvolution_engine: str = "pycudadecon"  # "pycudadecon" or "redlionfish"
     deconvolution_iterations: int = 10
     deconvolution_na: float = 0.4
@@ -606,6 +689,24 @@ class StitchingConfig:
     # >0 = honor the request, clamped to [1, 8].
     fuse_workers: int = 0
 
+    # Scratch directory for the streaming-mode temp files (per-tile spill
+    # memmaps + the fused `.dat` memmap), i.e. the `.stitch_tmp` folder.
+    #   None (default) = alongside the OUTPUT, i.e. `<output_dir>/.stitch_tmp`
+    #     (unchanged behaviour).
+    #   a path        = put `.stitch_tmp` under this directory instead.
+    # Point this at a FAST LOCAL disk (NVMe/SSD) when the input/output live on a
+    # slow or network drive: streaming is I/O-bound on the temp spill, so moving
+    # it off the busy drive can cut wall time substantially. Notes:
+    #   * No benefit if it resolves to the same physical drive as input/output
+    #     (the pipeline warns in that case).
+    #   * Needs room for the peak temp (~tile spill + fused memmap); the run
+    #     aborts up front if the scratch drive lacks the space.
+    #   * The final output is still written from the fused memmap to output_dir,
+    #     so the fused data crosses drives once (scratch -> output). That is the
+    #     normal fuse->write pass, NOT an extra copy of the finished result;
+    #     the whole `.stitch_tmp` is deleted at the end.
+    scratch_dir: Optional[str] = None
+
     @classmethod
     def with_yaml_defaults(cls) -> "StitchingConfig":
         """Create a StitchingConfig with defaults loaded from stitching_config.yaml.
@@ -628,6 +729,45 @@ class StitchingConfig:
 # the acquisition's actual z_step, so batch queues with different
 # Z steps each get their own resolution.
 ISO_DOWNSAMPLE = -1
+
+
+def _preprocess_peak_bytes(config, native_vox: int) -> int:
+    """Peak RAM one preprocess worker holds for a single tile, at NATIVE
+    resolution.
+
+    Preprocessing (illumination fusion / destripe / deconvolution / the
+    downsample float32 upcast) all run BEFORE the tile is downsampled, so the
+    working set scales with the *native* tile size, not the downsampled one.
+    Modelling it at downsampled size is what let both the memory estimate and
+    the worker-picker under-count by up to ~30-120x with downsampling on
+    ("projected safe, then OOM"). Kept as a single function so those two callers
+    can never diverge again.
+
+    Reflects the (post-optimisation) per-step behaviour: max/mean illumination
+    fusion and XY-only downsample are per-plane (cheap); the whole-volume float32
+    terms below are added only for the steps that still take them.
+    """
+    native_vox = max(1, int(native_vox))
+    # A native uint16 volume is held through the chain, plus clip/cast transients.
+    peak = native_vox * 2 * 1.5
+    if getattr(config, "deconvolution_enabled", False):
+        # input_float + decon output + PSF/FFT scratch (RedLionfish/pycudadecon
+        # hold ~4 float32 working arrays); model 4x native float32.
+        peak += 4 * native_vox * 4
+    if getattr(config, "illumination_fusion", "max") == "leonardo":
+        peak += 2 * native_vox * 4  # two float32 illumination sides
+    if int(getattr(config, "downsample_z", 1) or 1) > 1:
+        # Z downsample couples planes → whole-volume float32 zoom (in + out).
+        peak += 2 * native_vox * 4
+    # Non-fast destripe and flat-field each allocate a second whole-volume buffer
+    # (uint16) while the input volume is still live — add one native uint16.
+    if getattr(config, "destripe", False) and not getattr(
+        config, "destripe_fast", False
+    ):
+        peak += native_vox * 2
+    if getattr(config, "flat_field_correction", False):
+        peak += native_vox * 2
+    return int(peak)
 
 
 def compute_iso_downsample(
@@ -726,7 +866,19 @@ def estimate_memory_usage(
     # Output dimensions in pixels (downsampled)
     out_x_px = int((x_range_mm + fov_mm) / config.pixel_size_um * 1000.0) // ds_xy
     out_y_px = int((y_range_mm + fov_mm) / config.pixel_size_um * 1000.0) // ds_xy
-    out_z_px = n_planes // ds_z if ds_z > 1 else n_planes
+    # Output Z extent must account for Z-TILING (tiles stacked in Z), not just
+    # one tile's plane count — otherwise a Z-tiled mosaic under-counts output_gb
+    # (and the fused-memmap + disk guard) by ~1/N_z-tiers. Mirror the X/Y range
+    # logic: span from the lowest tile start to the highest tile end.
+    z_starts = [t.z_min_mm for t in tiles]
+    z_ends = [t.z_max_mm for t in tiles]
+    z_span_mm = (max(z_ends) - min(z_starts)) if len(tiles) > 1 else 0.0
+    per_plane_mm = tiles[0].z_step_mm if tiles else 0.0
+    if per_plane_mm > 0 and z_span_mm > 0:
+        out_z_full = max(n_planes, int(round(z_span_mm / per_plane_mm)) + 1)
+    else:
+        out_z_full = n_planes
+    out_z_px = out_z_full // ds_z if ds_z > 1 else out_z_full
 
     # Bytes per voxel
     bpv = 2  # uint16
@@ -828,7 +980,12 @@ def estimate_memory_usage(
         gaps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
         if not gaps:
             return None
-        return (sorted(gaps)[len(gaps) // 2]) * px_per_unit, len(uniq)
+        # Use the SMALLEST spacing between adjacent tiles, not the median. For a
+        # regular grid they're equal; for irregular/clustered montages the min
+        # gap is the densest region, so more tiles land in a block there — the
+        # conservative (over-count) direction. A guard should err toward
+        # false-abort, never toward under-count → OOM.
+        return min(gaps) * px_per_unit, len(uniq)
 
     px_per_mm_xy = 1000.0 / (config.pixel_size_um * ds_xy)
     px_per_mm_z = 1000.0 / (config.pixel_size_um * ds_z)  # z pitch in xy-px units
@@ -853,17 +1010,27 @@ def estimate_memory_usage(
     block_float_gb = (
         _fusion_coexist * views_per_block * block_vox * _fusion_float_bytes
     ) / (1024**3)
-    fusion_gb = _fusion_concurrency * block_float_gb
+    # Use the EFFECTIVE concurrent-block count: if the user pinned fuse_workers
+    # (a first-class config field, clamped to 8 by _pick_fuse_workers), the
+    # executor runs that many concurrent float64 blocks — model the same number
+    # so a fuse_workers override can't under-count the dominant fusion term.
+    _eff_fuse = int(getattr(config, "fuse_workers", 0) or 0)
+    _eff_fuse = min(_eff_fuse, 8) if _eff_fuse > 0 else _fusion_concurrency
+    fusion_gb = _eff_fuse * block_float_gb
 
     # --- Preprocessing (materialize) working set, both modes ---
-    # Each preprocess worker holds ~2.5× the (downsampled) tile as uint16, plus
-    # a float32 deconvolution working set when deconvolution is enabled.
-    tile_bytes_ds = ds_tile_vox * bpv
-    deconv_extra = 0.0
-    if getattr(config, "deconvolution_enabled", False):
-        deconv_extra = _deconv_working_factor * ds_tile_vox * 4  # float32
-    per_worker_pp = 2.5 * tile_bytes_ds + deconv_extra
-    pp_workers = min(4, max(1, n_tiles))
+    # Sized at NATIVE resolution (preprocessing runs before downsample) via the
+    # shared _preprocess_peak_bytes, so this can't diverge from the worker-picker.
+    native_vox = int(n_planes) * int(frame_w) * int(frame_h)
+    per_worker_pp = _preprocess_peak_bytes(config, native_vox)
+    # Model the SAME worker count _pick_preprocess_workers will use: honor a
+    # preprocess_workers override up to 8, else the auto ceiling of 4. Modelling
+    # a flat 4 while the executor runs up to 8 under-counts the preprocess peak
+    # by up to 2x (the "safe-then-OOM" bug this whole path exists to prevent —
+    # already fixed for fuse_workers/D4, mirrored here).
+    _req_pp = int(getattr(config, "preprocess_workers", 0) or 0)
+    pp_workers = min(_req_pp, 8) if _req_pp > 0 else 4
+    pp_workers = min(pp_workers, max(1, n_tiles))
     materialize_gb = pp_workers * per_worker_pp / (1024**3)
 
     # --- In-memory peak ---
@@ -871,10 +1038,7 @@ def estimate_memory_usage(
     # set, plus the stacked output array and pyramid overhead during write.
     held_tiles_gb = (n_tiles * n_channels * ds_tile_vox * bpv) / (1024**3)
     in_memory_gb = (
-        held_tiles_gb
-        + fusion_gb
-        + output_gb
-        + max(pyramid_overhead_gb, per_channel_gb)
+        held_tiles_gb + fusion_gb + output_gb + max(pyramid_overhead_gb, per_channel_gb)
     )
     in_memory_gb = max(in_memory_gb, materialize_gb)
 
@@ -884,9 +1048,7 @@ def estimate_memory_usage(
     # pipeline runs materialize THEN fuse per channel, so the peak is the max
     # of the two phases, not their sum. A couple of chunk buffers ride along
     # during the zarr/TIFF write.
-    chunk_buffer_gb = (
-        _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
-    )
+    chunk_buffer_gb = _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
     streaming_gb = max(materialize_gb, fusion_gb + chunk_buffer_gb)
 
     # Auto-detect: stream if in-memory estimate exceeds available RAM
@@ -895,7 +1057,17 @@ def estimate_memory_usage(
 
         system_ram_gb = psutil.virtual_memory().total / (1024**3)
     except ImportError:
+        # D2: psutil is a hard dependency; if it's missing (e.g. a stripped
+        # frozen build) the memory guards below silently disable themselves and
+        # the mode auto-select assumes a 64 GB box — a real OOM risk on a
+        # smaller machine. Make it loud rather than silent.
         system_ram_gb = _fallback_ram
+        logger.warning(
+            "psutil not available — memory estimate assumes a %.0f GB box and "
+            "the runtime memory guards/watchdog are DISABLED. Install psutil, "
+            "or force Streaming mode + downsample on low-RAM machines.",
+            _fallback_ram,
+        )
     auto_streaming = in_memory_gb > system_ram_gb * _streaming_threshold
 
     return {
@@ -925,6 +1097,13 @@ class RawTileInfo:
     raw_files: Dict[int, Dict[int, Path]] = field(default_factory=dict)
     channels: List[int] = field(default_factory=list)
     illumination_sides: List[int] = field(default_factory=list)
+    # Multi-view acquisition provenance. ``view``/``rotation_index`` come from the
+    # filename V###/R#### fields; ``angle_deg`` is the physical rotation-stage angle
+    # read from Workflow.txt (<Start Position> Angle (degrees)). All default to the
+    # single-angle case (0) so existing acquisitions are unaffected.
+    view: int = 0
+    rotation_index: int = 0
+    angle_deg: float = 0.0
     # Raw frame (camera AOI) dimensions in pixels. Resolved per-acquisition
     # from the Workflow.txt `AOI width`/`AOI height`, cross-checked against the
     # actual on-disk file size (the file always wins — see _resolve_tile_frame_dims).
@@ -1226,17 +1405,21 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
     raw_files: Dict[int, Dict[int, Path]] = {}
     channels = set()
     illum_sides = set()
+    views = set()
+    rot_indices = set()
     n_planes = 0
 
     for f in sorted(folder.iterdir()):
         m = RAW_FILE_PATTERN.match(f.name)
         if m:
-            ch = int(m.group(1))
-            illum = int(m.group(2))
-            planes = int(m.group(4))
+            ch = int(m.group("ch"))
+            illum = int(m.group("illum"))
+            planes = int(m.group("planes"))
 
             channels.add(ch)
             illum_sides.add(illum)
+            views.add(int(m.group("view")))
+            rot_indices.add(int(m.group("rot")))
             n_planes = max(n_planes, planes)
 
             if ch not in raw_files:
@@ -1246,6 +1429,8 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
     if not raw_files:
         logger.warning(f"No .raw files in {folder.name}")
         return None
+
+    angle_deg = _read_start_angle(folder / "Workflow.txt")
 
     # Resolve the raw frame (AOI) size: prefer Workflow.txt metadata, but let
     # the actual file size override it (handles cropped-AOI acquisitions).
@@ -1263,6 +1448,9 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
         raw_files=raw_files,
         channels=sorted(channels),
         illumination_sides=sorted(illum_sides),
+        view=min(views) if views else 0,
+        rotation_index=min(rot_indices) if rot_indices else 0,
+        angle_deg=angle_deg,
         frame_width=frame_w,
         frame_height=frame_h,
     )
@@ -1289,6 +1477,25 @@ def _read_z_range(folder: Path) -> Tuple[float, float]:
         z_max = float(end.group(1))
 
     return (z_min, z_max)
+
+
+def _read_start_angle(workflow_file: Path) -> float:
+    """Read the rotation-stage angle (degrees) from a Workflow.txt.
+
+    Uses ``<Start Position> ... Angle (degrees)`` — the physical stage angle for
+    the tile, which is the authoritative source (the filename R#### field is an
+    index, not necessarily degrees). Returns 0.0 when absent (single-angle case).
+    """
+    try:
+        if not workflow_file.exists():
+            return 0.0
+        content = workflow_file.read_text(errors="replace")
+    except OSError:
+        return 0.0
+    m = re.search(
+        r"<Start Position>.*?Angle \(degrees\) = ([-\d.]+)", content, re.DOTALL
+    )
+    return float(m.group(1)) if m else 0.0
 
 
 def _read_position_from_settings(settings_file: Path) -> Dict[str, float]:
@@ -1372,7 +1579,7 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
     for f in sorted(raw_dir.iterdir()):
         m = FLAT_RAW_PATTERN.search(f.name)
         if m:
-            x_idx, y_idx = int(m.group(1)), int(m.group(2))
+            x_idx, y_idx = int(m.group("xidx")), int(m.group("yidx"))
             tile_groups.setdefault((x_idx, y_idx), []).append(f)
 
     if not tile_groups:
@@ -1419,17 +1626,21 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
         raw_files_dict: Dict[int, Dict[int, Path]] = {}
         channels = set()
         illum_sides = set()
+        views = set()
+        rot_indices = set()
         n_planes = 0
 
         for f in files:
             m = FLAT_RAW_PATTERN.search(f.name)
             if m:
-                ch = int(m.group(3))
-                illum = int(m.group(4))
-                planes = int(m.group(6))
+                ch = int(m.group("ch"))
+                illum = int(m.group("illum"))
+                planes = int(m.group("planes"))
 
                 channels.add(ch)
                 illum_sides.add(illum)
+                views.add(int(m.group("view")))
+                rot_indices.add(int(m.group("rot")))
                 n_planes = max(n_planes, planes)
 
                 if ch not in raw_files_dict:
@@ -1442,6 +1653,11 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
         _sample = next(iter(next(iter(raw_files_dict.values())).values()))
         n_planes, frame_w, frame_h = _resolve_tile_geometry(_sample, n_planes, flat_aoi)
 
+        # Rotation-stage angle: prefer the tile's _Settings.txt, else root Workflow.txt.
+        angle_deg = _read_start_angle(settings_file) if settings_file else 0.0
+        if angle_deg == 0.0 and root_wf.exists():
+            angle_deg = _read_start_angle(root_wf)
+
         tiles.append(
             RawTileInfo(
                 folder=raw_dir,
@@ -1453,6 +1669,9 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                 raw_files=raw_files_dict,
                 channels=sorted(channels),
                 illumination_sides=sorted(illum_sides),
+                view=min(views) if views else 0,
+                rotation_index=min(rot_indices) if rot_indices else 0,
+                angle_deg=angle_deg,
                 frame_width=frame_w,
                 frame_height=frame_h,
             )
@@ -1622,10 +1841,16 @@ def fuse_illumination_sides(
     if method == "max":
         return np.maximum(left, right)
     elif method == "mean":
-        # Avoids overflow for uint16 by using intermediate type
-        return ((left.astype(np.float32) + right.astype(np.float32)) / 2).astype(
-            np.uint16
-        )
+        # Per-plane so the float32 working set is one plane, not two whole-volume
+        # float32 copies (~2x the native tile) plus their sum. Bit-identical to
+        # the whole-volume expression sliced per Z. left/right are memmaps, so
+        # only one plane of each is paged in at a time.
+        out = np.empty(left.shape, dtype=np.uint16)
+        for z in range(left.shape[0]):
+            out[z] = (
+                (left[z].astype(np.float32) + right[z].astype(np.float32)) / 2
+            ).astype(np.uint16)
+        return out
     elif method == "leonardo":
         return _fuse_leonardo(left, right)
     else:
@@ -1838,11 +2063,29 @@ def downsample_volume(
 
     from scipy.ndimage import zoom
 
-    zoom_factors = (1.0 / factor_z, 1.0 / factor_xy, 1.0 / factor_xy)
     label = f"Z{factor_z}x/XY{factor_xy}x" if factor_z != factor_xy else f"{factor_xy}x"
-    logger.info(
-        f"Downsampling volume {volume.shape} by {label} " f"(zoom={zoom_factors})..."
-    )
+    logger.info(f"Downsampling volume {volume.shape} by {label}...")
+
+    # XY-only downsample (factor_z == 1) is plane-independent, so stream it one
+    # Z-plane at a time: the float32 working set is a single 2048x2048 plane
+    # (~16 MB) instead of a full-volume float32 upcast (~12 GB for a native
+    # tile) held alongside zoom's output. Bit-identical: order-1 zoom with a
+    # z-factor of 1 does not mix planes.
+    if factor_z == 1 and factor_xy > 1:
+        z = volume.shape[0]
+        xy_zoom = (1.0 / factor_xy, 1.0 / factor_xy)
+        # Derive the output plane shape from zoom itself (it rounds), so this is
+        # identical to the 3D zoom's per-plane result.
+        first = zoom(volume[0].astype(np.float32), xy_zoom, order=1)
+        out = np.empty((z, *first.shape), dtype=np.uint16)
+        out[0] = np.clip(first, 0, 65535).astype(np.uint16)
+        for zi in range(1, z):
+            plane = zoom(volume[zi].astype(np.float32), xy_zoom, order=1)
+            out[zi] = np.clip(plane, 0, 65535).astype(np.uint16)
+        return out
+
+    # Z is downsampled too: planes couple, so fall back to whole-volume zoom.
+    zoom_factors = (1.0 / factor_z, 1.0 / factor_xy, 1.0 / factor_xy)
     result = zoom(volume.astype(np.float32), zoom_factors, order=1)
     return np.clip(result, 0, 65535).astype(np.uint16)
 
@@ -1890,12 +2133,25 @@ class StitchingPipeline:
         config: Optional[StitchingConfig] = None,
         cancelled_fn=None,
         progress_fn=None,
+        memory_warning_fn=None,
     ):
         self.config = config or StitchingConfig()
         self.logger = logging.getLogger(__name__)
         self._cancelled_fn = cancelled_fn or (lambda: False)
         self._raw_progress_fn = progress_fn or (lambda pct, msg: None)
+        # Called (from a background thread) the first time live private memory
+        # crosses the projected bound. The GUI wires this to a non-blocking
+        # popup; warn-only — the run is never aborted. Signature:
+        #   memory_warning_fn(info: dict)  with keys used_gb, projected_gb,
+        #   phase, mode.
+        self._memory_warning_fn = memory_warning_fn
+        self._memory_monitor = None
         self._estimator = None  # built once tile count is known
+        # Streaming-mode flat-field models {ch_id: model}. Populated by
+        # _run_streaming when flat_field_correction is on, and consumed inside
+        # _preprocess_single_tile. Empty in the in-memory path (which applies
+        # flat-field via its own estimate/apply step), so no double-application.
+        self._flatfield_models: Dict[int, Any] = {}
 
         # Wrap caller's progress_fn so we (a) classify the phase from
         # the status message and update the estimator's phase clock,
@@ -1943,15 +2199,109 @@ class StitchingPipeline:
 
     def _on_progress_emit(self, pct, msg):
         """Hook called for every internal progress emit. Drives the
-        estimator's phase transitions and appends a live ETA tail."""
+        estimator's phase transitions, the memory watchdog's phase
+        attribution, and appends a live ETA tail."""
+        phase = self._classify_phase(msg)
+        if phase and self._memory_monitor is not None:
+            self._memory_monitor.set_phase(phase)
         if self._estimator is not None:
-            phase = self._classify_phase(msg)
             if phase and phase != getattr(self._estimator, "_current_phase", None):
                 self._estimator.start_phase(phase)
             tail = self._estimator.format_label()
             if tail and tail != "estimating...":
                 msg = f"{msg}  —  {tail}"
         self._raw_progress_fn(pct, msg)
+
+    # ------------------------------------------------------------------
+    # Memory watchdog (warn-only)
+    # ------------------------------------------------------------------
+    def _start_memory_watchdog(self, mem_est: Dict[str, float], use_streaming: bool):
+        """Start a background monitor that WARNS (never aborts) if live private
+        memory exceeds the projected peak by a margin.
+
+        This is the runtime half of "independent checking": the pre-flight guard
+        trusts the a-priori estimate; this catches what the estimate MISSED, in
+        flight, and surfaces it loud + attributable (which phase, how far over)
+        instead of an opaque OS OOM. Uses USS (private/committed memory).
+        """
+        try:
+            from flamingo_stitcher.memory_monitor import MemoryMonitor
+        except Exception:
+            return  # monitor unavailable (e.g. no psutil) — skip silently
+
+        projected_gb = float(
+            mem_est.get("streaming_gb" if use_streaming else "in_memory_gb", 0.0)
+        )
+        try:
+            margin = float(
+                get_stitching_value("memory", "watchdog_margin", default=1.5)
+            )
+        except Exception:
+            margin = 1.5
+        if projected_gb <= 0:
+            return  # nothing meaningful to bound (e.g. tiny/among test runs)
+
+        # Cap the threshold at ~90% of AVAILABLE RAM (D1): the pre-flight guard
+        # permits peaks up to 95% of available, so an uncapped 1.5x margin can
+        # land the watchdog threshold ABOVE physical RAM — the process OOMs
+        # before USS ever reaches it, on exactly the near-limit jobs most likely
+        # to OOM. Capping keeps the threshold reachable so the warning fires.
+        try:
+            import psutil
+
+            avail_gb = psutil.virtual_memory().available / (1024**3)
+        except Exception:
+            avail_gb = 0.0
+
+        raw_gb = projected_gb * margin
+        threshold_gb = min(raw_gb, avail_gb * 0.9) if avail_gb > 0 else raw_gb
+        threshold_bytes = int(threshold_gb * (1024**3))  # a working-set DELTA
+        mode = "streaming" if use_streaming else "in-memory"
+
+        def _on_exceed(used_bytes: int, phase):
+            base = getattr(self._memory_monitor, "baseline_bytes", 0) or 0
+            delta_gb = max(0, used_bytes - base) / (1024**3)
+            self.logger.warning(
+                f"  [memory watchdog] working-set memory {delta_gb:.1f} GB "
+                f"exceeded projected {projected_gb:.1f} GB × {margin:g} "
+                f"(threshold {threshold_gb:.1f} GB) during phase "
+                f"'{phase or '?'}' ({mode}). The run continues; if it OOMs, "
+                f"force Streaming and/or increase downsample."
+            )
+            if self._memory_warning_fn is not None:
+                try:
+                    self._memory_warning_fn(
+                        {
+                            "used_gb": round(delta_gb, 1),
+                            "projected_gb": round(projected_gb, 1),
+                            "margin": margin,
+                            "phase": phase or "?",
+                            "mode": mode,
+                        }
+                    )
+                except Exception:
+                    pass  # a broken callback must never crash the run
+
+        self._memory_monitor = MemoryMonitor(
+            interval_s=0.25,
+            threshold_bytes=threshold_bytes,
+            on_exceed=_on_exceed,
+            metric="uss",
+        )
+        self._memory_monitor.start()
+        self.logger.info(
+            f"Memory watchdog armed: warn if working-set memory exceeds "
+            f"{threshold_gb:.1f} GB (projected {projected_gb:.1f} × {margin:g}"
+            f"{', capped to 90% avail' if threshold_gb < raw_gb else ''}, {mode})"
+        )
+
+    def _stop_memory_watchdog(self):
+        if self._memory_monitor is not None:
+            try:
+                self._memory_monitor.stop()
+            except Exception:
+                pass
+            self._memory_monitor = None
 
     def _build_estimator(self, tiles, acquisition_dir=None, output_dir=None):
         """Construct the multi-phase estimator from tiles + config.
@@ -2034,15 +2384,28 @@ class StitchingPipeline:
         in :meth:`_run_impl`.
         """
         try:
-            result = self._run_impl(acquisition_dir, output_path, channels, tiles)
+            # Register a dask cancel callback for the whole run so a long
+            # fuse/write compute aborts promptly (≈ one chunk) instead of
+            # running to completion after the user hits Cancel.
+            with _CancelCallback(self._cancelled_fn):
+                result = self._run_impl(acquisition_dir, output_path, channels, tiles)
             cancelled = bool(self._cancelled_fn())
             if self._estimator is not None:
                 self._estimator.finalize(success=not cancelled)
             return result
+        except PipelineCancelled:
+            # A dask compute was torn down by the user cancel. Treat as a clean
+            # cancellation (not an error): the worker checks _cancelled_fn().
+            self.logger.info("Pipeline cancelled by user (compute aborted)")
+            if self._estimator is not None:
+                self._estimator.finalize(success=False)
+            return output_path
         except BaseException:
             if self._estimator is not None:
                 self._estimator.finalize(success=False)
             raise
+        finally:
+            self._stop_memory_watchdog()
 
     def _run_impl(
         self,
@@ -2166,6 +2529,40 @@ class StitchingPipeline:
                 f"Mode: {'streaming' if use_streaming else 'in-memory'} (user-selected)"
             )
 
+        # D3: if AUTO-mode picked in-memory but it would trip the resource guard
+        # (which keys off AVAILABLE RAM, whereas auto-select keys off TOTAL RAM),
+        # and streaming WOULD fit, fall back to streaming rather than hard-abort
+        # a job that could have run. (Respect an explicit user mode choice.)
+        if self.config.streaming_mode is None and not use_streaming:
+            try:
+                import psutil
+
+                _avail_gb = psutil.virtual_memory().available / (1024**3)
+            except Exception:
+                _avail_gb = 0.0
+            _ram_frac = float(getattr(self.config, "resource_guard_ram_fraction", 0.95))
+            # Match _enforce_resource_limits, which adds PyImarisWriter scratch
+            # (~0.25x output) to the peak for imaris output — otherwise the
+            # fallback can pick streaming believing it fits, then the guard
+            # aborts anyway.
+            _imaris_extra = (
+                0.25 * float(mem_est.get("output_gb", 0.0))
+                if self.config.output_format == "imaris"
+                else 0.0
+            )
+            if (
+                _avail_gb > 0
+                and mem_est["in_memory_gb"] + _imaris_extra > _avail_gb * _ram_frac
+                and mem_est["streaming_gb"] + _imaris_extra <= _avail_gb * _ram_frac
+            ):
+                self.logger.info(
+                    f"Auto-mode: in-memory ~{mem_est['in_memory_gb']:.0f} GB "
+                    f"exceeds {_ram_frac * 100:.0f}% of {_avail_gb:.0f} GB "
+                    f"available; falling back to streaming "
+                    f"(~{mem_est['streaming_gb']:.1f} GB) instead of aborting."
+                )
+                use_streaming = True
+
         self._log_preflight(
             tiles, process_channels, output_path, mem_est, use_streaming
         )
@@ -2173,6 +2570,9 @@ class StitchingPipeline:
         # Hard abort before committing any resources if this item would blow
         # past available RAM or disk (prevents machine-killing OOM/ENOSPC).
         self._enforce_resource_limits(tiles, output_path, mem_est, use_streaming)
+
+        # Arm the warn-only watchdog for the rest of the run (stopped in run()).
+        self._start_memory_watchdog(mem_est, use_streaming)
 
         if use_streaming:
             # ============================================================
@@ -2200,6 +2600,23 @@ class StitchingPipeline:
             self.logger.info("Pipeline cancelled by user")
             return output_path
 
+        # Flat-field: estimate models UP FRONT (before load) so they're applied
+        # inside _preprocess_single_tile during the load — the same single
+        # flat-field path as the streaming mode (early, native, per plane). This
+        # replaces the old post-load estimate-then-apply-whole-volume step, so
+        # both modes now flat-field identically.
+        if self.config.flat_field_correction:
+            self._progress_fn(4, "Estimating flat-field profiles (BaSiCPy)...")
+            self.logger.info("Step 2b: Estimating flat-field profiles (BaSiCPy)...")
+            self._flatfield_models = self._estimate_flatfield_models(
+                tiles, process_channels
+            )
+            if self._cancelled_fn():
+                self.logger.info("Pipeline cancelled by user")
+                return output_path
+        else:
+            self._flatfield_models = {}
+
         self._progress_fn(5, "Loading and preprocessing tiles...")
         self.logger.info("Step 2: Loading and preprocessing tiles...")
         channel_tile_data = self._load_and_preprocess(tiles, process_channels)
@@ -2207,62 +2624,6 @@ class StitchingPipeline:
         if self._cancelled_fn():
             self.logger.info("Pipeline cancelled by user")
             return output_path
-
-        # --- Flat-field correction (between load and register) ---
-        if self.config.flat_field_correction:
-            from flamingo_stitcher.flat_field import (
-                apply_flat_field,
-                estimate_flat_fields,
-                is_available,
-            )
-
-            if not is_available():
-                self.logger.warning(
-                    "Flat-field correction requested but basicpy is not installed. "
-                    "Skipping. Install with:\n"
-                    "  pip install torch --extra-index-url "
-                    "https://download.pytorch.org/whl/cpu\n"
-                    "  pip install basicpy>=2.0.0"
-                )
-            else:
-                self.logger.info("Step 2b: Estimating flat-field profiles (BaSiCPy)...")
-
-                def _ff_progress(msg: str) -> None:
-                    self._progress_fn(35, msg)
-
-                models = estimate_flat_fields(
-                    channel_tile_data, progress_fn=_ff_progress
-                )
-
-                if self._cancelled_fn():
-                    self.logger.info("Pipeline cancelled by user")
-                    return output_path
-
-                if models:
-                    for ch_id, model in models.items():
-                        try:
-                            ff = np.asarray(model.flatfield)
-                            self.logger.info(
-                                f"  Channel {ch_id}: flat-field model "
-                                f"(range {float(ff.min()):.3f}–{float(ff.max()):.3f})"
-                            )
-                        except Exception:
-                            pass
-                    self._progress_fn(38, "Applying flat-field correction...")
-                    self.logger.info(
-                        f"  Applying flat-field correction to "
-                        f"{len(models)} channel(s)..."
-                    )
-                    apply_flat_field(
-                        channel_tile_data, models, progress_fn=_ff_progress
-                    )
-                    self.logger.info("  Flat-field correction applied.")
-                else:
-                    self.logger.warning(
-                        "  No flat-field models produced — skipping correction. "
-                        "BaSiCPy estimation returned nothing (see the log file in "
-                        "%APPDATA%/FlamingoStitcher/logs/ for the underlying error)."
-                    )
 
         # --- Step 3: Register using reference channel ---
         if self.config.skip_registration:
@@ -2620,7 +2981,26 @@ class StitchingPipeline:
 
         import dask.diagnostics
 
+        # Estimate flat-field models UP FRONT (before registration) so every
+        # channel is corrected consistently — including the reference channel,
+        # whose tiles are materialised for registration and reused for fusion
+        # (C1). This matches the in-memory path, which flat-fields before
+        # registering. Previously the streaming path skipped flat-field entirely.
+        if self.config.flat_field_correction:
+            self._progress_fn(4, "Estimating flat-field (streaming)...")
+            self._flatfield_models = self._estimate_flatfield_models(
+                tiles, process_channels
+            )
+        else:
+            self._flatfield_models = {}
+
         # --- Step 2+3: Load reference channel + register ---
+        # If registration runs, it materialises the reference channel's tiles to
+        # disk; these are kept and reused for that channel's fusion pass instead
+        # of preprocessing + spilling them a second time (C1).
+        reg_reuse_ch = None
+        reg_reuse_data = None
+        reg_reuse_dir = None
         if self.config.skip_registration:
             self._progress_fn(45, "Skipping registration (using stage positions)...")
             self.logger.info(
@@ -2652,7 +3032,11 @@ class StitchingPipeline:
             # process commit limit and dies with "Unable to allocate 3.25 GiB"
             # even on a ~900 GB box. Registration only reads the tiles lazily
             # (and binned), so memmap-back them and let dask page in chunks.
-            reg_tmp_dir = output_path / ".stitch_tmp" / f"reg_ch{ref_ch:02d}"
+            reg_tmp_dir = (
+                _scratch_base_dir(self.config, output_path)
+                / ".stitch_tmp"
+                / f"reg_ch{ref_ch:02d}"
+            )
             probe = self._preprocess_single_tile(tiles[0], ref_ch)
             ref_shape = probe.shape
             del probe
@@ -2680,16 +3064,27 @@ class StitchingPipeline:
                 reg_params, transform_key = self._register_tiles(
                     ref_tile_data, voxel_size_um
                 )
-            finally:
-                # Drop the lazy handles and delete the spill dir. The fusion
-                # loop below re-materialises each channel (this one included)
-                # into its own temp dir, so nothing downstream needs these.
+            except BaseException:
+                # On failure/cancel drop the spill. (On success we KEEP it — see
+                # below — so the fusion loop can reuse the ref channel's
+                # already-materialised tiles.)
                 del ref_tile_data
                 gc.collect()
                 shutil.rmtree(reg_tmp_dir, ignore_errors=True)
-            self.logger.info("  Freed registration tile data")
+                raise
+            # Keep the ref-channel spill for reuse in the fusion loop (C1):
+            # re-materialising it there would preprocess + write N tiles a second
+            # time (a full redundant pass, worst with deconvolution on).
+            reg_reuse_ch = ref_ch
+            reg_reuse_data = ref_tile_data
+            reg_reuse_dir = reg_tmp_dir
+            self.logger.info(
+                "  Registration complete; reusing ref-channel spill for fusion"
+            )
 
         if self._cancelled_fn():
+            if reg_reuse_dir is not None:
+                shutil.rmtree(reg_reuse_dir, ignore_errors=True)
             self.logger.info("Pipeline cancelled by user")
             return output_path
 
@@ -2717,13 +3112,19 @@ class StitchingPipeline:
         stacked = None
         fused_memmap_path = None
 
-        tmp_root = output_path / ".stitch_tmp"
+        tmp_root = _scratch_base_dir(self.config, output_path) / ".stitch_tmp"
         tmp_root.mkdir(parents=True, exist_ok=True)
         imaris_mode = self.config.output_format == "imaris"
         try:
             for ch_idx, ch_id in enumerate(process_channels):
                 if self._cancelled_fn():
                     self.logger.info("Pipeline cancelled by user")
+                    # This early return isn't inside the write-phase finally, so
+                    # clean the spill ourselves (it now includes the reused
+                    # ref-channel spill). Drop the memmap ref first (Windows lock).
+                    stacked = None
+                    gc.collect()
+                    shutil.rmtree(tmp_root, ignore_errors=True)
                     return output_path
 
                 fuse_pct = 50 + int(35 * (ch_idx + 0.5) / max(len(process_channels), 1))
@@ -2738,23 +3139,29 @@ class StitchingPipeline:
                     f"[streaming, one-shot tile preprocess → memmap]..."
                 )
 
-                # Preprocess each tile once, spill to memmap on disk.
-                ch_tmp_dir = tmp_root / f"ch{ch_id:02d}"
-                tile_data = self._materialize_tiles_to_disk(
-                    tiles, ch_id, expected_tile_shape, ch_tmp_dir
-                )
+                # Preprocess each tile once, spill to memmap on disk — unless
+                # this is the reference channel, whose tiles were already
+                # materialised for registration (C1): reuse that spill instead
+                # of preprocessing + writing every tile a second time.
+                if ch_id == reg_reuse_ch and reg_reuse_data is not None:
+                    ch_tmp_dir = reg_reuse_dir
+                    tile_data = reg_reuse_data
+                    reg_reuse_data = None  # consumed
+                    self.logger.info(
+                        f"  Reusing pre-registered spill for channel {ch_id} "
+                        f"(skipping re-materialize)"
+                    )
+                else:
+                    ch_tmp_dir = tmp_root / f"ch{ch_id:02d}"
+                    tile_data = self._materialize_tiles_to_disk(
+                        tiles, ch_id, expected_tile_shape, ch_tmp_dir
+                    )
                 if not tile_data:
                     self.logger.warning(f"No data for channel {ch_id}, skipping")
                     if ch_tmp_dir.exists():
                         shutil.rmtree(ch_tmp_dir, ignore_errors=True)
                     continue
 
-                fused_sim, origin_um = self._fuse_channel(
-                    tile_data, voxel_size_um, reg_params, transform_key
-                )
-
-                # Clip + cast to uint16 in the graph so float64 intermediates
-                # are converted per-chunk, never materializing the full volume.
                 compute_pct = 50 + int(
                     35 * (ch_idx + 0.8) / max(len(process_channels), 1)
                 )
@@ -2764,86 +3171,154 @@ class StitchingPipeline:
                     f"({ch_idx + 1}/{len(process_channels)})...",
                 )
 
-                darr = fused_sim.data
-                while darr.ndim > 3:
-                    darr = darr[0]
-                darr = da.clip(darr, 0, 65535).astype(np.uint16)
-
-                # Background zeroing: voxels at or below the per-channel
-                # threshold become 0 so blosc/zstd compresses them away.
-                # Applied as a single dask op; runs per-chunk with no
-                # extra peak memory.
+                # Per-channel background-zero threshold, applied in the graph
+                # (per-chunk, no extra peak). Shared by both fusion paths.
                 bg_threshold = 0
                 if self.config.background_zero_enabled:
                     bg_threshold = int(
                         self.config.background_zero_thresholds.get(ch_id, 0)
                     )
                     if bg_threshold > 0:
-                        darr = da.where(
-                            darr > np.uint16(bg_threshold),
-                            darr,
-                            np.uint16(0),
-                        )
                         self.logger.info(
                             f"  Channel {ch_id}: background zeroing "
                             f"threshold={bg_threshold}"
                         )
 
-                self.logger.info(
-                    f"  Channel {ch_id}: shape={darr.shape} "
-                    f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
-                    f"X={origin_um['x']:.1f} \u00b5m"
+                def _finalize(dk):
+                    # Clip + cast to uint16 in the graph so float64 intermediates
+                    # convert per-chunk; apply background zeroing if set.
+                    while dk.ndim > 3:
+                        dk = dk[0]
+                    dk = da.clip(dk, 0, 65535).astype(np.uint16)
+                    if bg_threshold > 0:
+                        dk = da.where(dk > np.uint16(bg_threshold), dk, np.uint16(0))
+                    return dk
+
+                def _alloc_stacked(shape_zyx):
+                    # Allocate the (C,Z,Y,X) on-disk fused memmap on first use so
+                    # `stacked` never lives in RAM and writers stream from it.
+                    nonlocal stacked, fused_memmap_path
+                    if stacked is None:
+                        fused_shape = (len(process_channels), *shape_zyx)
+                        fused_memmap_path = tmp_root / "fused.dat"
+                        stacked = np.memmap(
+                            fused_memmap_path,
+                            dtype=np.uint16,
+                            mode="w+",
+                            shape=fused_shape,
+                        )
+                        self.logger.info(
+                            f"  Fused output memmap: {fused_shape} "
+                            f"({np.prod(fused_shape) * 2 / (1024**3):.1f} GB) "
+                            f"-> {fused_memmap_path}"
+                        )
+
+                def _scheduler_for(dk):
+                    fw = self._pick_fuse_workers(dk)
+                    if fw <= 1:
+                        return "synchronous", {"scheduler": "synchronous"}
+                    return f"threads x{fw}", {
+                        "scheduler": "threads",
+                        "num_workers": fw,
+                    }
+
+                superblock = int(
+                    getattr(self.config, "fusion_superblock_chunks", 0) or 0
                 )
 
-                # Single code path for all output formats: compute fusion
-                # into a per-channel slot of a 4D on-disk memmap. This:
-                #   * Keeps `stacked` out of RAM (previously np.zeros ate
-                #     C × output_gb before any writer saw it).
-                #   * Means Imaris's PyImarisWriter reads final voxels from
-                #     the memmap file instead of driving dask compute per
-                #     8 MB block (was 30 s × 30 k blocks = ~11 days).
-                #   * Content-based weighting + blending now run exactly
-                #     once per channel instead of once per Imaris block.
-                if stacked is None:
-                    n_total = len(process_channels)
-                    fused_shape = (n_total, *darr.shape)
-                    fused_memmap_path = tmp_root / "fused.dat"
-                    stacked = np.memmap(
-                        fused_memmap_path,
-                        dtype=np.uint16,
-                        mode="w+",
-                        shape=fused_shape,
+                # Both names always exist so the shared cleanup below can `del`
+                # them regardless of which path ran (super-block leaves them None
+                # and releases its region refs each iteration).
+                darr = None
+                fused_sim = None
+
+                if superblock > 0:
+                    # ---- Super-block batched fusion (item E): bound the dask
+                    # graph to O(region) by fusing chunk-aligned sub-regions and
+                    # storing each into the memmap slice, instead of one graph
+                    # over the whole output. Chunk alignment makes this
+                    # bit-identical to whole-output fusion for every overlap mode.
+                    sims, fuse_kwargs = self._build_fusion_inputs(
+                        tile_data, voxel_size_um, reg_params, transform_key
+                    )
+                    full_props = self._full_stack_properties(sims, fuse_kwargs)
+                    org = full_props["origin"]
+                    shp = full_props["shape"]
+                    origin_um = {
+                        "z": float(org["z"]),
+                        "y": float(org["y"]),
+                        "x": float(org["x"]),
+                    }
+                    full_shape = (int(shp["z"]), int(shp["y"]), int(shp["x"]))
+                    _alloc_stacked(full_shape)
+                    dest_idx = len(fused_channel_ids)
+                    regions = list(
+                        self._iter_superblock_regions(full_props, superblock)
                     )
                     self.logger.info(
-                        f"  Fused output memmap: {fused_shape} "
-                        f"({np.prod(fused_shape) * 2 / (1024**3):.1f} GB) "
-                        f"→ {fused_memmap_path}"
+                        f"  Channel {ch_id}: shape={full_shape} "
+                        f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
+                        f"X={origin_um['x']:.1f} um -- {len(regions)} "
+                        f"super-block region(s) of {superblock} chunks/axis"
                     )
+                    from multiview_stitcher import fusion as _fusion
 
-                dest_idx = len(fused_channel_ids)
-                fuse_workers = self._pick_fuse_workers(darr)
-                if fuse_workers <= 1:
-                    scheduler_name = "synchronous"
-                    scheduler_cfg: Dict[str, Any] = {"scheduler": "synchronous"}
+                    for ridx, (rprops, (z0, z1, y0, y1, x0, x1)) in enumerate(regions):
+                        if self._cancelled_fn():
+                            self.logger.info("Pipeline cancelled by user")
+                            break
+                        region_kwargs = dict(fuse_kwargs)
+                        region_kwargs["output_stack_properties"] = rprops
+                        region_sim = self._fuse_with_fallback(
+                            _fusion.fuse, sims, region_kwargs
+                        )
+                        rdarr = _finalize(region_sim.data)
+                        _sname, scfg = _scheduler_for(rdarr)
+                        with dask.config.set(**scfg):
+                            # lock=False: regions/chunks write disjoint memmap
+                            # ranges, so the default per-target write lock only
+                            # serializes the block memcpys for no reason.
+                            da.store(
+                                rdarr,
+                                stacked[dest_idx][z0:z1, y0:y1, x0:x1],
+                                compute=True,
+                                lock=False,
+                            )
+                        self._progress_fn(
+                            compute_pct,
+                            f"Channel {ch_id}: fused region "
+                            f"{ridx + 1}/{len(regions)}",
+                        )
+                    del sims
                 else:
-                    scheduler_name = f"threads×{fuse_workers}"
-                    scheduler_cfg = {
-                        "scheduler": "threads",
-                        "num_workers": fuse_workers,
-                    }
-                self.logger.info(
-                    f"  Storing channel {ch_id} into fused memmap "
-                    f"(scheduler={scheduler_name}, memmap-backed tiles)..."
-                )
-                progress_cb = _TimeThrottledProgress(
-                    self.logger,
-                    label=f"channel {ch_id} store",
-                    interval_s=30.0,
-                    progress_fn=self._progress_fn,
-                )
-                with dask.config.set(**scheduler_cfg):
-                    with progress_cb:
-                        da.store(darr, stacked[dest_idx], compute=True)
+                    # ---- Whole-output fusion (historical path) ----
+                    fused_sim, origin_um = self._fuse_channel(
+                        tile_data, voxel_size_um, reg_params, transform_key
+                    )
+                    darr = _finalize(fused_sim.data)
+                    self.logger.info(
+                        f"  Channel {ch_id}: shape={darr.shape} "
+                        f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
+                        f"X={origin_um['x']:.1f} um"
+                    )
+                    _alloc_stacked(tuple(darr.shape))
+                    dest_idx = len(fused_channel_ids)
+                    scheduler_name, scheduler_cfg = _scheduler_for(darr)
+                    self.logger.info(
+                        f"  Storing channel {ch_id} into fused memmap "
+                        f"(scheduler={scheduler_name}, memmap-backed tiles)..."
+                    )
+                    progress_cb = _TimeThrottledProgress(
+                        self.logger,
+                        label=f"channel {ch_id} store",
+                        interval_s=30.0,
+                        progress_fn=self._progress_fn,
+                    )
+                    with dask.config.set(**scheduler_cfg):
+                        with progress_cb:
+                            # lock=False: each channel writes a disjoint memmap
+                            # slot; the default write lock only serializes memcpys.
+                            da.store(darr, stacked[dest_idx], compute=True, lock=False)
 
                 # Safety cap: if background zeroing was active, verify
                 # the fraction of zeroed voxels stayed below the cap.
@@ -2851,8 +3326,15 @@ class StitchingPipeline:
                 # cheap) rather than recomputing the dask graph.
                 if bg_threshold > 0:
                     written = stacked[dest_idx]
-                    n_zero = int(np.count_nonzero(written == 0))
                     n_total = int(written.size)
+                    # Count zeros in Z-slabs. `written == 0` on the whole channel
+                    # would allocate a full-size boolean array in RAM (~500 GB
+                    # for a 1 TB channel) — an OOM at the exact scale this
+                    # pipeline targets. One slab's worth of bool is bounded.
+                    z_slab = max(1, int(self.config.output_chunksize.get("z", 128)))
+                    n_zero = 0
+                    for z0 in range(0, written.shape[0], z_slab):
+                        n_zero += int(np.count_nonzero(written[z0 : z0 + z_slab] == 0))
                     zero_frac = n_zero / max(n_total, 1)
                     cap = float(self.config.background_zero_sanity_cap_fraction)
                     self.logger.info(
@@ -3030,6 +3512,72 @@ class StitchingPipeline:
 
         return result
 
+    def _estimate_flatfield_models(
+        self, tiles: List[RawTileInfo], channels: List[int]
+    ) -> Dict[int, Any]:
+        """Estimate a flat-field model per channel (both pipeline modes).
+
+        Loads only the illumination-fused MIDDLE plane of each tile (one plane
+        per tile per channel — bounded RAM, ~N_tiles × H × W), then fits BaSiC
+        via the shared estimate_flat_fields. The returned models are consumed by
+        _preprocess_single_tile, which applies flat-field per plane right after
+        illumination fusion (native resolution, early in the chain) — the single
+        flat-field path for streaming AND in-memory. Returns {} (with a loud
+        warning) if basicpy is unavailable.
+        """
+        from .flat_field import estimate_flat_fields, is_available
+
+        if not is_available():
+            self.logger.warning(
+                "Flat-field correction requested but basicpy is unavailable "
+                "(direct or isolated env) — output will NOT be flat-fielded. "
+                "Use 'Setup Preprocessing…' in the dialog to install."
+            )
+            return {}
+
+        ch_data: Dict[int, List[Tuple[Any, RawTileInfo]]] = {ch: [] for ch in channels}
+        for tile in tiles:
+            for ch in channels:
+                illum = tile.raw_files.get(ch, {})
+                if not illum:
+                    continue
+                planes: Dict[int, np.ndarray] = {}
+                for side, path in illum.items():
+                    vol = load_tile_volume(
+                        path, tile.n_planes, tile.frame_width, tile.frame_height
+                    )
+                    mid = vol.shape[0] // 2
+                    # np.array (copy), not np.asarray (view): a view keeps the
+                    # whole tile `vol` alive. For single-side tiles `fused` stays
+                    # this array, so a view would pin every tile's full native
+                    # volume until the final np.stack (OOM on large single-side
+                    # TIFF mosaics — defeats the "one plane per tile" bound).
+                    planes[side] = np.array(vol[mid])[None]  # (1, H, W) copy
+                if len(planes) > 1:
+                    fused = fuse_illumination_sides(
+                        planes, method=self.config.illumination_fusion
+                    )
+                else:
+                    fused = list(planes.values())[0]
+                ch_data[ch].append((fused, tile))
+
+        return estimate_flat_fields(
+            ch_data, progress_fn=lambda m: self._progress_fn(45, m)
+        )
+
+    def _apply_flatfield_volume(self, volume: np.ndarray, model: Any) -> np.ndarray:
+        """Apply a flat-field model to a native-resolution volume, one plane at
+        a time (bounded to one plane of float32). Bit-for-bit the same math as
+        flat_field.apply_flat_field."""
+        ff = model.flatfield.astype(np.float32)
+        ff = np.where(ff > 0.001, ff, 1.0)
+        dark = model.darkfield.astype(np.float32)
+        out = np.empty(volume.shape, dtype=np.uint16)
+        for z in range(volume.shape[0]):
+            plane = (volume[z].astype(np.float32) - dark) / ff
+            out[z] = np.clip(plane, 0, 65535).astype(np.uint16)
+        return out
+
     def _preprocess_single_tile(self, tile: RawTileInfo, ch_id: int) -> np.ndarray:
         """Load and preprocess a single tile for one channel.
 
@@ -3065,6 +3613,15 @@ class StitchingPipeline:
         else:
             volume = np.asarray(list(illum_volumes.values())[0])
 
+        # Flat-field correction (streaming path). In-memory mode applies its own
+        # flat-field step and leaves _flatfield_models empty, so this is a no-op
+        # there (no double application). Applied here — right after illumination
+        # fusion, at native resolution, per plane — so the streaming path no
+        # longer silently skips a requested flat-field correction.
+        _ff_model = self._flatfield_models.get(ch_id)
+        if _ff_model is not None:
+            volume = self._apply_flatfield_volume(volume, _ff_model)
+
         if self.config.depth_attenuation:
             from .depth_attenuation import correct_depth_attenuation
 
@@ -3078,7 +3635,8 @@ class StitchingPipeline:
         if self.config.destripe and not self.config.destripe_fast:
             volume = destripe_volume(volume, max_workers=self.config.destripe_workers)
 
-        if self.config.deconvolution_enabled:
+        _deconv_fast = bool(getattr(self.config, "deconvolution_fast", False))
+        if self.config.deconvolution_enabled and not _deconv_fast:
             volume = self._deconvolve_tile(volume, tile)
 
         if self.config.downsample_xy > 1 or self.config.downsample_z > 1:
@@ -3088,6 +3646,12 @@ class StitchingPipeline:
 
         if self.config.destripe and self.config.destripe_fast:
             volume = destripe_volume(volume, max_workers=self.config.destripe_workers)
+
+        # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far
+        # cheaper (fewer voxels + smaller PSF) but lower quality, since the PSF
+        # blur is estimated/removed at reduced resolution. Off by default.
+        if self.config.deconvolution_enabled and _deconv_fast:
+            volume = self._deconvolve_tile(volume, tile)
 
         if self.config.camera_x_inverted:
             # Return a stride-reversed view, not a contiguous copy. The caller
@@ -3120,14 +3684,26 @@ class StitchingPipeline:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tile_bytes = int(np.prod(expected_shape) * 2)  # uint16
+        tile_bytes = int(np.prod(expected_shape) * 2)  # uint16, downsampled (temp disk)
 
         # Filter to tiles that actually contain this channel, preserving
         # their original indices so memmap filenames stay stable across
         # channels (useful when debugging).
         active = [(i, t) for i, t in enumerate(tiles) if ch_id in t.raw_files]
 
-        n_workers = self._pick_preprocess_workers(tile_bytes, len(active))
+        # Size the worker pool on the NATIVE per-tile peak — preprocessing runs
+        # at native resolution before downsample (see _preprocess_peak_bytes).
+        _geo_tile = active[0][1] if active else (tiles[0] if tiles else None)
+        if _geo_tile is not None:
+            native_vox = (
+                int(_geo_tile.n_planes)
+                * int(_geo_tile.frame_width)
+                * int(_geo_tile.frame_height)
+            )
+        else:
+            native_vox = int(np.prod(expected_shape))
+        per_worker_bytes = _preprocess_peak_bytes(self.config, native_vox)
+        n_workers = self._pick_preprocess_workers(per_worker_bytes, len(active))
         self.logger.info(
             f"  Materializing {len(active)} tiles for channel {ch_id} "
             f"→ {tmp_dir} "
@@ -3225,13 +3801,14 @@ class StitchingPipeline:
         # spatial sequence regardless of completion order from the pool.
         return [result_by_idx[i] for i in sorted(result_by_idx)]
 
-    def _pick_preprocess_workers(self, tile_bytes: int, n_tiles: int) -> int:
+    def _pick_preprocess_workers(self, per_worker_bytes: int, n_tiles: int) -> int:
         """Choose a safe ThreadPool size for per-tile preprocessing.
 
-        Each worker holds ~2.5× ``tile_bytes`` at peak (raw load +
-        preprocessed output + memmap writeback buffer). We cap workers
-        at 50% of available RAM divided by that footprint, and at
-        ``n_tiles`` so the pool never outsizes the work.
+        ``per_worker_bytes`` is the NATIVE-resolution peak one worker holds for a
+        tile (from :func:`_preprocess_peak_bytes`, accounting for the enabled
+        preprocessing steps). Preprocessing runs BEFORE downsample, so sizing on
+        the downsampled tile — as this used to — picked far too many workers and
+        could OOM. We keep total preprocessing RAM under ~50% of available.
 
         Config override:
           * ``preprocess_workers = 0``: auto, clamped to [1, 4].
@@ -3248,7 +3825,7 @@ class StitchingPipeline:
         except Exception:
             avail_bytes = 8 * 1024**3  # conservative 8 GB fallback
 
-        per_worker = max(1, int(tile_bytes * 2.5))
+        per_worker = max(1, int(per_worker_bytes))
         ram_cap = max(1, avail_bytes // (per_worker * 2))
 
         if requested > 0:
@@ -3286,10 +3863,28 @@ class StitchingPipeline:
         except Exception:
             avail_bytes = 8 * 1024**3  # conservative 8 GB fallback
 
-        # Reserve 25% for fused memmap page cache + tile memmap pages +
-        # OS. Remaining budget at 1 GB per worker.
+        # Reserve 25% for fused-memmap page cache + tile memmap pages + OS.
+        # Budget per worker = the actual per-block float64 fusion working set,
+        # derived from the real output chunk size and fusion mode (matches
+        # estimate_memory_usage). The old flat 1 GB over-counted the default
+        # `max` path on small chunks — collapsing to a single core on tight-RAM
+        # boxes for no reason — and under-counted large chunks.
         budget_bytes = max(0, int(avail_bytes * 0.75))
-        per_worker_bytes = 1 * 1024**3
+        try:
+            chunk_vox = 1
+            for c in darr.chunksize:
+                chunk_vox *= int(c)
+        except Exception:
+            chunk_vox = 64 * 256 * 256
+        content = bool(
+            getattr(self.config, "content_based_fusion", False)
+            and getattr(self.config, "tile_overlap_fusion", "max") != "max"
+        )
+        # ~9-tile local overlap; content-based adds a halo + extra weight buffers.
+        coexist = 3.0 if content else 2.0
+        halo_factor = 1.8 if content else 1.0
+        per_worker_bytes = int(coexist * 9 * chunk_vox * halo_factor * 8)
+        per_worker_bytes = max(per_worker_bytes, 256 * 1024**2)  # 256 MB floor
         ram_cap = max(1, budget_bytes // per_worker_bytes)
 
         # Cap by the number of output chunks so the pool never outsizes
@@ -3438,46 +4033,27 @@ class StitchingPipeline:
             retry_kwargs.pop("weights_func_kwargs", None)
             return fuse_fn(sims, **retry_kwargs)
 
-    def _fuse_channel(
+    def _build_fusion_inputs(
         self,
         tile_data: List[Tuple[Any, RawTileInfo]],
         voxel_size_um: Dict[str, float],
         reg_params: list,
         transform_key: str,
-    ) -> Tuple[Any, Dict[str, float]]:
-        """Fuse tiles for a single channel using pre-computed registration.
+    ) -> Tuple[list, Dict[str, Any]]:
+        """Build the per-tile SpatialImages + the fuse() kwargs for a channel.
 
-        Args:
-            tile_data: [(volume, tile_info), ...] for this channel
-            voxel_size_um: Voxel sizes dict
-            reg_params: Affine params from _register_tiles (one per tile)
-            transform_key: Transform key to use for fusion
-
-        Returns:
-            (fused_sim, origin_um) — fused SpatialImage and origin dict
+        Split out of :meth:`_fuse_channel` so the streaming path can build the
+        inputs ONCE and then fuse many chunk-aligned sub-regions from them
+        (super-block batching, item E), instead of one graph over the whole
+        output. Returns ``(sims, fuse_kwargs)``; ``transform_key`` is embedded
+        in ``fuse_kwargs``.
         """
-        try:
-            from multiview_stitcher import (
-                fusion,
-            )
-            from multiview_stitcher import io as mvs_io
-            from multiview_stitcher import (
-                msi_utils,
-            )
-            from multiview_stitcher import spatial_image_utils as si_utils
-        except ImportError as exc:
-            # Surface the REAL missing module (e.g. a dependency stripped from a
-            # frozen build) instead of hiding it behind a generic message — the
-            # underlying ImportError names exactly what's absent.
-            raise ImportError(
-                "multiview-stitcher (or one of its dependencies) failed to import. "
-                f"Underlying error: {exc}. "
-                "If running from source, install with: pip install multiview-stitcher"
-            ) from exc
+        from multiview_stitcher import io as mvs_io
+        from multiview_stitcher import msi_utils
+        from multiview_stitcher import spatial_image_utils as si_utils
 
         import dask.array as da
 
-        # Build SpatialImages
         msims = []
         for volume, tile_info in tile_data:
             translation_um = {
@@ -3498,7 +4074,6 @@ class StitchingPipeline:
             msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
             msims.append(msim)
 
-        # Apply pre-computed registration transforms
         if reg_params and transform_key != mvs_io.METADATA_TRANSFORM_KEY:
             for msim, param in zip(msims, reg_params):
                 msi_utils.set_affine_transform(
@@ -3508,7 +4083,6 @@ class StitchingPipeline:
                     base_transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                 )
 
-        # Fuse
         sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
 
         fuse_kwargs: Dict[str, Any] = dict(
@@ -3548,6 +4122,49 @@ class StitchingPipeline:
                         "  content_based weights not available — using default blending"
                     )
 
+        return sims, fuse_kwargs
+
+    def _fuse_channel(
+        self,
+        tile_data: List[Tuple[Any, RawTileInfo]],
+        voxel_size_um: Dict[str, float],
+        reg_params: list,
+        transform_key: str,
+        output_stack_properties: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[Any, Dict[str, float]]:
+        """Fuse tiles for a single channel using pre-computed registration.
+
+        Args:
+            tile_data: [(volume, tile_info), ...] for this channel
+            voxel_size_um: Voxel sizes dict
+            reg_params: Affine params from _register_tiles (one per tile)
+            transform_key: Transform key to use for fusion
+            output_stack_properties: If given, fuse ONLY this sub-region
+                (origin/shape/spacing) instead of the whole output — used by
+                super-block batching. Must be chunk-aligned for the region to
+                match whole-output fusion bit-for-bit.
+
+        Returns:
+            (fused_sim, origin_um) — fused SpatialImage and origin dict
+        """
+        try:
+            from multiview_stitcher import fusion
+        except ImportError as exc:
+            # Surface the REAL missing module (e.g. a dependency stripped from a
+            # frozen build) instead of hiding it behind a generic message — the
+            # underlying ImportError names exactly what's absent.
+            raise ImportError(
+                "multiview-stitcher (or one of its dependencies) failed to import. "
+                f"Underlying error: {exc}. "
+                "If running from source, install with: pip install multiview-stitcher"
+            ) from exc
+
+        sims, fuse_kwargs = self._build_fusion_inputs(
+            tile_data, voxel_size_um, reg_params, transform_key
+        )
+        if output_stack_properties is not None:
+            fuse_kwargs["output_stack_properties"] = output_stack_properties
+
         fused = self._fuse_with_fallback(fusion.fuse, sims, fuse_kwargs)
 
         origin_um = {
@@ -3561,6 +4178,49 @@ class StitchingPipeline:
         )
 
         return fused, origin_um
+
+    def _full_stack_properties(self, sims, fuse_kwargs) -> Dict[str, Any]:
+        """Compute the whole-output stack properties (origin/shape/spacing)
+        without fusing — used to lay out super-block regions."""
+        from multiview_stitcher import fusion
+        from multiview_stitcher import spatial_image_utils as si_utils
+
+        tk = fuse_kwargs["transform_key"]
+        params = [si_utils.get_affine_from_sim(s, transform_key=tk) for s in sims]
+        spacing = si_utils.get_spacing_from_sim(sims[0])
+        return fusion.calc_fusion_stack_properties(
+            sims, params=params, spacing=spacing, mode="union"
+        )
+
+    def _iter_superblock_regions(self, full_props, region_chunks: int):
+        """Yield ``(region_props, (z0,z1,y0,y1,x0,x1))`` covering the full
+        output in chunk-aligned regions of ``region_chunks`` output-chunks per
+        axis. Chunk alignment is what makes each region fuse bit-identically to
+        the whole output (see tests/test_superblock_fusion.py)."""
+        sp = full_props["spacing"]
+        org = full_props["origin"]
+        shp = full_props["shape"]
+        cs = self.config.output_chunksize
+        step = {
+            d: max(1, int(cs.get(d, 256))) * max(1, int(region_chunks))
+            for d in ("z", "y", "x")
+        }
+        for z0 in range(0, int(shp["z"]), step["z"]):
+            z1 = min(z0 + step["z"], int(shp["z"]))
+            for y0 in range(0, int(shp["y"]), step["y"]):
+                y1 = min(y0 + step["y"], int(shp["y"]))
+                for x0 in range(0, int(shp["x"]), step["x"]):
+                    x1 = min(x0 + step["x"], int(shp["x"]))
+                    region_props = {
+                        "origin": {
+                            "z": org["z"] + z0 * sp["z"],
+                            "y": org["y"] + y0 * sp["y"],
+                            "x": org["x"] + x0 * sp["x"],
+                        },
+                        "shape": {"z": z1 - z0, "y": y1 - y0, "x": x1 - x0},
+                        "spacing": dict(sp),
+                    }
+                    yield region_props, (z0, z1, y0, y1, x0, x1)
 
     def _write_multichannel_output(
         self,
@@ -3772,6 +4432,30 @@ class StitchingPipeline:
                 "origin_um": origin_list,
             }
 
+        # Per-tile coverage descriptor (additive; older readers ignore unknown
+        # keys). Records which illumination sides and rotation angle each tile
+        # carried, so an asymmetric / multi-view acquisition is self-describing.
+        # `partial_coverage` flags when the cuboid was NOT collected uniformly:
+        # any tile missing a side, or more than one distinct angle present.
+        tiles_meta = [
+            {
+                "x_mm": t.x_mm,
+                "y_mm": t.y_mm,
+                "z_min_mm": t.z_min_mm,
+                "z_max_mm": t.z_max_mm,
+                "illumination_sides": list(t.illumination_sides),
+                "angle_deg": t.angle_deg,
+                "view": t.view,
+            }
+            for t in tiles
+        ]
+        all_sides = sorted({s for t in tiles for s in t.illumination_sides})
+        all_angles = sorted({t.angle_deg for t in tiles})
+        partial_coverage = (
+            any(list(t.illumination_sides) != all_sides for t in tiles)
+            or len(all_angles) > 1
+        )
+
         metadata = {
             "version": 2,
             "source_acquisition": str(acquisition_dir),
@@ -3784,6 +4468,10 @@ class StitchingPipeline:
             "output_format": self.config.output_format,
             "channels": channels_meta,
             "tile_count": len(tiles),
+            "illumination_sides": all_sides,
+            "angles_deg": all_angles,
+            "partial_coverage": partial_coverage,
+            "tiles": tiles_meta,
         }
 
         meta_path = output_dir / "stitch_metadata.json"
@@ -4401,27 +5089,79 @@ class StitchingPipeline:
         # writer runs. Both live simultaneously for most of the run.
         spill_gb = (len(tiles) * tile_bytes / (1024**3)) if use_streaming else 0.0
         fused_memmap_gb = output_gb if use_streaming else 0.0
+        scratch_gb = spill_gb + fused_memmap_gb  # lives under .stitch_tmp
+
+        # Scratch (temp) lives at config.scratch_dir when set, else next to the
+        # output. Report/guard the correct drive for each portion.
+        scratch_base = _scratch_base_dir(self.config, output_path)
+        scratch_set = getattr(self.config, "scratch_dir", None) is not None
+        try:
+            scratch_base.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        # `is not True`: when the volume check is undeterminable (None, e.g. a
+        # stat error) but a scratch dir was explicitly set, assume it IS separate
+        # so the scratch drive still gets a free-space check rather than silently
+        # falling back to charging everything to the output drive.
+        separate_scratch = (
+            scratch_set and _same_volume(scratch_base, output_path) is not True
+        )
 
         try:
             out_free_gb = _shutil.disk_usage(output_path).free / (1024**3)
-            # Peak disk = per-channel tile spill + fused memmap + final output
-            needed_gb = output_gb + spill_gb + fused_memmap_gb
-            parts = [f"~{output_gb:.1f} GB output"]
-            if spill_gb > 0:
-                parts.append(f"~{spill_gb:.1f} GB tile spill")
-            if fused_memmap_gb > 0:
-                parts.append(f"~{fused_memmap_gb:.1f} GB fused memmap")
-            msg = (
-                f"Output drive ({output_path}): {out_free_gb:.0f} GB free, "
-                f"need {' + '.join(parts)}"
-            )
-            self.logger.info(msg)
-            if out_free_gb < needed_gb * 1.1:
-                self.logger.warning(
-                    f"  [warning] output drive may run out of space: "
-                    f"need ~{needed_gb:.0f} GB, {out_free_gb:.0f} GB free. "
-                    f"Free up space or point output to a larger drive."
+            if separate_scratch:
+                # Only the final output lands on the output drive; the tile spill
+                # + fused memmap go to the (separate) scratch drive.
+                self.logger.info(
+                    f"Output drive ({output_path}): {out_free_gb:.0f} GB free, "
+                    f"need ~{output_gb:.1f} GB output"
                 )
+                if out_free_gb < output_gb * 1.1:
+                    self.logger.warning(
+                        f"  [warning] output drive may run out of space: need "
+                        f"~{output_gb:.0f} GB, {out_free_gb:.0f} GB free."
+                    )
+                try:
+                    scr_free_gb = _shutil.disk_usage(scratch_base).free / (1024**3)
+                    self.logger.info(
+                        f"Scratch drive ({scratch_base}): {scr_free_gb:.0f} GB free, "
+                        f"need ~{scratch_gb:.1f} GB (tile spill + fused memmap; "
+                        f"deleted at the end)"
+                    )
+                    if scratch_gb > 0 and scr_free_gb < scratch_gb * 1.1:
+                        self.logger.warning(
+                            f"  [warning] scratch drive may run out of space: need "
+                            f"~{scratch_gb:.0f} GB, {scr_free_gb:.0f} GB free. Point "
+                            f"the scratch dir at a larger fast drive."
+                        )
+                except OSError as e:
+                    self.logger.debug(f"Could not probe scratch drive: {e}")
+            else:
+                # Single drive: output + spill + fused memmap all together.
+                needed_gb = output_gb + scratch_gb
+                parts = [f"~{output_gb:.1f} GB output"]
+                if spill_gb > 0:
+                    parts.append(f"~{spill_gb:.1f} GB tile spill")
+                if fused_memmap_gb > 0:
+                    parts.append(f"~{fused_memmap_gb:.1f} GB fused memmap")
+                self.logger.info(
+                    f"Output drive ({output_path}): {out_free_gb:.0f} GB free, "
+                    f"need {' + '.join(parts)}"
+                )
+                if scratch_set and scratch_gb > 0:
+                    # Scratch requested but on the SAME drive as the output —
+                    # it won't relieve the I/O contention it's meant to fix.
+                    self.logger.warning(
+                        "  [warning] scratch dir is on the same drive as the "
+                        "output — no I/O benefit. Put it on a separate fast "
+                        "local disk (NVMe/SSD)."
+                    )
+                if out_free_gb < needed_gb * 1.1:
+                    self.logger.warning(
+                        f"  [warning] output drive may run out of space: "
+                        f"need ~{needed_gb:.0f} GB, {out_free_gb:.0f} GB free. "
+                        f"Free up space or point output to a larger drive."
+                    )
         except OSError as e:
             self.logger.debug(f"Could not probe output drive free space: {e}")
 
@@ -4492,24 +5232,52 @@ class StitchingPipeline:
             )
             spill_gb = (len(tiles) * tile_bytes / (1024**3)) if use_streaming else 0.0
             fused_memmap_gb = output_gb if use_streaming else 0.0
-            needed_gb = output_gb + spill_gb + fused_memmap_gb
+            scratch_gb = spill_gb + fused_memmap_gb  # under .stitch_tmp
+
+            scratch_base = _scratch_base_dir(self.config, output_path)
+            scratch_set = getattr(self.config, "scratch_dir", None) is not None
+            try:
+                scratch_base.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            # is not True: undeterminable + explicit scratch dir => assume separate
+            # so the scratch drive is guarded (see _log_preflight for rationale).
+            separate = (
+                scratch_set and _same_volume(scratch_base, output_path) is not True
+            )
+
             output_path.mkdir(parents=True, exist_ok=True)
-            free_gb = _shutil.disk_usage(output_path).free / (1024**3)
-            if free_gb > 0 and needed_gb > free_gb * disk_frac:
+            # Output drive: final output always; spill+fused too UNLESS scratch is
+            # on a separate drive.
+            out_need = output_gb + (0.0 if separate else scratch_gb)
+            out_free_gb = _shutil.disk_usage(output_path).free / (1024**3)
+            if out_free_gb > 0 and out_need > out_free_gb * disk_frac:
                 raise RuntimeError(
-                    f"Aborting before run: needs ~{needed_gb:.0f} GB on the output "
+                    f"Aborting before run: needs ~{out_need:.0f} GB on the output "
                     f"drive ({output_gb:.0f} GB output"
                     + (
                         f" + {spill_gb:.0f} GB spill + {fused_memmap_gb:.0f} GB "
                         f"fused memmap"
-                        if use_streaming
+                        if use_streaming and not separate
                         else ""
                     )
-                    + f") but only {free_gb:.0f} GB free (limit "
+                    + f") but only {out_free_gb:.0f} GB free (limit "
                     f"{disk_frac * 100:.0f}%). Remedies: point output to a larger "
                     f"drive, increase downsample, or fix the XY pixel size if the "
                     f"output looks far too large. Override with "
                     f"resource_guard_enabled=False."
                 )
+            # Separate scratch drive: guard it for the spill + fused memmap.
+            if separate and scratch_gb > 0:
+                scr_free_gb = _shutil.disk_usage(scratch_base).free / (1024**3)
+                if scr_free_gb > 0 and scratch_gb > scr_free_gb * disk_frac:
+                    raise RuntimeError(
+                        f"Aborting before run: scratch dir needs ~{scratch_gb:.0f} GB "
+                        f"({spill_gb:.0f} GB spill + {fused_memmap_gb:.0f} GB fused "
+                        f"memmap) on {scratch_base} but only {scr_free_gb:.0f} GB free "
+                        f"(limit {disk_frac * 100:.0f}%). Point the scratch dir at a "
+                        f"larger fast drive, increase downsample, or unset it. "
+                        f"Override with resource_guard_enabled=False."
+                    )
         except OSError as e:
             self.logger.debug(f"Disk guard probe failed (allowing run): {e}")

@@ -360,6 +360,12 @@ memory:
   # (in/out volumes + FFT scratch). Only added when deconvolution is enabled.
   deconv_working_factor: 4.0
 
+  # Runtime memory watchdog: WARN (never abort) if live private memory (USS)
+  # exceeds the projected peak by this factor. Surfaces an unmodeled allocation
+  # loud + attributable (which phase, how far over) instead of an opaque OOM.
+  # The GUI raises a non-blocking popup; the run continues.
+  watchdog_margin: 1.5
+
   # Dask chunk size for internal processing (tile loading, fusion).
   # These are NOT the output file chunk sizes — see zarr.chunks and
   # output.chunksize for those. These control the dask task graph

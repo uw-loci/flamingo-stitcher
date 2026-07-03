@@ -105,21 +105,37 @@ def write_pyramidal_ome_tiff(
 
     logger.info(f"Pyramid levels: {pyramid_levels} (plus full resolution)")
 
-    # Generate downsampled pyramid data
+    # Generate downsampled pyramid data.
     # OME-TIFF SubIFDs must have the same number of Z pages as full resolution,
-    # so we only downsample Y and X (not Z).
+    # so we only downsample Y and X (not Z). Each level is streamed to an
+    # on-disk memmap one Z-plane at a time — previously every level was
+    # materialised in RAM and held in a list (~0.33x the whole output), a
+    # latent OOM on TB-scale outputs even in streaming mode.
+    import shutil as _shutil
+
     pyramid_data = []
+    _pyr_tmp_dir = None
     if pyramid_levels > 0:
         if progress_callback:
             progress_callback(5, "Generating pyramid levels...")
 
+        _pyr_tmp_dir = output_path.parent / f".stitch_pyr_tmp_{output_path.stem}"
+        _pyr_tmp_dir.mkdir(parents=True, exist_ok=True)
         for level in range(pyramid_levels):
-            factor = 2 ** (level + 1)
-            downsampled = _downsample_yx(np_data, factor)
+            mm_path = _pyr_tmp_dir / f"level_{level + 1}.dat"
+            # Cascade: downsample the PREVIOUS level by 2x instead of re-reading
+            # the full-res volume and binning by 2^(level+1). Full-res is read
+            # from disk once (for level 1); each later level reads the prior
+            # level, which is 4x smaller — total pyramid-gen reads ~1.33x the
+            # output instead of N_levels x. Pyramid preview levels can differ by
+            # <=1 LSB from single-step binning (intermediate uint16 rounding);
+            # the full-resolution level 0 (the real data) is untouched.
+            src = np_data if level == 0 else pyramid_data[-1]
+            downsampled = _downsample_yx_to_memmap(src, 2, mm_path)
             pyramid_data.append(downsampled)
             logger.info(
                 f"  Pyramid level {level + 1}: {downsampled.shape} "
-                f"({factor}x YX downsample)"
+                f"({2 ** (level + 1)}x YX downsample, cascaded, spilled to disk)"
             )
 
     # Build OME-XML metadata
@@ -147,31 +163,47 @@ def write_pyramidal_ome_tiff(
     if progress_callback:
         progress_callback(10, "Writing full-resolution data...")
 
-    with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=True) as tif:
-        # Write full resolution with SubIFD slots for pyramid levels
-        tif.write(
-            np_data,
-            subifds=pyramid_levels if pyramid_levels > 0 else None,
-            metadata=metadata,
-            **write_options,
-        )
-
-        if progress_callback:
-            progress_callback(50, "Writing pyramid levels...")
-
-        # Write pyramid levels as SubIFDs
-        for i, level_data in enumerate(pyramid_data):
-            if progress_callback:
-                pct = 50 + int(40 * (i + 1) / len(pyramid_data))
-                progress_callback(
-                    pct, f"Writing pyramid level {i + 1}/{pyramid_levels}..."
-                )
-
+    try:
+        with tifffile.TiffWriter(str(output_path), bigtiff=True, ome=True) as tif:
+            # Write full resolution with SubIFD slots for pyramid levels
             tif.write(
-                level_data,
-                subfiletype=1,
+                np_data,
+                subifds=pyramid_levels if pyramid_levels > 0 else None,
+                metadata=metadata,
                 **write_options,
             )
+
+            if progress_callback:
+                progress_callback(50, "Writing pyramid levels...")
+
+            # Write pyramid levels as SubIFDs (streamed from on-disk memmaps)
+            for i, level_data in enumerate(pyramid_data):
+                if progress_callback:
+                    pct = 50 + int(40 * (i + 1) / len(pyramid_data))
+                    progress_callback(
+                        pct, f"Writing pyramid level {i + 1}/{pyramid_levels}..."
+                    )
+
+                tif.write(
+                    level_data,
+                    subfiletype=1,
+                    **write_options,
+                )
+    finally:
+        # Release the level memmaps and delete their backing files. Windows
+        # holds file locks until every np.memmap referencing them is gone, so
+        # force a collection before rmtree (matches the _run_streaming cleanup).
+        import gc as _gc
+
+        # `del pyramid_data` drops the list, but the `for i, level_data in …`
+        # loop variable still aliases the LAST level's memmap — leaving it mapped
+        # means rmtree silently fails on Windows and leaks the temp dir. Null it
+        # too (assign, not del: it's unbound when pyramid_levels == 0).
+        del pyramid_data
+        level_data = None
+        _gc.collect()
+        if _pyr_tmp_dir is not None:
+            _shutil.rmtree(_pyr_tmp_dir, ignore_errors=True)
 
     # Log output stats
     file_size = output_path.stat().st_size
@@ -365,6 +397,52 @@ def _downsample_yx_3d(volume: np.ndarray, factor: int) -> np.ndarray:
 
     reshaped = truncated.reshape(z, new_y, factor, new_x, factor)
     return reshaped.mean(axis=(2, 4)).astype(volume.dtype)
+
+
+def _downsample_yx_plane(plane: np.ndarray, factor: int) -> np.ndarray:
+    """Bin-shrink a single 2D (Y, X) plane by ``factor``. Same math as
+    ``_downsample_yx_3d`` applied per-Z-plane, so streaming a volume plane by
+    plane is bit-identical to downsampling it whole."""
+    y, x = plane.shape
+    y_trunc = (y // factor) * factor
+    x_trunc = (x // factor) * factor
+    trunc = plane[:y_trunc, :x_trunc]
+    new_y = y_trunc // factor
+    new_x = x_trunc // factor
+    return (
+        trunc.reshape(new_y, factor, new_x, factor)
+        .mean(axis=(1, 3))
+        .astype(plane.dtype)
+    )
+
+
+def _downsample_yx_to_memmap(volume: np.ndarray, factor: int, mm_path) -> np.ndarray:
+    """Downsample Y/X into an on-disk memmap, one Z-plane at a time.
+
+    Bounds peak RAM to ~one plane instead of a whole pyramid level — the fix
+    for the writer holding ~0.33x the output volume in RAM to build the pyramid.
+    Handles 3D (Z,Y,X) and 4D (C,Z,Y,X); Z (and C) are preserved. Returns the
+    memmap (caller owns deletion of ``mm_path``).
+    """
+    is_4d = volume.ndim == 4
+    if is_4d:
+        c, z, y, x = volume.shape
+    else:
+        z, y, x = volume.shape
+        c = 1
+    new_y = y // factor
+    new_x = x // factor
+    out_shape = (c, z, new_y, new_x) if is_4d else (z, new_y, new_x)
+    mm = np.memmap(str(mm_path), dtype=volume.dtype, mode="w+", shape=out_shape)
+    if is_4d:
+        for ci in range(c):
+            for zi in range(z):
+                mm[ci, zi] = _downsample_yx_plane(volume[ci, zi], factor)
+    else:
+        for zi in range(z):
+            mm[zi] = _downsample_yx_plane(volume[zi], factor)
+    mm.flush()
+    return mm
 
 
 def _downsample_bin_shrink(volume: np.ndarray, factor: int) -> np.ndarray:

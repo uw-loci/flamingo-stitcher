@@ -37,6 +37,13 @@ dependencies = [
     # stacks as float64 (e.g. 81 views × 64×1024×1024 = 40.5 GiB per block) —
     # a machine-killing OOM. 0.1.56 honours the 256px chunk we request.
     "multiview-stitcher>=0.1.56,<0.2",
+    # multiview-stitcher's registration (phase correlation + global optimization)
+    # imports pandas but declares it only as an OPTIONAL dependency, so a default
+    # install silently lacks it: registration then raises "Missing optional
+    # dependency 'pandas'" mid-run and falls back to stage-metadata positions —
+    # after already spending hours materializing tiles, and with degraded
+    # alignment. Declare it here so registration always works.
+    "pandas>=2.2,<3",
     # certifi gives urllib a CA bundle inside the frozen build (no system CA
     # store there), so the GUI updater's HTTPS calls to api.github.com verify.
     "certifi>=2023.7.22",

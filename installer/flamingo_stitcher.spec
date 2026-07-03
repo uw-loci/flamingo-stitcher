@@ -62,6 +62,13 @@ collect_pkgs = [
     # ImportError and breaks every stitch at Step 3. collect_all pulls in its
     # mpl-data (fonts/styles) too. We never plot — it's an import-time dep only.
     "matplotlib",
+    # multiview-stitcher's global optimization (param_resolution) imports pandas,
+    # but pandas is only imported inside the lazily-loaded registration path, so
+    # PyInstaller's static analysis misses it. Without collect_all, registration
+    # dies mid-run with "Missing optional dependency 'pandas'" and the stitch
+    # silently falls back to metadata-only positions. (Same class of bug as the
+    # matplotlib/wasmtime entries above.)
+    "pandas",
 ]
 # Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
 # itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.
