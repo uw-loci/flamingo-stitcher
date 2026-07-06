@@ -1144,7 +1144,22 @@ class StitchingDialog(PersistentDialog):
         self._log_text.setStyleSheet(
             "QTextEdit { font-family: monospace; font-size: 11px; }"
         )
-        log_layout.addWidget(self._log_text)
+
+        # A cheerful "working" indicator: marching flamingos animate to the
+        # right of the log, but only while a run is in progress. Purely
+        # cosmetic — degrades to just the log if the GIF/QMovie can't load.
+        self._flamingo_movie = None
+        self._flamingo_label = self._build_flamingo_indicator()
+        if self._flamingo_label is None:
+            log_layout.addWidget(self._log_text)
+        else:
+            log_body_row = QHBoxLayout()
+            log_body_row.setContentsMargins(0, 0, 0, 0)
+            log_body_row.addWidget(self._log_text, 1)
+            log_body_row.addWidget(
+                self._flamingo_label, 0, Qt.AlignTop | Qt.AlignHCenter
+            )
+            log_layout.addLayout(log_body_row)
         self._log_group.setLayout(log_layout)
         self._log_group.setVisible(False)  # collapsed initially
         layout.addWidget(self._log_group)
@@ -2355,6 +2370,7 @@ class StitchingDialog(PersistentDialog):
 
         # Store batch state
         self._batch_running = True
+        self._set_flamingos_marching(True)
         self._batch_config = config
         self._batch_channels = self._parse_channels()
         self._batch_results = []
@@ -2639,6 +2655,47 @@ class StitchingDialog(PersistentDialog):
                 item, output_dir, elapsed + self._MEM_WAIT_POLL_S
             ),
         )
+
+    # ---- "Working" flamingo animation (cosmetic) -------------------------
+    def _build_flamingo_indicator(self):
+        """A small looping 'marching flamingos' QMovie for the log's right
+        edge, shown only while a run is active. Returns the QLabel, or None if
+        the movie can't be created (missing file / no gif image plugin) — this
+        is optional chrome and must never block a stitch."""
+        try:
+            from PyQt5.QtCore import QSize
+            from PyQt5.QtGui import QMovie
+
+            gif = Path(__file__).parent / "working_flamingos.gif"
+            if not gif.exists():
+                return None
+            movie = QMovie(str(gif))
+            if not movie.isValid():
+                return None
+            movie.setCacheMode(QMovie.CacheAll)
+            movie.setScaledSize(QSize(120, 120))
+            label = QLabel()
+            label.setMovie(movie)
+            label.setFixedSize(120, 120)
+            label.setToolTip("Stitching in progress…")
+            label.setVisible(False)  # revealed only while processing
+            self._flamingo_movie = movie
+            return label
+        except Exception:
+            return None
+
+    def _set_flamingos_marching(self, marching: bool) -> None:
+        """Start/stop + show/hide the 'working' flamingo animation."""
+        label = getattr(self, "_flamingo_label", None)
+        movie = getattr(self, "_flamingo_movie", None)
+        if label is None or movie is None:
+            return
+        if marching:
+            label.setVisible(True)
+            movie.start()
+        else:
+            movie.stop()
+            label.setVisible(False)
 
     def _start_item_worker(self, item, output_dir):
         """Launch the stitching worker for *item* (memory gate already passed)."""
@@ -3096,6 +3153,7 @@ class StitchingDialog(PersistentDialog):
                 )
 
         self._batch_running = False
+        self._set_flamingos_marching(False)
         self._queue_index = -1
         self._batch_config = None
         self._batch_channels = None
