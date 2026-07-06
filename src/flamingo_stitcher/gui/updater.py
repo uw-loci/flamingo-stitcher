@@ -297,7 +297,10 @@ class UpdatePanel(QWidget):
         layout.addWidget(self.chk_auto)
 
         layout.addSpacing(14)
-        links_title = QLabel("Help &amp; links")
+        # Plain text with a literal "&" — this QLabel has no HTML tags, so it
+        # was rendered as plain text and showed the raw "&amp;" entity.
+        links_title = QLabel("Help & links")
+        links_title.setTextFormat(Qt.PlainText)
         lf = QFont(links_title.font())
         lf.setPointSize(lf.pointSize() + 2)
         lf.setBold(True)
@@ -305,8 +308,28 @@ class UpdatePanel(QWidget):
         layout.addWidget(links_title)
 
         repo = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+
+        # Per-launch run logs live under <config dir>/logs (see gui.app
+        # ._setup_logging). Surface the folder here so a crash can be reported
+        # with the newest log — the GUI text panel is RAM-only and lost on crash.
+        logs_line = ""
+        try:
+            from flamingo_stitcher.gui.app import _user_config_dir
+
+            _logs_dir = _user_config_dir() / "logs"
+            logs_line = (
+                f"&bull; <a href='{_logs_dir.as_uri()}' style='color:{_C_ACCENT};'>"
+                f"Open the run-log folder</a> "
+                f"<span style='color:{_C_MUTED};'>(one timestamped log per launch, "
+                f"newest 20 kept — attach the newest when reporting a crash)"
+                f"<br>{_logs_dir}</span><br>"
+            )
+        except Exception:
+            pass
+
         links = QLabel(
-            f"&bull; <a href='{repo}#readme' style='color:{_C_ACCENT};'>README &amp; usage guide</a><br>"
+            logs_line
+            + f"&bull; <a href='{repo}#readme' style='color:{_C_ACCENT};'>README &amp; usage guide</a><br>"
             f"&bull; <a href='{repo}/blob/main/src/flamingo_stitcher/docs/"
             f"stitching_hardware_troubleshooting.md' style='color:{_C_ACCENT};'>"
             f"Hardware &amp; troubleshooting guide</a><br>"
