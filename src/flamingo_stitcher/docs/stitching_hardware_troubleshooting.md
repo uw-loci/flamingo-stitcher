@@ -137,6 +137,45 @@ dask / numpy:
 If you hit a new one on a recent branch, grab the full traceback — the
 line number pins which copy is the culprit.
 
+### Symptom: Run finishes the fuse, then aborts at "Writing pyramidal OME-TIFF" with `Unable to allocate ~N GiB ... float64`
+
+The whole streaming pipeline succeeded — the fused volume is already on
+disk as `fused.dat`. Only the **pyramid builder** OOM'd, because it
+materialised a whole downsample level in RAM as float64 (`.mean()` before
+`.astype`). The tell is the error shape: **half the fused Y/X, dtype
+float64**, e.g. `(1662, 7424, 5120)` for a `(1662, 14849, 10241)` fuse =
+471 GiB. This is *not* a full-resolution limit.
+
+Fixed in **v0.5.0** (`75aa9de`): `_downsample_yx_to_memmap` spills each
+pyramid level to disk one Z-plane at a time. Check the version banner at
+the top of the log; if it predates 0.5.0, update. Immediate workaround at
+the same resolution: switch **Output format -> OME-Zarr (sharded)**, which
+writes the pyramid chunk-by-chunk and never holds a level in RAM.
+
+Related, same run: `Registration failed: Missing optional dependency
+'pandas' ... Falling back to metadata positions only` means the tiles
+were **not** registered (raw stage positions used). v0.5.0 makes pandas a
+hard dependency (`pyproject.toml`), so the silent fallback can't happen.
+
+### When you hit an OOM: what to change (keeps the chosen resolution)
+
+On a memory failure the tool now prints step-aware advice in the log
+(and the memory-watchdog popup mirrors the top of it), keyed to the step
+that ran out and to the settings actually in force — it never suggests a
+lever already engaged (e.g. "switch to Streaming" while already
+streaming). The reference table:
+
+| Step that OOM'd | Levers (all keep full resolution, most-effective first) |
+|---|---|
+| **Write** | OME-TIFF/Imaris -> **OME-Zarr (sharded)** (streams pyramid); update to v0.5.0+; fewer pyramid levels |
+| **Fuse / preprocess** | Lower preprocess/fuse workers to 1-2 (workers x tile = the streaming working set); turn off content-based blending; disable per-tile float buffers (deconvolution, depth attenuation, non-fast destripe, flat-field); Leonardo illum-fusion -> Max/Mean; scratch dir on a fast, roomy disk |
+| **Register** | Tick "Skip registration (use stage positions)" if positions are good; ensure pandas is installed |
+| **Any, in-memory mode** | Switch Memory mode -> Streaming — the single biggest lever |
+| **Last resort (any)** | Raise XY or Z downsample one step — *the only lever that lowers resolution* |
+
+Logic lives in `oom_advice.py` (pure, unit-tested); the GUI failure
+handler and the watchdog popup both call it.
+
 ### Symptom: Stitching crashes before it starts with `SyntaxError` mentioning `\u00b5` or a backslash in f-string
 
 Python ≤3.11 can't parse backslash escapes inside f-string expressions.
