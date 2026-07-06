@@ -19,4 +19,4 @@ fails fast on a mismatch, so an installer can never ship reporting the wrong
 installed version to its own updater.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
