@@ -416,7 +416,7 @@ class StitchingDialog(PersistentDialog):
         # --- Settings, split into three plainly-named groups so a new user
         # isn't met with one dense wall of controls. Advanced toggles stay in
         # the collapsible "Processing Options" panel below. The three boxes
-        # live in a container assigned to self._settings_group, so the single
+        # live in a container assigned to self._config_container, so the single
         # setEnabled() that locks settings during a run still disables them all.
         settings_container = QWidget()
         settings_vbox = QVBoxLayout(settings_container)
@@ -846,8 +846,10 @@ class StitchingDialog(PersistentDialog):
         settings_vbox.addWidget(info_group)
 
         # The group boxes share one container so the existing
-        # self._settings_group.setEnabled(False) during a run disables them all.
-        self._settings_group = settings_container
+        # self._config_container.setEnabled(False) during a run disables them
+        # all. NOTE: keep this distinct from the class attr _settings_group,
+        # which is the QSettings group-name string used by _save/_restore.
+        self._config_container = settings_container
         content_layout.addWidget(settings_container)
 
         # --- Collapsible processing options ---
@@ -1792,7 +1794,7 @@ class StitchingDialog(PersistentDialog):
         LEFT enabled — it's read live in ``_append_log`` and is meant to be
         flipped while a run streams output.
         """
-        self._settings_group.setEnabled(enabled)
+        self._config_container.setEnabled(enabled)
         self._output_dir_edit.setEnabled(enabled)
         self._proc_toggle.setEnabled(enabled)
         self._proc_widget.setEnabled(enabled)
