@@ -96,7 +96,6 @@ datas += collect_data_files(
 # preprocessing_env can stage it into the pixi env and run it by path.
 datas += [
     (os.path.join(ROOT, "src/flamingo_stitcher/gui/flamingo_icon.png"), "flamingo_stitcher/gui"),
-    (os.path.join(ROOT, "src/flamingo_stitcher/gui/working_flamingos.gif"), "flamingo_stitcher/gui"),
     (os.path.join(ROOT, "src/flamingo_stitcher/isolated_worker.py"), "flamingo_stitcher"),
     (os.path.join(ROOT, "scripts/create_preprocessing_env.bat"), "scripts"),
     (os.path.join(ROOT, "scripts/create_preprocessing_env.sh"), "scripts"),

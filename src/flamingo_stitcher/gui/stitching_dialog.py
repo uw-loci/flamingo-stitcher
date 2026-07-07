@@ -269,11 +269,6 @@ class StitchingDialog(PersistentDialog):
     # Subfolder-per-tile layout: grandparent (2 levels up).
     _acq_dir_restore_levels_up = 2
 
-    # QSettings group for this dialog's persisted state. Overridable so sibling
-    # tabs (Single Workflow, Multi-View) keep independent settings and don't
-    # clobber each other's queue/options.
-    _settings_group = _SETTINGS_GROUP
-
     def __init__(self, parent=None, **kwargs):
         # **kwargs forwards PersistentDialog options (geometry_manager,
         # window_id) so the host app can inject its own geometry manager when
@@ -296,8 +291,6 @@ class StitchingDialog(PersistentDialog):
         self._batch_config = None
         self._batch_channels = None
         self._batch_results = []  # List of (path, success, error_msg)
-        # Last classified pipeline step; drives step-aware OOM advice on failure.
-        self._current_step_key = None
 
         self.setWindowTitle("Tile Stitching")
         # Keep the width comfortable for the settings row, but allow a short
@@ -334,10 +327,6 @@ class StitchingDialog(PersistentDialog):
         content_layout.setSpacing(10)
         _scroll.setWidget(_content)
         layout.addWidget(_scroll, 1)
-
-        # Subclass hook: inject extra controls at the top of the scroll area
-        # (e.g. the Multi-View tab's rotation controls + warning banner).
-        self._add_dialog_extras(content_layout)
 
         # --- Batch queue ---
         queue_group = QGroupBox("Acquisition Queue")
@@ -416,7 +405,7 @@ class StitchingDialog(PersistentDialog):
         # --- Settings, split into three plainly-named groups so a new user
         # isn't met with one dense wall of controls. Advanced toggles stay in
         # the collapsible "Processing Options" panel below. The three boxes
-        # live in a container assigned to self._config_container, so the single
+        # live in a container assigned to self._settings_group, so the single
         # setEnabled() that locks settings during a run still disables them all.
         settings_container = QWidget()
         settings_vbox = QVBoxLayout(settings_container)
@@ -846,10 +835,8 @@ class StitchingDialog(PersistentDialog):
         settings_vbox.addWidget(info_group)
 
         # The group boxes share one container so the existing
-        # self._config_container.setEnabled(False) during a run disables them
-        # all. NOTE: keep this distinct from the class attr _settings_group,
-        # which is the QSettings group-name string used by _save/_restore.
-        self._config_container = settings_container
+        # self._settings_group.setEnabled(False) during a run disables them all.
+        self._settings_group = settings_container
         content_layout.addWidget(settings_container)
 
         # --- Collapsible processing options ---
@@ -1120,8 +1107,6 @@ class StitchingDialog(PersistentDialog):
         self._log_group = QGroupBox()
         log_layout = QVBoxLayout()
         log_layout.setContentsMargins(0, 0, 0, 0)
-        log_opts_row = QHBoxLayout()
-        log_opts_row.setContentsMargins(0, 0, 0, 0)
         self._verbose_log_cb = QCheckBox("Verbose log (include Python output)")
         self._verbose_log_cb.setToolTip(
             "Include behind-the-scenes Python output (flat-field, Imaris/Zarr\n"
@@ -1129,39 +1114,14 @@ class StitchingDialog(PersistentDialog):
             "for a concise run log; turn on to troubleshoot a failed/odd run.\n"
             "Takes effect on the next run."
         )
-        log_opts_row.addWidget(self._verbose_log_cb)
-        self._timestamp_log_cb = QCheckBox("Timestamps")
-        self._timestamp_log_cb.setToolTip(
-            "Prefix each new log line with a compact date + time to the minute\n"
-            "(MM-DD HH:MM), so you can see when a line was printed — handy on\n"
-            "long runs where progress lines repeat with only the ETA changing.\n"
-            "Applies to lines printed from now on; takes effect immediately."
-        )
-        log_opts_row.addWidget(self._timestamp_log_cb)
-        log_opts_row.addStretch()
-        log_layout.addLayout(log_opts_row)
+        log_layout.addWidget(self._verbose_log_cb)
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
         self._log_text.setMinimumHeight(120)
         self._log_text.setStyleSheet(
             "QTextEdit { font-family: monospace; font-size: 11px; }"
         )
-
-        # A cheerful "working" indicator: marching flamingos animate to the
-        # right of the log, but only while a run is in progress. Purely
-        # cosmetic — degrades to just the log if the GIF/QMovie can't load.
-        self._flamingo_movie = None
-        self._flamingo_label = self._build_flamingo_indicator()
-        if self._flamingo_label is None:
-            log_layout.addWidget(self._log_text)
-        else:
-            log_body_row = QHBoxLayout()
-            log_body_row.setContentsMargins(0, 0, 0, 0)
-            log_body_row.addWidget(self._log_text, 1)
-            log_body_row.addWidget(
-                self._flamingo_label, 0, Qt.AlignTop | Qt.AlignHCenter
-            )
-            log_layout.addLayout(log_body_row)
+        log_layout.addWidget(self._log_text)
         self._log_group.setLayout(log_layout)
         self._log_group.setVisible(False)  # collapsed initially
         layout.addWidget(self._log_group)
@@ -1787,19 +1747,12 @@ class StitchingDialog(PersistentDialog):
         Covers the settings grid, output dir, processing-options panel (and its
         toggle), and the background-zeroing panel so none can be changed while a
         stitch is in progress.
-
-        Verbose log is locked too: it's a run input snapshotted at start
-        (passed to the worker), so toggling it mid-run can't affect the current
-        run and would only mislead. The Timestamps checkbox is deliberately
-        LEFT enabled — it's read live in ``_append_log`` and is meant to be
-        flipped while a run streams output.
         """
-        self._config_container.setEnabled(enabled)
+        self._settings_group.setEnabled(enabled)
         self._output_dir_edit.setEnabled(enabled)
         self._proc_toggle.setEnabled(enabled)
         self._proc_widget.setEnabled(enabled)
         self._bg_zero_panel.setEnabled(enabled)
-        self._verbose_log_cb.setEnabled(enabled)
 
     def _on_proc_toggle(self, checked: bool):
         """Show/hide the processing options panel and resize the dialog.
@@ -2167,11 +2120,6 @@ class StitchingDialog(PersistentDialog):
 
     # --- Run / Cancel ---
 
-    def _add_dialog_extras(self, content_layout) -> None:
-        """Hook for subclasses to inject extra controls at the top of the scroll
-        area. No-op in the base dialog."""
-        return
-
     def _build_config(self):
         """Build a StitchingConfig from YAML defaults + current UI settings."""
         from flamingo_stitcher.pipeline import StitchingConfig
@@ -2372,7 +2320,6 @@ class StitchingDialog(PersistentDialog):
 
         # Store batch state
         self._batch_running = True
-        self._set_flamingos_marching(True)
         self._batch_config = config
         self._batch_channels = self._parse_channels()
         self._batch_results = []
@@ -2414,7 +2361,6 @@ class StitchingDialog(PersistentDialog):
 
         ram_warnings = []  # per-item lines
         disk_warnings = []
-        any_in_memory = False  # any RAM-warned item running in in-memory mode
         for item in pending:
             tiles = item.get("tiles")
             if not tiles:
@@ -2452,8 +2398,6 @@ class StitchingDialog(PersistentDialog):
                     f"peak ~{peak_gb:.0f} GB{fmt_note} "
                     f"(available RAM {avail_ram_gb:.0f} GB)"
                 )
-                if not use_streaming:
-                    any_in_memory = True
 
             if out_free_gb is not None:
                 # Streaming mode holds three things on disk: per-channel
@@ -2495,23 +2439,10 @@ class StitchingDialog(PersistentDialog):
         if ram_warnings:
             lines.append("\nMemory is tight for:")
             lines.extend(ram_warnings)
-            if any_in_memory:
-                # In-memory mode is the biggest lever and isn't in force yet.
-                lines.append(
-                    "\nIf the write hits swap it will slow to a crawl or be "
-                    "killed by the OS. Switch Memory mode to Streaming (keeps "
-                    "full resolution) or raise the downsample factor."
-                )
-            else:
-                # Already streaming — don't suggest it. Point at the levers
-                # that reduce the streaming working set instead.
-                lines.append(
-                    "\nAlready in Streaming mode. To lower the peak at full "
-                    "resolution: reduce preprocess/fuse workers, turn off "
-                    "content-based blending / deconvolution / depth "
-                    "attenuation if enabled, or switch OME-TIFF/Imaris output "
-                    "to OME-Zarr. Last resort: raise the downsample factor."
-                )
+            lines.append(
+                "\nIf the write hits swap it will slow to a crawl or be killed "
+                "by the OS. Consider Streaming mode or a higher downsample."
+            )
         if disk_warnings:
             lines.append("\nDisk space is tight for:")
             lines.extend(disk_warnings)
@@ -2584,110 +2515,7 @@ class StitchingDialog(PersistentDialog):
         item["status"] = "stitching"
         self._update_queue_table()
 
-        # Give RAM a chance to recover before launching, so a transient dip
-        # left by the previous item doesn't trip the pipeline's resource guard
-        # into a false abort. gc already ran in _on_item_finished; this
-        # (non-blocking) gate additionally waits out slower OS-level
-        # reclamation. Instant/no-op for the first item and whenever RAM is
-        # already ample.
-        self._launch_item_when_memory_ready(item, output_dir)
-
-    # ---- Between-item memory-recovery gate -------------------------------
-    _MEM_WAIT_TIMEOUT_S = 120.0  # stop waiting and proceed after this long
-    _MEM_WAIT_POLL_S = 5.0  # re-check cadence while waiting
-
-    def _memory_gate_gb(self, item):
-        """(need_gb, avail_gb) for *item*, or (None, None) if unknowable.
-
-        ``need`` is the projected peak of the mode the pipeline would auto-pick
-        (streaming vs in-memory), matching how the resource guard decides.
-        """
-        try:
-            import psutil
-
-            from flamingo_stitcher.pipeline import estimate_memory_usage
-
-            all_ch = sorted({ch for t in item["tiles"] for ch in t.channels})
-            process_ch = self._batch_channels or all_ch
-            est = estimate_memory_usage(item["tiles"], process_ch, self._batch_config)
-            need = (
-                est["streaming_gb"]
-                if est.get("auto_streaming")
-                else est["in_memory_gb"]
-            )
-            avail = psutil.virtual_memory().available / (1024**3)
-            return float(need), float(avail)
-        except Exception:
-            return None, None
-
-    def _launch_item_when_memory_ready(self, item, output_dir, elapsed=0.0):
-        # The batch may have been cancelled while this timer was pending.
-        if not self._batch_running or item.get("status") != "stitching":
-            return
-        need_gb, avail_gb = self._memory_gate_gb(item)
-        ready = (
-            need_gb is None
-            or avail_gb is None
-            or avail_gb >= need_gb
-            or elapsed >= self._MEM_WAIT_TIMEOUT_S
-        )
-        if ready:
-            if need_gb is not None and avail_gb is not None and avail_gb < need_gb:
-                self._log(
-                    f"  Proceeding after {int(elapsed)}s — RAM still low "
-                    f"({avail_gb:.0f} GB free vs ~{need_gb:.0f} GB projected); "
-                    f"the resource guard will make the final call."
-                )
-            self._start_item_worker(item, output_dir)
-            return
-        self._log(
-            f"  Waiting for memory to recover before this item: "
-            f"{avail_gb:.0f} GB free, ~{need_gb:.0f} GB projected "
-            f"(re-checking every {int(self._MEM_WAIT_POLL_S)}s, up to "
-            f"{int(self._MEM_WAIT_TIMEOUT_S)}s)…"
-        )
-        import gc
-
-        gc.collect()
-        from PyQt5.QtCore import QTimer
-
-        QTimer.singleShot(
-            int(self._MEM_WAIT_POLL_S * 1000),
-            lambda: self._launch_item_when_memory_ready(
-                item, output_dir, elapsed + self._MEM_WAIT_POLL_S
-            ),
-        )
-
-    # ---- "Working" flamingo animation (cosmetic) -------------------------
-    def _build_flamingo_indicator(self):
-        """DISABLED in v0.5.3.
-
-        The animated QMovie (added in v0.5.1/v0.5.2) hard-crashed the frozen
-        Windows build inside Qt5Core.dll (Windows exception 0xc0000409) the
-        instant a run started — killing live stitches with no Python
-        traceback. The animation is purely cosmetic, so it stays off until
-        the crash is understood and a thread-safe indicator is proven out
-        (e.g. a static pixmap, or QMovie verified under concurrent worker
-        signal traffic). Returning None means the log renders without a GIF
-        and _set_flamingos_marching() no-ops (label/movie stay None).
-        """
-        return None
-
-    def _set_flamingos_marching(self, marching: bool) -> None:
-        """Start/stop + show/hide the 'working' flamingo animation."""
-        label = getattr(self, "_flamingo_label", None)
-        movie = getattr(self, "_flamingo_movie", None)
-        if label is None or movie is None:
-            return
-        if marching:
-            label.setVisible(True)
-            movie.start()
-        else:
-            movie.stop()
-            label.setVisible(False)
-
-    def _start_item_worker(self, item, output_dir):
-        """Launch the stitching worker for *item* (memory gate already passed)."""
+        # Start worker
         from flamingo_stitcher.worker import StitchingWorker
 
         self._worker = StitchingWorker(
@@ -2724,20 +2552,6 @@ class StitchingDialog(PersistentDialog):
                 item["status"] = "cancelled"
         self._update_queue_table()
 
-        # Cancel arriving *between* items — i.e. during the memory-recovery
-        # wait, when no worker is live: no worker-finished callback will come
-        # to advance/complete the queue, so finalise the batch here. (When a
-        # worker IS running the normal cancel→finish→advance path handles it.)
-        if self._worker is None and getattr(self, "_batch_running", False):
-            if 0 <= self._queue_index < len(self._queue):
-                cur = self._queue[self._queue_index]
-                if cur["status"] in ("stitching", "discovering"):
-                    cur["status"] = "cancelled"
-                    self._batch_results.append((cur["path"], False, "Cancelled"))
-            self._update_queue_table()
-            self._on_batch_complete()
-            return
-
         from flamingo_stitcher.gui._compat import get_notification_service
 
         svc = get_notification_service(self)
@@ -2763,7 +2577,6 @@ class StitchingDialog(PersistentDialog):
         for key, _ in self._step_order:
             self._set_step_state(key, "todo")
         self._status_label.setText("Ready")
-        self._current_step_key = None
 
     def _set_step_state(self, key: str, state: str):
         """Set the colour of a step pill to TODO / RUNNING / DONE /
@@ -2826,16 +2639,13 @@ class StitchingDialog(PersistentDialog):
         if self._batch_running and len(self._queue) > 1:
             n_total = sum(1 for it in self._queue if it["status"] != "cancelled")
             n_done = sum(1 for it in self._queue if it["status"] in ("done", "error"))
-            status = f"[{n_done + 1}/{n_total}] {status}"
-        self._status_label.setText(self._colorize_status(status))
+            self._status_label.setText(f"[{n_done + 1}/{n_total}] {status}")
+        else:
+            self._status_label.setText(status)
 
         key = self._classify_step(status)
         if key is None:
             return
-
-        # Remember the last classified step so a failure handler can give
-        # step-aware OOM advice (see _on_item_error).
-        self._current_step_key = key
 
         # Skip-registration special case: the status says "Skipping
         # registration..." which we want to render as skipped (grey),
@@ -2868,69 +2678,11 @@ class StitchingDialog(PersistentDialog):
                 if "#1976D2" not in existing:
                     self._set_step_state(k, "todo")
 
-    def _colorize_status(self, status: str) -> str:
-        """Render the status line as rich text so the per-step ETA and the
-        whole-run ETA are told apart at a glance.
-
-        Both segments read ``"... remaining (Done at ~...)"``, so with no cue
-        the two "Done at" times are easy to confuse. The pipeline now labels
-        them ``"this step:"`` and ``"overall:"`` in plain text; here we also
-        colour them — blue for the current step (matches the in-progress pill),
-        orange for the whole run. Non-ETA messages are returned unchanged.
-        """
-        from html import escape
-
-        from flamingo_stitcher.pipeline import OVERALL_ETA_SEP
-
-        STEP_COLOR = "#1976D2"  # blue — matches the in-progress step pill
-        OVERALL_COLOR = "#E65100"  # orange — distinct from the step colour
-
-        head, sep, overall = status.partition(OVERALL_ETA_SEP)
-        marker = "this step:"
-        i = head.find(marker)
-        if i == -1 and not sep:
-            return status  # plain message (no ETA tails) — leave as-is
-
-        if i != -1:
-            head_html = (
-                escape(head[:i])
-                + f'<span style="color:{STEP_COLOR};">{escape(head[i:])}</span>'
-            )
-        else:
-            head_html = escape(head)
-
-        if sep:
-            return (
-                head_html
-                + escape(sep)
-                + f'<span style="color:{OVERALL_COLOR}; font-weight:600;">'
-                + escape(overall)
-                + "</span>"
-            )
-        return head_html
-
-    def _append_log(self, message: str):
-        """Append one line to the log, optionally timestamped, and autoscroll.
-
-        Single choke point for both worker log lines and the dialog's own
-        messages so the "Timestamps" toggle applies uniformly. The stamp is
-        compact (``MM-DD HH:MM``, to the minute) and prepended per line so a
-        multi-line message stays aligned.
-        """
-        if getattr(self, "_timestamp_log_cb", None) is not None and (
-            self._timestamp_log_cb.isChecked()
-        ):
-            from datetime import datetime
-
-            stamp = datetime.now().strftime("%m-%d %H:%M")
-            message = "\n".join(f"[{stamp}] {ln}" for ln in message.split("\n"))
+    def _on_log_message(self, message: str):
+        """Handle log messages from worker."""
         self._log_text.append(message)
         scrollbar = self._log_text.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
-
-    def _on_log_message(self, message: str):
-        """Handle log messages from worker."""
-        self._append_log(message)
 
     def _on_item_completed(self, output_path: str):
         """Handle successful completion of one queue item."""
@@ -2968,61 +2720,6 @@ class StitchingDialog(PersistentDialog):
             self._batch_results.append((item["path"], False, error_msg))
             self._update_queue_table()
         self._log(f"\n\u2717 Error: {error_msg}")
-        self._maybe_log_oom_advice(error_msg)
-
-    def _maybe_log_oom_advice(self, error_msg: str):
-        """If the failure was an out-of-memory error, log step-aware advice.
-
-        Most software's only answer to an OOM is "use less data". The pipeline
-        has several levers that keep the chosen resolution \u2014 which one to reach
-        for depends on the step that failed. We surface those, most-effective
-        first, so the user can retry at full resolution instead of downsampling.
-        """
-        try:
-            from flamingo_stitcher.oom_advice import (
-                format_oom_advice,
-                is_memory_error,
-            )
-
-            if not is_memory_error(error_msg):
-                return
-            self._log("\n" + format_oom_advice(
-                self._current_step_key,
-                self._oom_settings_snapshot(),
-                use_streaming=self._resolved_streaming_mode(),
-            ))
-        except Exception as e:  # advice must never mask the real error
-            self._logger.debug(f"OOM advice unavailable: {e}")
-
-    def _oom_settings_snapshot(self) -> dict:
-        """Collect the memory-relevant config flags for OOM advice."""
-        cfg = self._batch_config
-        if cfg is None:
-            return {}
-        keys = (
-            "output_format",
-            "content_based_fusion",
-            "deconvolution_enabled",
-            "depth_attenuation",
-            "destripe",
-            "destripe_fast",
-            "flat_field_correction",
-            "illumination_fusion",
-            "preprocess_workers",
-            "fuse_workers",
-            "skip_registration",
-        )
-        return {k: getattr(cfg, k, None) for k in keys}
-
-    def _resolved_streaming_mode(self):
-        """The memory mode actually in force (True=streaming, False=in-memory,
-        None=unknown). ``streaming_mode`` is a tri-state on the config
-        (None=auto); we can only report a definite in-memory when it was
-        explicitly forced off."""
-        cfg = self._batch_config
-        if cfg is None:
-            return None
-        return getattr(cfg, "streaming_mode", None)
 
     def _on_memory_warning(self, info: dict):
         """Show a non-blocking popup when the memory watchdog trips.
@@ -3041,42 +2738,6 @@ class StitchingDialog(PersistentDialog):
             f"during '{phase}' [{mode}]."
         )
         self._log(line)
-
-        # Build step/mode-aware advice so we never suggest something already
-        # in force (e.g. "switch to Streaming" while the run IS streaming).
-        # ``phase`` uses the same step keys as oom_advice; ``mode`` is the
-        # authoritative resolved memory mode.
-        tips = []
-        try:
-            from flamingo_stitcher.oom_advice import oom_advice
-
-            step_key = phase if phase in (
-                "discover", "register", "preprocess", "fuse", "write", "metadata"
-            ) else None
-            tips = oom_advice(
-                step_key,
-                self._oom_settings_snapshot(),
-                use_streaming=(mode == "streaming"),
-            )
-        except Exception as e:  # advice must never break the warning popup
-            self._logger.debug(f"watchdog advice unavailable: {e}")
-
-        if tips:
-            self._log(
-                "If it runs out of memory, these keep the chosen resolution "
-                "(most effective first):"
-            )
-            for i, t in enumerate(tips, 1):
-                self._log(f"  {i}. {t}")
-            # Popup stays terse: the top two levers; the log has the full list.
-            advice_block = "\n".join(f"• {t}" for t in tips[:2])
-        else:
-            advice_block = (
-                "The run is continuing. If it runs out of memory, cancel and "
-                "reduce the per-tile memory (fewer workers / lighter processing) "
-                "or raise the downsample factor."
-            )
-
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("High memory use")
@@ -3084,8 +2745,8 @@ class StitchingDialog(PersistentDialog):
             f"Stitching is using more memory than projected.\n\n"
             f"Live: ~{used} GB   Projected: ~{proj} GB\n"
             f"Phase: {phase}    Mode: {mode}\n\n"
-            f"The run is continuing. If it runs out of memory, try (full list "
-            f"in the log):\n\n{advice_block}"
+            f"The run is continuing. If it runs out of memory, cancel and "
+            f"re-run with Streaming mode and/or a higher downsample factor."
         )
         box.setStandardButtons(QMessageBox.Ok)
         box.setModal(False)  # non-blocking — don't freeze the run/UI
@@ -3142,7 +2803,6 @@ class StitchingDialog(PersistentDialog):
                 )
 
         self._batch_running = False
-        self._set_flamingos_marching(False)
         self._queue_index = -1
         self._batch_config = None
         self._batch_channels = None
@@ -3344,7 +3004,7 @@ class StitchingDialog(PersistentDialog):
 
     def _log(self, message: str):
         """Append a message to the log area."""
-        self._append_log(message)
+        self._log_text.append(message)
 
     # --- Preprocessing environment ---
 
@@ -3777,7 +3437,7 @@ class StitchingDialog(PersistentDialog):
     def _save_settings(self):
         """Save dialog settings to QSettings."""
         s = QSettings()
-        s.beginGroup(self._settings_group)
+        s.beginGroup(_SETTINGS_GROUP)
         # Save queue paths (only pending/done items, not transient states)
         paths = [str(item["path"]) for item in self._queue]
         s.setValue("queue_paths", paths)
@@ -3791,7 +3451,6 @@ class StitchingDialog(PersistentDialog):
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
-        s.setValue("timestamp_log", self._timestamp_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -3821,7 +3480,7 @@ class StitchingDialog(PersistentDialog):
     def _restore_settings(self):
         """Restore dialog settings from QSettings."""
         s = QSettings()
-        s.beginGroup(self._settings_group)
+        s.beginGroup(_SETTINGS_GROUP)
 
         # Restore queue paths
         paths = s.value("queue_paths", [], type=list)
@@ -3901,7 +3560,6 @@ class StitchingDialog(PersistentDialog):
             self._frame_size_combo.setCurrentIndex(frame_idx)
 
         self._verbose_log_cb.setChecked(s.value("verbose_log", False, type=bool))
-        self._timestamp_log_cb.setChecked(s.value("timestamp_log", False, type=bool))
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)
@@ -4054,7 +3712,6 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
-        s.setValue("timestamp_log", self._timestamp_log_cb.isChecked())
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
@@ -4164,7 +3821,6 @@ class NativeStitchingDialog(StitchingDialog):
             self._frame_size_combo.setCurrentIndex(frame_idx)
 
         self._verbose_log_cb.setChecked(s.value("verbose_log", False, type=bool))
-        self._timestamp_log_cb.setChecked(s.value("timestamp_log", False, type=bool))
 
         flat_field = s.value("flat_field", False, type=bool)
         self._flat_field_cb.setChecked(flat_field)
@@ -4243,134 +3899,3 @@ class NativeStitchingDialog(StitchingDialog):
         # (e.g. Destripe True but pystripe not installed on this box). Re-run
         # the availability gate so unavailable options end up unchecked+disabled.
         self._update_preprocessing_availability()
-
-
-_MULTIVIEW_SETTINGS_GROUP = "MultiViewStitchingDialog"
-
-
-class MultiViewStitchingDialog(StitchingDialog):
-    """Stitching for multi-angle (rotation) acquisitions.
-
-    A separate tab so multi-view fusion stays out of the normal single-angle
-    flow. Same folder-per-tile discovery and pipeline as the base dialog, but
-    multi-view fusion is forced on and the rotation controls are exposed. The
-    rotation sign / center conventions are rig-validated (confirm with a
-    two-angle test acquisition).
-    """
-
-    _settings_group = _MULTIVIEW_SETTINGS_GROUP
-
-    def __init__(self, parent=None, **kwargs):
-        super().__init__(parent=parent, **kwargs)
-        self.setWindowTitle("Tile Stitching (Multi-View)")
-
-    def _add_dialog_extras(self, content_layout) -> None:
-        banner = QLabel(
-            "⚠ Multi-view (rotation) stitching — fuses several rotation "
-            "angles into one volume. For normal single-angle acquisitions use the "
-            "‘Tile Stitching’ tab instead."
-        )
-        banner.setWordWrap(True)
-        banner.setStyleSheet(
-            "background:#fff3cd; color:#664d03; border:1px solid #ffe69c;"
-            "border-radius:4px; padding:6px;"
-        )
-        content_layout.addWidget(banner)
-
-        group = QGroupBox("Multi-View (rotation)")
-        v = QVBoxLayout()
-
-        note = QLabel(
-            "Each view is placed by a rotation about the vertical (Y) axis; "
-            "overlaps are resolved by registration and uncovered regions are "
-            "zero-filled."
-        )
-        note.setWordWrap(True)
-        note.setStyleSheet("color:#555; font-size:11px;")
-        v.addWidget(note)
-
-        center_row = QHBoxLayout()
-        center_row.addWidget(QLabel("Rotation center:"))
-        self._mv_center_combo = QComboBox()
-        self._mv_center_combo.addItem("Auto (tile centroid)", "auto")
-        self._mv_center_combo.addItem("Manual (X, Z)", "manual")
-        self._mv_center_combo.currentIndexChanged.connect(
-            self._mv_update_center_enabled
-        )
-        center_row.addWidget(self._mv_center_combo)
-        center_row.addWidget(QLabel("X"))
-        self._mv_cx_spin = QDoubleSpinBox()
-        self._mv_cx_spin.setRange(-1000.0, 1000.0)
-        self._mv_cx_spin.setDecimals(3)
-        self._mv_cx_spin.setSuffix(" mm")
-        center_row.addWidget(self._mv_cx_spin)
-        center_row.addWidget(QLabel("Z"))
-        self._mv_cz_spin = QDoubleSpinBox()
-        self._mv_cz_spin.setRange(-1000.0, 1000.0)
-        self._mv_cz_spin.setDecimals(3)
-        self._mv_cz_spin.setSuffix(" mm")
-        center_row.addWidget(self._mv_cz_spin)
-        center_row.addStretch()
-        v.addLayout(center_row)
-
-        sign_row = QHBoxLayout()
-        sign_row.addWidget(QLabel("Rotation sign:"))
-        self._mv_sign_combo = QComboBox()
-        self._mv_sign_combo.addItem("+1", 1.0)
-        self._mv_sign_combo.addItem("−1", -1.0)
-        self._mv_sign_combo.setToolTip(
-            "Handedness relating the stage angle to the fusion rotation.\n"
-            "Confirm on the rig with a two-angle test if views don't align."
-        )
-        sign_row.addWidget(self._mv_sign_combo)
-        sign_row.addStretch()
-        v.addLayout(sign_row)
-
-        group.setLayout(v)
-        content_layout.addWidget(group)
-        self._mv_update_center_enabled()
-
-    def _mv_update_center_enabled(self) -> None:
-        manual = self._mv_center_combo.currentData() == "manual"
-        self._mv_cx_spin.setEnabled(manual)
-        self._mv_cz_spin.setEnabled(manual)
-
-    def _build_config(self):
-        config = super()._build_config()
-        config.multiview_fusion = True
-        config.rotation_sign = float(self._mv_sign_combo.currentData())
-        if self._mv_center_combo.currentData() == "manual":
-            # UI is in mm; the pipeline's rotation center is in µm.
-            config.rotation_center_um = (
-                self._mv_cx_spin.value() * 1000.0,
-                self._mv_cz_spin.value() * 1000.0,
-            )
-        else:
-            config.rotation_center_um = None
-        return config
-
-    def _save_settings(self):
-        super()._save_settings()
-        s = QSettings()
-        s.beginGroup(self._settings_group)
-        s.setValue("mv_center_mode", self._mv_center_combo.currentData())
-        s.setValue("mv_cx_mm", self._mv_cx_spin.value())
-        s.setValue("mv_cz_mm", self._mv_cz_spin.value())
-        s.setValue("mv_rotation_sign", self._mv_sign_combo.currentData())
-        s.endGroup()
-
-    def _restore_settings(self):
-        super()._restore_settings()
-        s = QSettings()
-        s.beginGroup(self._settings_group)
-        mode = s.value("mv_center_mode", "auto")
-        idx = self._mv_center_combo.findData(mode)
-        if idx >= 0:
-            self._mv_center_combo.setCurrentIndex(idx)
-        self._mv_cx_spin.setValue(float(s.value("mv_cx_mm", 0.0)))
-        self._mv_cz_spin.setValue(float(s.value("mv_cz_mm", 0.0)))
-        sidx = self._mv_sign_combo.findData(float(s.value("mv_rotation_sign", 1.0)))
-        if sidx >= 0:
-            self._mv_sign_combo.setCurrentIndex(sidx)
-        s.endGroup()
-        self._mv_update_center_enabled()
