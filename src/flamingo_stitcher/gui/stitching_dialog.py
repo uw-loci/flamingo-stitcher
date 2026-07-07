@@ -2660,31 +2660,18 @@ class StitchingDialog(PersistentDialog):
 
     # ---- "Working" flamingo animation (cosmetic) -------------------------
     def _build_flamingo_indicator(self):
-        """A small looping 'marching flamingos' QMovie for the log's right
-        edge, shown only while a run is active. Returns the QLabel, or None if
-        the movie can't be created (missing file / no gif image plugin) — this
-        is optional chrome and must never block a stitch."""
-        try:
-            from PyQt5.QtCore import QSize
-            from PyQt5.QtGui import QMovie
+        """DISABLED in v0.5.3.
 
-            gif = Path(__file__).parent / "working_flamingos.gif"
-            if not gif.exists():
-                return None
-            movie = QMovie(str(gif))
-            if not movie.isValid():
-                return None
-            movie.setCacheMode(QMovie.CacheAll)
-            movie.setScaledSize(QSize(120, 120))
-            label = QLabel()
-            label.setMovie(movie)
-            label.setFixedSize(120, 120)
-            label.setToolTip("Stitching in progress…")
-            label.setVisible(False)  # revealed only while processing
-            self._flamingo_movie = movie
-            return label
-        except Exception:
-            return None
+        The animated QMovie (added in v0.5.1/v0.5.2) hard-crashed the frozen
+        Windows build inside Qt5Core.dll (Windows exception 0xc0000409) the
+        instant a run started — killing live stitches with no Python
+        traceback. The animation is purely cosmetic, so it stays off until
+        the crash is understood and a thread-safe indicator is proven out
+        (e.g. a static pixmap, or QMovie verified under concurrent worker
+        signal traffic). Returning None means the log renders without a GIF
+        and _set_flamingos_marching() no-ops (label/movie stay None).
+        """
+        return None
 
     def _set_flamingos_marching(self, marching: bool) -> None:
         """Start/stop + show/hide the 'working' flamingo animation."""
