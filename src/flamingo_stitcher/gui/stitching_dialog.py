@@ -38,6 +38,23 @@ from flamingo_stitcher.gui._compat import PersistentDialog
 
 logger = logging.getLogger(__name__)
 
+
+class _NoScrollDoubleSpinBox(QDoubleSpinBox):
+    """A spin box that ignores the mouse wheel unless it already has focus.
+
+    The default QDoubleSpinBox grabs wheel events on hover, so brushing the
+    scroll wheel over the form silently nudges a value — most damagingly the
+    XY pixel size, where a stray 0.001 µm change quietly disables Discover's
+    auto-fill. Click or tab into the box first to scroll-adjust it.
+    """
+
+    def wheelEvent(self, event):
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 # QSettings keys
 _SETTINGS_GROUP = "StitchingDialog"
 # Shared (cross-dialog) key for the last folder browsed to via "Add…", so the
@@ -441,7 +458,8 @@ class StitchingDialog(PersistentDialog):
 
         # Row 0: Pixel size + Z step
         settings_layout.addWidget(QLabel("Pixel size (\u00b5m):"), 0, 0)
-        self._pixel_size_spin = QDoubleSpinBox()
+        self._pixel_size_spin = _NoScrollDoubleSpinBox()
+        self._pixel_size_spin.setFocusPolicy(Qt.StrongFocus)
         self._pixel_size_spin.setRange(0.01, 100.0)
         self._pixel_size_spin.setDecimals(3)
         self._pixel_size_spin.setValue(self._default_pixel_um)
@@ -449,7 +467,8 @@ class StitchingDialog(PersistentDialog):
         settings_layout.addWidget(self._pixel_size_spin, 0, 1)
 
         settings_layout.addWidget(QLabel("Z step (\u00b5m):"), 0, 2)
-        self._z_step_spin = QDoubleSpinBox()
+        self._z_step_spin = _NoScrollDoubleSpinBox()
+        self._z_step_spin.setFocusPolicy(Qt.StrongFocus)
         self._z_step_spin.setRange(0.0, 1000.0)
         self._z_step_spin.setDecimals(3)
         self._z_step_spin.setValue(0.0)
@@ -1661,20 +1680,55 @@ class StitchingDialog(PersistentDialog):
             return
         mag = read_objective_magnification(acq)
         mag_str = f"{mag:.2f}×" if mag else "?"
+        detected = round(suggested, 4)
         cur = self._pixel_size_spin.value()
-        if not self._pixel_size_user_set:
+
+        def _apply_detected():
             self._setting_pixel_programmatically = True
-            self._pixel_size_spin.setValue(round(suggested, 4))
+            self._pixel_size_spin.setValue(detected)
             self._setting_pixel_programmatically = False
+            # Applying the detected value clears the manual-override flag so a
+            # later Discover keeps tracking the acquisition automatically.
+            self._pixel_size_user_set = False
+
+        # Untouched, or effectively equal to the detected value (e.g. a single
+        # stray wheel notch within rounding) — just sync silently.
+        if not self._pixel_size_user_set or abs(cur - detected) <= max(
+            0.0005, detected * 0.005
+        ):
+            _apply_detected()
             self._log(
-                f"Auto-detected XY pixel size: {suggested:.3f} µm "
+                f"Auto-detected XY pixel size: {detected:.3f} µm "
                 f"(objective {mag_str} from ScopeSettings.txt)"
             )
-        elif cur > 0 and abs(cur - suggested) / suggested > 0.15:
+            return
+
+        # The field was changed and now differs from the detected value. This
+        # is often an accidental scroll-wheel nudge, so offer to restore the
+        # detected value rather than silently keeping a possibly-wrong one —
+        # while still letting a deliberate override stand (choose No).
+        reply = QMessageBox.question(
+            self,
+            "Overwrite XY pixel size?",
+            f"The XY pixel size is set to {cur:.4f} µm, but the acquisition's "
+            f"objective ({mag_str}, from ScopeSettings.txt) gives "
+            f"{detected:.4f} µm.\n\n"
+            f"Overwrite with the detected {detected:.4f} µm?\n\n"
+            f"Choose No to keep your current value — e.g. a measured "
+            f"calibration you set on purpose.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if reply == QMessageBox.Yes:
+            _apply_detected()
             self._log(
-                f"⚠ XY pixel size {cur:.3f} µm differs from the objective-derived "
-                f"~{suggested:.3f} µm ({mag_str}). Verify before stitching — a wrong "
-                f"pixel size causes gaps/overlap between tiles."
+                f"XY pixel size overwritten with detected {detected:.3f} µm "
+                f"(objective {mag_str})."
+            )
+        else:
+            self._log(
+                f"Kept manual XY pixel size {cur:.3f} µm "
+                f"(detected {detected:.3f} µm from {mag_str} not applied)."
             )
 
     def _log_detected_frame_size(self):
