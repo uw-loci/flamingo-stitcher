@@ -91,4 +91,4 @@ where = ["src"]
 include = ["flamingo_stitcher*"]
 
 [tool.setuptools.package-data]
-flamingo_stitcher = ["configs/*.yaml", "docs/*.md", "preprocessing/*.toml"]
+flamingo_stitcher = ["configs/*.yaml", "docs/*.md", "preprocessing/*.toml", "gui/*.gif"]

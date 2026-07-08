@@ -96,11 +96,40 @@ def _splash_close() -> None:
         pass
 
 
+def _install_exception_guard() -> None:
+    """Route unhandled exceptions to the log instead of crashing the process.
+
+    PyQt5 aborts the whole application (qFatal → Windows exception 0xc0000409)
+    when an unhandled Python exception escapes a slot invoked from C++ — e.g. a
+    queued signal delivered from the worker thread — *and* sys.excepthook is
+    still the default one. Installing a custom hook both makes such errors
+    visible in the persistent log and prevents the hard crash: a slot failure
+    degrades to a logged error rather than taking down a running stitch.
+    (This is exactly how a missing import in a progress slot killed early
+    builds with no traceback.)
+    """
+    import traceback
+
+    _log = logging.getLogger("flamingo_stitcher.unhandled")
+
+    def _hook(exc_type, exc, tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc, tb)
+            return
+        _log.error(
+            "Unhandled exception (caught by guard; application kept alive):\n%s",
+            "".join(traceback.format_exception(exc_type, exc, tb)),
+        )
+
+    sys.excepthook = _hook
+
+
 def main() -> int:
     """Launch the standalone stitching GUI. Returns the Qt exit code."""
     log_path = _setup_logging()
     if log_path:
         logging.getLogger(__name__).info(f"Log file: {log_path}")
+    _install_exception_guard()
 
     _splash_text("Loading the stitching engine...")
 

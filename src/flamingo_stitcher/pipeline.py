@@ -20,6 +20,12 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+# Separator placed between a phase's own "this step:" ETA and the whole-run
+# "overall:" ETA in a single status line. The GUI splits on this to colour the
+# two segments distinctly; kept visually distinct (spaced middle dot) so the
+# plain-text status (CLI/logs) also reads cleanly.
+OVERALL_ETA_SEP = "   ·   "
+
 
 def _get_git_version() -> Optional[str]:
     """Get current git commit hash, or None if unavailable."""
@@ -383,7 +389,7 @@ class _TimeThrottledProgress(_DaskCallback):
                 if clock.date() == datetime.now().date()
                 else clock.strftime("%a %H:%M")
             )
-            tail = f" — {rem} remaining (Done at ~{eta_str})"
+            tail = f" — this step: {rem} remaining (Done at ~{eta_str})"
         else:
             tail = ""
         msg = f"{self._label}: {pct_local:.0f}%{tail}"
@@ -2209,7 +2215,12 @@ class StitchingPipeline:
                 self._estimator.start_phase(phase)
             tail = self._estimator.format_label()
             if tail and tail != "estimating...":
-                msg = f"{msg}  —  {tail}"
+                # Separator + explicit "overall:" label so this whole-run ETA
+                # is not confused with the per-step "this step:" ETA that the
+                # dask callback already appended (both read "... remaining
+                # (Done at ~...)"). The GUI splits on OVERALL_ETA_SEP to colour
+                # the two segments differently; plain-text/CLI/logs stay legible.
+                msg = f"{msg}{OVERALL_ETA_SEP}overall: {tail}"
         self._raw_progress_fn(pct, msg)
 
     # ------------------------------------------------------------------
