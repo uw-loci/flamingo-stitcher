@@ -2268,6 +2268,18 @@ class StitchingPipeline:
         threshold_gb = min(raw_gb, avail_gb * 0.9) if avail_gb > 0 else raw_gb
         threshold_bytes = int(threshold_gb * (1024**3))  # a working-set DELTA
         mode = "streaming" if use_streaming else "in-memory"
+        # Mode-aware remedy: don't tell a user who is already streaming to
+        # "switch to Streaming". In streaming mode the fuse working set is
+        # dominated by per-block cost — content-based blending and worker count
+        # inflate it well beyond the estimate — so point at those levers.
+        if use_streaming:
+            remedy = (
+                "already in Streaming mode — raise the XY/Z downsample factor, "
+                "turn off content-based blending, lower the fuse worker count, "
+                "or move the scratch dir to a fast local disk"
+            )
+        else:
+            remedy = "switch to Streaming mode and/or raise the downsample factor"
 
         def _on_exceed(used_bytes: int, phase):
             base = getattr(self._memory_monitor, "baseline_bytes", 0) or 0
@@ -2277,7 +2289,7 @@ class StitchingPipeline:
                 f"exceeded projected {projected_gb:.1f} GB × {margin:g} "
                 f"(threshold {threshold_gb:.1f} GB) during phase "
                 f"'{phase or '?'}' ({mode}). The run continues; if it OOMs, "
-                f"force Streaming and/or increase downsample."
+                f"{remedy}."
             )
             if self._memory_warning_fn is not None:
                 try:
