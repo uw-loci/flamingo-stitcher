@@ -5047,7 +5047,10 @@ class StitchingPipeline:
         # super-linearly with tile overlap + tile count. Real-world
         # datasets (66-tile 750 GB acq) hit ~5-8 hours of fuse time
         # with threads×4; the default cosine blending is 5-10× faster.
-        if self.config.content_based_fusion:
+        # Only actually used when blending overlaps; max-mode fusion
+        # (max_fusion) has no weights kwarg and skips content weights entirely,
+        # so announcing it there is misleading (and it costs no extra memory).
+        if self.config.content_based_fusion and self.config.tile_overlap_fusion != "max":
             self.logger.warning(
                 "  [info] Content-based fusion is enabled. Expect "
                 "the fuse-store step to be significantly slower (often "
