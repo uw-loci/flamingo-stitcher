@@ -559,6 +559,13 @@ class StitchingConfig:
     # (see tests/test_superblock_fusion.py). 0 = disabled (whole-output, the
     # historical path); a value like 8 fuses 8×8×8-chunk regions at a time.
     fusion_superblock_chunks: int = 0
+    # Auto super-block: when STREAMING a large output and fusion_superblock_chunks
+    # is left at 0, regions are auto-sized to ~this many GB of output each so the
+    # streaming fuse graph memory is bounded (the whole-output da.store lets the
+    # threaded scheduler hold far more than n_workers blocks — e.g. 127 GB on a
+    # 623 GB output — while the estimate assumes bounded per-block fusion). An
+    # explicit fusion_superblock_chunks always wins; 0 here disables auto.
+    fusion_superblock_target_gb: float = 4.0
     # Cosine fade-out blending widths (µm) — controls the smooth transition
     # zone at tile boundaries.  Inspired by BigStitcher's cosine-weighted
     # blending (Hörl et al., Nature Methods 2019).  multiview-stitcher
@@ -817,6 +824,57 @@ def compute_iso_downsample(
 # ---------------------------------------------------------------------------
 # Memory estimation
 # ---------------------------------------------------------------------------
+
+
+def resolve_superblock_chunks(
+    config: "StitchingConfig",
+    out_z_px: int,
+    out_y_px: int,
+    out_x_px: int,
+    use_streaming: bool,
+    bpv: int = 2,
+) -> int:
+    """Region size (output-chunks per axis) for super-block fusion; 0 = whole
+    output.
+
+    An explicit ``config.fusion_superblock_chunks`` always wins. Otherwise, for
+    STREAMING of a large output, auto-size cubic regions to ~
+    ``config.fusion_superblock_target_gb`` of output each, so the fuse graph is
+    bounded to O(region) instead of the unbounded whole-output ``da.store``
+    (which the estimate already assumes). In-memory mode and small outputs keep
+    the whole-output path (nothing to bound / no benefit). Shared by the runtime
+    and estimate so they never disagree.
+    """
+    import math
+
+    explicit = int(getattr(config, "fusion_superblock_chunks", 0) or 0)
+    if explicit > 0:
+        return explicit
+    target_gb = float(getattr(config, "fusion_superblock_target_gb", 0.0) or 0.0)
+    if not use_streaming or target_gb <= 0:
+        return 0
+
+    cs = getattr(config, "output_chunksize", {}) or {}
+    cz = max(1, int(cs.get("z", 128)))
+    cy = max(1, int(cs.get("y", 256)))
+    cx = max(1, int(cs.get("x", 256)))
+    n_ch_z = math.ceil(max(1, out_z_px) / cz)
+    n_ch_y = math.ceil(max(1, out_y_px) / cy)
+    n_ch_x = math.ceil(max(1, out_x_px) / cx)
+
+    total_out_gb = (out_z_px * out_y_px * out_x_px * bpv) / (1024**3)
+    # Small outputs: the whole-output graph is already bounded — don't pay the
+    # per-region re-fuse overhead.
+    if total_out_gb <= 2.0 * target_gb:
+        return 0
+
+    chunk_gb = (cz * cy * cx * bpv) / (1024**3)
+    region_blocks = max(1.0, target_gb / max(chunk_gb, 1e-9))
+    n = max(1, int(round(region_blocks ** (1.0 / 3.0))))
+    # A region that already spans the whole output in every axis == whole-output.
+    if n >= n_ch_z and n >= n_ch_y and n >= n_ch_x:
+        return 0
+    return n
 
 
 def estimate_memory_usage(
@@ -3245,9 +3303,36 @@ class StitchingPipeline:
                         "num_workers": fw,
                     }
 
-                superblock = int(
+                # Build fusion inputs once up front so the output shape is known
+                # BEFORE committing to a fuse graph — that lets us auto-size
+                # super-block regions to bound streaming fuse memory. The
+                # whole-output da.store otherwise lets the threaded scheduler
+                # hold far more than n_workers blocks (see
+                # resolve_superblock_chunks); the estimate already assumes the
+                # bounded, per-block model.
+                sims, fuse_kwargs = self._build_fusion_inputs(
+                    tile_data, voxel_size_um, reg_params, transform_key
+                )
+                full_props = self._full_stack_properties(sims, fuse_kwargs)
+                _shp0 = full_props["shape"]
+                _explicit_sb = int(
                     getattr(self.config, "fusion_superblock_chunks", 0) or 0
                 )
+                superblock = resolve_superblock_chunks(
+                    self.config,
+                    int(_shp0["z"]),
+                    int(_shp0["y"]),
+                    int(_shp0["x"]),
+                    use_streaming=True,
+                )
+                if superblock > 0 and not _explicit_sb:
+                    self.logger.info(
+                        f"  Auto super-block: fusing in {superblock}×{superblock}"
+                        f"×{superblock}-chunk regions to bound streaming fuse "
+                        f"memory (target ~"
+                        f"{float(self.config.fusion_superblock_target_gb):g} "
+                        f"GB/region). Set 'Fusion super-block chunks' to override."
+                    )
 
                 # Both names always exist so the shared cleanup below can `del`
                 # them regardless of which path ran (super-block leaves them None
@@ -3261,10 +3346,7 @@ class StitchingPipeline:
                     # storing each into the memmap slice, instead of one graph
                     # over the whole output. Chunk alignment makes this
                     # bit-identical to whole-output fusion for every overlap mode.
-                    sims, fuse_kwargs = self._build_fusion_inputs(
-                        tile_data, voxel_size_um, reg_params, transform_key
-                    )
-                    full_props = self._full_stack_properties(sims, fuse_kwargs)
+                    # (sims / fuse_kwargs / full_props already built above.)
                     org = full_props["origin"]
                     shp = full_props["shape"]
                     origin_um = {
@@ -3315,6 +3397,9 @@ class StitchingPipeline:
                     del sims
                 else:
                     # ---- Whole-output fusion (historical path) ----
+                    # The up-front inputs were only needed to size super-block
+                    # regions; the historical path rebuilds them in _fuse_channel.
+                    del sims, fuse_kwargs, full_props
                     fused_sim, origin_um = self._fuse_channel(
                         tile_data, voxel_size_um, reg_params, transform_key
                     )
