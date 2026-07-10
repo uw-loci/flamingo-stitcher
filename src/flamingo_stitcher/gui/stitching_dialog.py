@@ -338,6 +338,11 @@ class StitchingDialog(PersistentDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
+        # Frozen Output row — pinned at the very top of the tab, ABOVE the
+        # (scrolling) queue + settings, so the output target / size / free space
+        # stays visible no matter what the user scrolls to. Empty until set.
+        self._build_frozen_output_row(layout)
+
         # The configuration controls (queue, settings, processing options) live
         # in a scroll area so they keep their natural size on small screens —
         # the window scrolls rather than squishing fields below readability.
@@ -417,18 +422,8 @@ class StitchingDialog(PersistentDialog):
         queue_group.setLayout(queue_layout)
         content_layout.addWidget(queue_group)
 
-        # --- Output directory ---
-        out_layout = QHBoxLayout()
-        out_layout.addWidget(QLabel("Output Directory:"))
-        self._output_dir_edit = QLineEdit()
-        self._output_dir_edit.setPlaceholderText(
-            "Shared output folder (each acquisition gets a subfolder)..."
-        )
-        out_layout.addWidget(self._output_dir_edit)
-        out_browse_btn = QPushButton("Browse...")
-        out_browse_btn.clicked.connect(self._browse_output_dir)
-        out_layout.addWidget(out_browse_btn)
-        content_layout.addLayout(out_layout)
+        # (The Output Directory row moved to the frozen top row — see
+        # _build_frozen_output_row, pinned above the scroll area.)
 
         # --- Settings, split into three plainly-named groups so a new user
         # isn't met with one dense wall of controls. Advanced toggles stay in
@@ -1504,6 +1499,74 @@ class StitchingDialog(PersistentDialog):
             self._set_btn_default(self._discover_btn)
             self._set_btn_default(self._run_btn)
 
+    def _build_frozen_output_row(self, parent_layout):
+        """Pinned Output row at the very top of the tab.
+
+        Stays visible above the (scrolling) queue + settings so the output
+        target, projected size, and free space are always in view. Holds the
+        Output Directory field (moved out of the scroll area) plus a one-line
+        ``dir | size | free`` summary that starts empty.
+        """
+        group = QGroupBox("Output")
+        v = QVBoxLayout(group)
+        v.setContentsMargins(8, 4, 8, 6)
+        v.setSpacing(4)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Output Directory:"))
+        self._output_dir_edit = QLineEdit()
+        self._output_dir_edit.setPlaceholderText(
+            "Shared output folder (each acquisition gets a subfolder)..."
+        )
+        self._output_dir_edit.textChanged.connect(self._update_output_info)
+        row.addWidget(self._output_dir_edit)
+        out_browse_btn = QPushButton("Browse...")
+        out_browse_btn.clicked.connect(self._browse_output_dir)
+        row.addWidget(out_browse_btn)
+        v.addLayout(row)
+
+        # One-line summary: dir | ~size | free space. Empty until a dir is set.
+        self._output_info_label = QLabel("")
+        self._output_info_label.setTextFormat(Qt.PlainText)
+        self._output_info_label.setWordWrap(True)
+        self._output_info_label.setStyleSheet("color: #555;")
+        v.addWidget(self._output_info_label)
+
+        parent_layout.addWidget(group)
+
+    def _update_output_info(self, *_):
+        """Refresh the frozen Output summary: ``dir | ~size | free space``.
+
+        Size comes from the last memory estimate (once tiles are discovered);
+        free space is probed on the nearest existing parent of the output dir
+        (the dir itself may not exist yet). Defensive — cosmetic only.
+        """
+        label = getattr(self, "_output_info_label", None)
+        if label is None:
+            return
+        edit = getattr(self, "_output_dir_edit", None)
+        out = edit.text().strip() if edit is not None else ""
+        if not out:
+            label.setText("")
+            return
+        parts = []
+        est = getattr(self, "_last_mem_estimate", None)
+        if est and est.get("output_gb"):
+            parts.append(f"~{est['output_gb']:.0f} GB output")
+        try:
+            import shutil
+
+            probe = Path(out)
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            free_gb = shutil.disk_usage(str(probe)).free / (1024**3)
+            drive = Path(out).drive or str(probe)
+            parts.append(f"{free_gb:.0f} GB free on {drive}")
+        except Exception:
+            pass
+        suffix = ("   |   " + "   |   ".join(parts)) if parts else ""
+        label.setText(f"Output: {out}{suffix}")
+
     def _browse_output_dir(self):
         start = self._output_dir_edit.text() or str(Path.home())
         folder = QFileDialog.getExistingDirectory(
@@ -2145,6 +2208,9 @@ class StitchingDialog(PersistentDialog):
           Red "OOM!"     — selected mode will likely exceed RAM
           Empty          — no tile data yet (nothing to estimate)
         """
+        # Keep the frozen Output summary in step with the estimate (size term)
+        # whenever the indicator refreshes; it also updates on dir change.
+        self._update_output_info()
         est = self._last_mem_estimate
         if est is None:
             self._memory_indicator.setText("")
