@@ -196,6 +196,61 @@ class MultiPhaseEstimator:
             return "estimating..."
         return f"{_format_duration(rem)} remaining (Done at ~{self.format_eta()})"
 
+    def phase_breakdown(self) -> Dict[str, float]:
+        """Accumulated wall seconds per phase, with the in-progress phase's
+        partial time folded in so a breakdown read mid-phase is complete."""
+        out = dict(self._phase_durations)
+        if self._current_phase is not None and self._current_phase_start is not None:
+            out[self._current_phase] = out.get(self._current_phase, 0.0) + max(
+                0.0, time.monotonic() - self._current_phase_start
+            )
+        return out
+
+    def format_breakdown(self, title: str = "Time breakdown") -> list:
+        """Human-readable per-phase wall-time breakdown for the run log.
+
+        One line per observed phase (in execution order) with its wall time
+        and share of the tracked total, a trailing ``Other/setup`` line for
+        wall time not attributed to any phase (setup, gaps between status
+        messages, teardown), and a ``TOTAL`` line. Returns ``[]`` if the run
+        was too short to be worth reporting.
+        """
+        total = self.elapsed_seconds()
+        if total is None or total < 1.0:
+            return []
+        durations = self.phase_breakdown()
+        if not durations:
+            return []
+
+        labels = {
+            "discover": "Discover tiles",
+            "register": "Register tiles",
+            "preprocess": "Load + preprocess",
+            "fuse": "Fuse",
+            "write": "Write output",
+            "metadata": "Write metadata",
+        }
+        # Known phases first (execution order), then any unexpected ones.
+        ordered = [p for p in PHASE_ORDER if p in durations]
+        ordered += [p for p in durations if p not in PHASE_ORDER]
+
+        tracked = sum(durations.values())
+        untracked = max(0.0, total - tracked)
+
+        rows = [(labels.get(p, p), durations[p]) for p in ordered]
+        if untracked >= 1.0:
+            rows.append(("Other/setup", untracked))
+        name_w = max(len(name) for name, _ in rows)
+
+        lines = [f"=== {title} ==="]
+        for name, dur in rows:
+            pct = (100.0 * dur / total) if total > 0 else 0.0
+            lines.append(
+                f"  {name:<{name_w}}  {_format_duration(dur):>9}  ({pct:5.1f}%)"
+            )
+        lines.append(f"  {'TOTAL':<{name_w}}  {_format_duration(total):>9}")
+        return lines
+
 
 def _format_duration(seconds: float) -> str:
     seconds = max(0, int(round(seconds)))

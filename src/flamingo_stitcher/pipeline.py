@@ -2487,6 +2487,16 @@ class StitchingPipeline:
             raise
         finally:
             self._stop_memory_watchdog()
+            # Per-run time breakdown to the log, on every exit path. finalize()
+            # above has flushed the in-progress phase in each branch, so the
+            # durations are complete (partial when cancelled/errored, which is
+            # itself useful -- it shows where the time went before the stop).
+            if self._estimator is not None:
+                try:
+                    for _line in self._estimator.format_breakdown():
+                        self.logger.info(_line)
+                except Exception as _e:  # never let logging sink a run
+                    self.logger.debug(f"Time-breakdown log failed: {_e}")
 
     def _run_impl(
         self,
