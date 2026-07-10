@@ -65,9 +65,16 @@ Output drive (...): 1917 GB free, need ~215 GB output + ~375 GB tile spill + ~21
 and warns if free space falls under 110% of need. **Plan for 2–3× the
 raw acquisition size in free output-drive space.**
 
-**Separate temp drive**: not currently supported. If your output drive
-is slow/full, there's no way to redirect `.stitch_tmp/` to a faster
-disk. This is a TODO (`StitchingConfig.temp_dir`).
+**Separate scratch drive (strongly recommended for TB-scale runs)**: set
+a **Scratch dir** in the dialog to redirect `.stitch_tmp/` (the tile spill
++ fused memmap) onto a fast **local** SSD/NVMe, independent of the output
+drive. This is the single most important knob for full-resolution runs:
+the fuse phase streams **>1 TB** through `.stitch_tmp`, so a slow, spinning,
+or network scratch drive backs those writes up in RAM and can **freeze the
+whole machine** (see §2). Put scratch on the fastest local disk with room
+for `(tile spill + fused memmap)`; the final output can go to a larger,
+slower drive since it's written once. Added in v0.4.x (supersedes the old
+"no temp redirect" limitation).
 
 ### CPU
 
@@ -89,6 +96,44 @@ disk. This is a TODO (`StitchingConfig.temp_dir`).
 ---
 
 ## 2. Things to Check When a Run Looks Stuck
+
+### Symptom: the whole computer freezes / goes unresponsive during a full-res run (you have to hard power-off)
+
+This is **not the app crashing** and **not a power/PSU fault** — it's the
+machine running out of usable memory and thrashing to a halt. (Windows
+Event Viewer will show a Kernel-Power 41 with `BugcheckCode=0` and **no**
+minidump — the signature of a *forced* power-off of an already-hung machine
+— often alongside Resource-Exhaustion-Detector "low virtual memory" (2004)
+events naming the stitcher process.)
+
+The **fuse step** is the only step that goes big. Before v0.5.7 the
+whole-output fuse let dask hold thousands of output blocks at once (e.g.
+**~127 GB** working set on a 623 GB output), and the ~1–3 TB of memmap I/O
+fills the OS cache — together they thrash the box to a freeze. It froze
+even on a 191 GB machine.
+
+**Fixes (all keep full resolution — no downsampling, no dropped steps):**
+
+1. **Use stitcher ≥ v0.5.7.** Auto super-block fusion bounds the fuse
+   working set to ~one region (`fusion_superblock_target_gb`, default 4 GB
+   of output/region), so peak fuse RAM drops from ~127 GB back to the
+   materialize-phase ~32 GB. Look for `Auto super-block: fusing in NxNxN-chunk
+   regions …` in the log. This alone usually stops the freeze.
+2. **Put the Scratch dir on a fast *local* SSD/NVMe** (see §1 Storage). The
+   fuse streams >1 TB through `.stitch_tmp`; a slow/spinning/network drive
+   backs the writes up in RAM. As important as (1).
+3. **Never run large data in in-memory mode.** It commits the whole fused
+   volume (hundreds of GB to >1 TB) and *will* exhaust the commit limit —
+   the classic freeze. Streaming is the default; don't force in-memory on
+   big acquisitions. (A 379 GB `python.exe` commit was a real 2004 culprit.)
+
+The **page file does not need enlarging** — on a 191 GB box the commit
+limit is already ~RAM + page file; the fix is reducing demand (above), not
+raising the ceiling.
+
+If it *still* freezes with v0.5.7+ **and** fast-local scratch, capture the
+log (the version is on line 1 as of v0.5.8) plus the Event Viewer 41/2004
+entries and report — that's a new signal pointing at memmap writeback.
 
 ### Symptom: fuse phase logs "Storing channel N into fused memmap..." then no movement for 30+ min
 
