@@ -418,6 +418,19 @@ class StitchingDialog(PersistentDialog):
         queue_btn_layout.addWidget(self._remove_btn)
 
         queue_btn_layout.addStretch()
+
+        self._load_config_btn = QPushButton("Load Configuration…")
+        self._load_config_btn.setToolTip(
+            "Load stitching settings from another run's stitch_metadata.json\n"
+            "(or a saved configuration file) to reuse a setup that worked —\n"
+            "e.g. one shared by another user.\n\n"
+            "Applies processing options only. Pixel size, Z spacing, frame AOI\n"
+            "and the output location are left as they are and re-detected by\n"
+            "Discover, so the settings transfer cleanly to your own data."
+        )
+        self._load_config_btn.clicked.connect(self._on_load_configuration)
+        queue_btn_layout.addWidget(self._load_config_btn)
+
         queue_layout.addLayout(queue_btn_layout)
         queue_group.setLayout(queue_layout)
         content_layout.addWidget(queue_group)
@@ -2348,6 +2361,194 @@ class StitchingDialog(PersistentDialog):
                 config.zarr_compression = compression
                 config.tiff_compression = compression
         return config
+
+    # StitchingConfig fields that are specific to a particular acquisition
+    # (physical geometry) or to this machine, so a *shared* configuration must
+    # not overwrite them. Discover re-derives the file-specific ones from the
+    # actual data; the output/scratch locations are environment-specific.
+    _NONSHAREABLE_CONFIG_FIELDS = frozenset(
+        {"pixel_size_um", "z_step_um", "frame_width", "frame_height", "scratch_dir"}
+    )
+
+    @staticmethod
+    def _set_combo_by_data(combo, value) -> bool:
+        """Select the combo entry whose stored data equals ``value``.
+
+        Uses Python equality (not Qt ``findData``) so it matches ``None``,
+        bools and dict-valued combo data correctly. Returns False if no
+        entry matches (option unavailable in this build/format).
+        """
+        for i in range(combo.count()):
+            if combo.itemData(i) == value:
+                combo.setCurrentIndex(i)
+                return True
+        return False
+
+    def _on_load_configuration(self):
+        """Load processing settings from a run's stitch_metadata.json (or a
+        saved configuration file) into the current tab, so a setup that worked
+        can be reused / shared. File-specific and environment-specific fields
+        are intentionally left alone (Discover re-detects them)."""
+        start_dir = (
+            self._output_dir_edit.text().strip()
+            or QSettings().value(_LAST_BROWSE_KEY, "", type=str)
+            or ""
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Load Stitching Configuration",
+            start_dir,
+            "Stitching metadata / config (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            data = json.loads(Path(path).read_text())
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Couldn't read configuration",
+                f"Could not read a stitching configuration from:\n{path}\n\n{e}",
+            )
+            return
+
+        cfg = None
+        if isinstance(data, dict):
+            block = data.get("stitching_config")
+            if isinstance(block, dict) and block:
+                cfg = block
+            elif any(
+                k in data
+                for k in ("illumination_fusion", "output_format", "downsample_xy")
+            ):
+                cfg = data  # a bare configuration file
+        if not cfg:
+            QMessageBox.warning(
+                self,
+                "Not a stitching configuration",
+                "This file doesn't contain stitching settings.\n\n"
+                "Choose a stitch_metadata.json from a completed run (it carries "
+                "the settings used) or a saved configuration file.",
+            )
+            return
+
+        applied, skipped = self._apply_stitching_config(cfg)
+        self._log(f"Loaded stitching configuration from {Path(path).name}")
+        self._log(f"  Applied {applied} setting(s) from the shared configuration.")
+        if skipped:
+            labels = {
+                "pixel_size_um": "pixel size",
+                "z_step_um": "Z spacing",
+                "frame_width": "frame AOI",
+                "frame_height": "frame AOI",
+                "scratch_dir": "scratch location",
+            }
+            pretty = sorted({labels.get(s, s) for s in skipped})
+            self._log(
+                "  Left unchanged (acquisition/environment specific, re-detected "
+                "by Discover): " + ", ".join(pretty) + "."
+            )
+        QMessageBox.information(
+            self,
+            "Configuration loaded",
+            f"Applied {applied} processing setting(s) from:\n{Path(path).name}\n\n"
+            "Pixel size, Z spacing, frame AOI and the output location were left "
+            "as they are — run Discover to detect those from your acquisition.",
+        )
+
+    def _apply_stitching_config(self, cfg: dict):
+        """Apply a serialized StitchingConfig dict to the current widgets.
+
+        Returns ``(applied_count, skipped_field_names)``. Only processing
+        settings are applied; :attr:`_NONSHAREABLE_CONFIG_FIELDS` are skipped
+        so a shared config never clobbers this acquisition's geometry or the
+        local output location. Mirrors :meth:`_build_config` in reverse.
+        """
+        applied = 0
+        skipped = set()
+
+        def has(name):
+            return name in cfg and name not in self._NONSHAREABLE_CONFIG_FIELDS
+
+        # Note which non-shareable fields the file carried, for the summary.
+        for name in self._NONSHAREABLE_CONFIG_FIELDS:
+            if name in cfg:
+                skipped.add(name)
+
+        # Output format FIRST — its handler repopulates the compression combo,
+        # so compression must be applied after (matching _restore_settings).
+        if has("output_format"):
+            applied += self._set_combo_by_data(
+                self._format_combo, cfg["output_format"]
+            )
+        # Compression is stored per-format on the config; pick the one that
+        # matches the (now-applied) format.
+        fmt = self._format_combo.currentData()
+        comp = None
+        if fmt in ("ome-tiff", "both") and has("tiff_compression"):
+            comp = cfg["tiff_compression"]
+        elif fmt in ("ome-zarr-sharded", "ome-zarr-v2", "both") and has(
+            "zarr_compression"
+        ):
+            comp = cfg["zarr_compression"]
+        if comp is not None:
+            applied += self._set_combo_by_data(self._compression_combo, comp)
+
+        combo_fields = [
+            ("illumination_fusion", self._fusion_combo),
+            ("tile_overlap_fusion", self._tile_fusion_combo),
+            ("downsample_xy", self._downsample_xy_combo),
+            ("downsample_z", self._downsample_z_combo),
+            ("registration_binning", self._reg_binning_combo),
+            ("streaming_mode", self._streaming_combo),
+            ("output_chunksize", self._chunk_size_combo),
+        ]
+        for name, combo in combo_fields:
+            if has(name):
+                applied += self._set_combo_by_data(combo, cfg[name])
+
+        check_fields = [
+            ("flat_field_correction", self._flat_field_cb),
+            ("destripe", self._destripe_cb),
+            ("destripe_fast", self._destripe_fast_cb),
+            ("deconvolution_enabled", self._deconv_cb),
+            ("content_based_fusion", self._content_fusion_cb),
+            ("skip_registration", self._skip_reg_cb),
+            ("package_ozx", self._ozx_cb),
+            ("tiff_pyramids", self._tiff_pyramids_cb),
+        ]
+        for name, cb in check_fields:
+            if has(name):
+                cb.setChecked(bool(cfg[name]))
+                applied += 1
+
+        # Background zeroing: enable state now; per-channel thresholds can only
+        # be applied once channels are known, so stash them for replay after
+        # Discover (the same mechanism _restore_settings uses).
+        if has("background_zero_enabled"):
+            self._bg_zero_panel.set_enabled_state(bool(cfg["background_zero_enabled"]))
+            applied += 1
+        if has("background_zero_thresholds"):
+            try:
+                thr = {
+                    int(k): int(v)
+                    for k, v in dict(cfg["background_zero_thresholds"]).items()
+                }
+            except (ValueError, TypeError):
+                thr = {}
+            self._pending_bg_zero_thresholds = thr
+            # Apply immediately too, in case channels are already populated.
+            self._bg_zero_panel.set_thresholds(thr)
+            applied += 1
+
+        # A shared config can re-check options whose backend is missing on this
+        # box (e.g. Destripe with pystripe absent); re-gate so those clear.
+        self._update_preprocessing_availability()
+        try:
+            self._update_memory_indicator()
+        except Exception:
+            pass
+        return applied, skipped
 
     def _parse_channels(self) -> Optional[List[int]]:
         """Parse channels from the channels line edit. Returns None for 'all'."""

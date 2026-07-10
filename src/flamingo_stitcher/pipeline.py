@@ -26,6 +26,57 @@ logger = logging.getLogger(__name__)
 # plain-text status (CLI/logs) also reads cleanly.
 OVERALL_ETA_SEP = "   ·   "
 
+# StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
+# block so a run's settings can be reloaded into the GUI ("Load Configuration",
+# to share a setup that worked). The file-specific ones at the end are recorded
+# for provenance; the GUI loader deliberately skips them (Discover re-derives
+# them from the actual acquisition). Order is presentation-only.
+SHAREABLE_CONFIG_FIELDS = (
+    "illumination_fusion",
+    "tile_overlap_fusion",
+    "output_format",
+    "tiff_compression",
+    "zarr_compression",
+    "flat_field_correction",
+    "destripe",
+    "destripe_fast",
+    "deconvolution_enabled",
+    "content_based_fusion",
+    "downsample_xy",
+    "downsample_z",
+    "skip_registration",
+    "registration_binning",
+    "streaming_mode",
+    "output_chunksize",
+    "package_ozx",
+    "tiff_pyramids",
+    "background_zero_enabled",
+    "background_zero_thresholds",
+    # File-specific (recorded for provenance; GUI loader skips these):
+    "pixel_size_um",
+    "z_step_um",
+    "frame_width",
+    "frame_height",
+)
+
+
+def serialize_stitching_config(config) -> Dict[str, Any]:
+    """Serialize the shareable subset of a StitchingConfig to JSON-safe types.
+
+    Dict-valued fields (chunk sizes, per-channel thresholds/binning) have
+    their keys stringified so ``json.dumps`` accepts them; the loader
+    reverses that. Fields absent on the config object are simply omitted.
+    """
+    out: Dict[str, Any] = {}
+    for name in SHAREABLE_CONFIG_FIELDS:
+        if not hasattr(config, name):
+            continue
+        val = getattr(config, name)
+        if isinstance(val, dict):
+            val = {str(k): v for k, v in val.items()}
+        out[name] = val
+    return out
+
 
 def _get_git_version() -> Optional[str]:
     """Get current git commit hash, or None if unavailable."""
@@ -4590,6 +4641,10 @@ class StitchingPipeline:
             "angles_deg": all_angles,
             "partial_coverage": partial_coverage,
             "tiles": tiles_meta,
+            # Full processing settings used for this run, so the GUI's "Load
+            # Configuration" can reproduce a setup that worked on another
+            # acquisition (skipping the file-specific fields on load).
+            "stitching_config": serialize_stitching_config(self.config),
         }
 
         meta_path = output_dir / "stitch_metadata.json"
