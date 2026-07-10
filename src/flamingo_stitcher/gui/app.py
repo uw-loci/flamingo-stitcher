@@ -127,8 +127,27 @@ def _install_exception_guard() -> None:
 def main() -> int:
     """Launch the standalone stitching GUI. Returns the Qt exit code."""
     log_path = _setup_logging()
+    _log = logging.getLogger(__name__)
+    # Log the version + environment on the FIRST line of every run — before any
+    # dialog is built or a stitch starts — so a log is never version-ambiguous,
+    # even if the app crashes at launch or the user never starts a run.
+    try:
+        import platform
+
+        from flamingo_stitcher._version import __version__
+
+        frozen = " (frozen)" if getattr(sys, "frozen", False) else ""
+        _log.info(
+            "Flamingo Stitcher %s%s starting — Python %s on %s",
+            __version__,
+            frozen,
+            platform.python_version(),
+            platform.platform(),
+        )
+    except Exception:
+        pass
     if log_path:
-        logging.getLogger(__name__).info(f"Log file: {log_path}")
+        _log.info(f"Log file: {log_path}")
     _install_exception_guard()
 
     _splash_text("Loading the stitching engine...")
