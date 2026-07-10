@@ -796,46 +796,11 @@ class StitchingDialog(PersistentDialog):
         scratch_wrap.setLayout(scratch_row)
         settings_layout.addWidget(scratch_wrap, 3, 4)
 
-        # ===== Output information (live estimates) =====
-        # A separate, plainly-labelled box so the native→output resolution,
-        # memory, and time read-outs are easy to find instead of being buried
-        # under the save settings.
-        info_group = QGroupBox("Output information")
-        info_layout = QVBoxLayout()
-        info_layout.setSpacing(4)
+        # (The "Output information" live estimates — native→output voxel,
+        # in-memory/streaming memory, and queue time — are pinned in the frozen
+        # Output row at the top of the tab, see _build_frozen_output_row, so
+        # they stay visible while the user changes settings here.)
 
-        # Native → output voxel size (how pixel size, Z step, and downsample
-        # combine). Shown first because it answers "what resolution do I get?".
-        self._voxel_readout_label = QLabel("")
-        self._voxel_readout_label.setStyleSheet("color: #444; font-size: 11px;")
-        self._voxel_readout_label.setToolTip(
-            "Native voxel (XY pixel × XY pixel × Z step) from the fields\n"
-            "above, then the resulting output voxel after applying the\n"
-            "chosen downsample factors. For 'iso', the factors are\n"
-            "resolved from the native voxel and shown in parentheses."
-        )
-        info_layout.addWidget(self._voxel_readout_label)
-
-        # Memory estimate (in-memory vs streaming peak, colour-coded).
-        self._memory_label = QLabel("")
-        # Rich text so per-term spans can carry their own colour.
-        self._memory_label.setTextFormat(Qt.RichText)
-        self._memory_label.setStyleSheet("font-size: 11px;")
-        info_layout.addWidget(self._memory_label)
-
-        # Rough queue-time estimate (sum across pending queue items).
-        self._time_label = QLabel("")
-        self._time_label.setTextFormat(Qt.RichText)
-        self._time_label.setStyleSheet("font-size: 11px;")
-        self._time_label.setToolTip(
-            "Approximate total wall time to stitch the Pending items in the "
-            "queue.\nUses measured times from previous runs of similar settings "
-            "when available;\notherwise a rough guess. Accuracy improves as you "
-            "run more acquisitions."
-        )
-        info_layout.addWidget(self._time_label)
-
-        info_group.setLayout(info_layout)
         # Track whether the user has manually set the XY pixel size, so the
         # ScopeSettings-derived auto-fill on discover doesn't clobber a
         # deliberate choice. A guard distinguishes programmatic setValue.
@@ -870,7 +835,6 @@ class StitchingDialog(PersistentDialog):
 
         output_group.setLayout(output_outer)
         settings_vbox.addWidget(output_group)
-        settings_vbox.addWidget(info_group)
 
         # The group boxes share one container so the existing
         # self._config_container.setEnabled(False) during a run disables them
@@ -1544,6 +1508,43 @@ class StitchingDialog(PersistentDialog):
         self._output_info_label.setWordWrap(True)
         self._output_info_label.setStyleSheet("color: #555;")
         v.addWidget(self._output_info_label)
+
+        # ===== Live estimates (pinned here so they stay visible while the user
+        # changes downsample/format/etc. instead of scrolling away). Laid out
+        # to use the horizontal space rather than stack tall. =====
+        # Memory: in-memory vs streaming peak, colour-coded — the headline the
+        # user watches while tuning options. Rich text for per-term colour.
+        self._memory_label = QLabel("")
+        self._memory_label.setTextFormat(Qt.RichText)
+        self._memory_label.setWordWrap(True)
+        self._memory_label.setStyleSheet("font-size: 11px;")
+        v.addWidget(self._memory_label)
+
+        # Native → output voxel size (left) and rough queue time (right) share
+        # one row to keep the block short.
+        info_row = QHBoxLayout()
+        info_row.setContentsMargins(0, 0, 0, 0)
+        self._voxel_readout_label = QLabel("")
+        self._voxel_readout_label.setStyleSheet("color: #444; font-size: 11px;")
+        self._voxel_readout_label.setToolTip(
+            "Native voxel (XY pixel × XY pixel × Z step) from the fields\n"
+            "above, then the resulting output voxel after applying the\n"
+            "chosen downsample factors. For 'iso', the factors are\n"
+            "resolved from the native voxel and shown in parentheses."
+        )
+        info_row.addWidget(self._voxel_readout_label)
+        info_row.addStretch()
+        self._time_label = QLabel("")
+        self._time_label.setTextFormat(Qt.RichText)
+        self._time_label.setStyleSheet("font-size: 11px;")
+        self._time_label.setToolTip(
+            "Approximate total wall time to stitch the Pending items in the "
+            "queue.\nUses measured times from previous runs of similar settings "
+            "when available;\notherwise a rough guess. Accuracy improves as you "
+            "run more acquisitions."
+        )
+        info_row.addWidget(self._time_label)
+        v.addLayout(info_row)
 
         parent_layout.addWidget(group)
 
