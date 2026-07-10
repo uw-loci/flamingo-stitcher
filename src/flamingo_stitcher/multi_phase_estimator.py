@@ -1,18 +1,33 @@
 """Multi-phase stitching ETA estimator.
 
-Tracks per-phase wall time during a stitching run and projects total
-elapsed time / remaining time from observed phase durations combined
-with cached per-phase share-of-total from prior runs.
+The whole-run "remaining time" is anchored to the pipeline's own **global
+progress fraction** (the monotone 0–100% the pipeline already emits, which
+advances per-tile through preprocessing and per-region through fusion), via
+honest linear extrapolation from elapsed wall time::
 
-ETA strategies, in order of preference:
+    remaining = elapsed * (1 - f) / f
 
-1. **Cold start** (no phases done, cached total available): use the
-   cached mean total wall time as both elapsed-projection and remaining.
-2. **Mid run, with cached shares**: ``T_projected = sum(observed) /
-   sum(shares_observed)``. Remaining = ``T_projected - sum(observed)``.
-3. **Mid run, no cached shares**: extrapolate linearly from the
-   completed-phase count. Crude but better than silence.
-4. **Nothing**: return ``None`` so the caller can render "estimating...".
+This is self-calibrating (it uses how long the run has *actually* taken to
+reach fraction ``f``, so a slow disk or a slow machine is absorbed
+automatically) and monotone in ``f`` — it cannot do the wild 3 min → 5 h
+swings the old share-division scheme produced. That scheme inferred the total
+by dividing a phase's *observed time* by its cached *share of total*, which,
+with no within-phase progress signal, made the estimate balloon the longer any
+one phase ran.
+
+Two refinements keep the early estimate sane:
+
+* **Cold-start prior.** Before there's meaningful progress (``f`` tiny /
+  little elapsed), fall back to a prior total — the cached mean wall time for
+  this config if we have run it before, else a rough model passed in by the
+  caller. The live extrapolation is blended in as ``f`` grows past a small
+  threshold, so there's no discontinuity when it takes over.
+* **Smoothing.** The reported value is EMA-smoothed so per-emit jitter and the
+  small step at a phase boundary don't jump the clock around.
+
+Per-phase wall clocks are still tracked (``start_phase`` / ``end_phase``) — the
+memory watchdog and the end-of-run time breakdown depend on them — they just no
+longer drive the ETA.
 """
 
 from __future__ import annotations
@@ -30,10 +45,18 @@ from flamingo_stitcher.timing_cache import (
 
 logger = logging.getLogger(__name__)
 
-# Minimum partial duration (seconds) for the in-progress phase to
-# count toward the share-based projection. Below this, the partial is
-# too noisy: dividing tiny partial by tiny share gives garbage.
-_MIN_INPROGRESS_S = 5.0
+# Progress-fraction band over which the live extrapolation takes over from the
+# cold-start prior. Below _F_LO the run is too early to trust elapsed/f; above
+# _F_HI the extrapolation is used alone; between, the two are blended.
+_F_LO = 0.05
+_F_HI = 0.25
+
+# EMA smoothing for the reported remaining time (per query). Higher = snappier.
+_SMOOTH_ALPHA = 0.35
+
+# Don't report a live ETA until this much wall time has passed — a couple of
+# seconds in, elapsed is too small to extrapolate from.
+_MIN_ELAPSED_S = 5.0
 
 
 class MultiPhaseEstimator:
@@ -51,7 +74,12 @@ class MultiPhaseEstimator:
         est.finalize()               # at run end (writes to cache)
     """
 
-    def __init__(self, cache: StitchingTimingCache, key: StitchingTimingKey):
+    def __init__(
+        self,
+        cache: StitchingTimingCache,
+        key: StitchingTimingKey,
+        prior_total_s: Optional[float] = None,
+    ):
         self._cache = cache
         self._key = key
         self._start_t: Optional[float] = None
@@ -59,13 +87,25 @@ class MultiPhaseEstimator:
         self._current_phase_start: Optional[float] = None
         self._phase_durations: Dict[str, float] = {}
 
+        # Live global progress fraction (0..1), fed by the pipeline's monotone
+        # percent. Kept monotone non-decreasing so a writer that reports its own
+        # local 0..100 can't drag the whole-run fraction backwards.
+        self._frac: float = 0.0
+        self._smoothed_remaining: Optional[float] = None
+
         self._cached_total_s = cache.get_total_s(key)
         self._cached_shares = cache.get_phase_shares(key)
+        # Cold-start prior: prefer the measured mean for this config; else the
+        # caller's rough model. Used until live progress can carry the estimate.
+        self._prior_total_s = self._cached_total_s or prior_total_s
         if self._cached_total_s:
             logger.info(
-                f"Stitching ETA: seeded from cache "
-                f"(total ~{self._cached_total_s:.0f}s, "
-                f"{len(self._cached_shares)} phase shares)"
+                f"Stitching ETA: seeded from cache (total ~{self._cached_total_s:.0f}s)"
+            )
+        elif prior_total_s:
+            logger.info(
+                f"Stitching ETA: cold start, rough prior ~{prior_total_s:.0f}s "
+                f"(refined live from progress)"
             )
 
     # ------------------------------------------------------------------
@@ -125,49 +165,81 @@ class MultiPhaseEstimator:
             return None
         return time.monotonic() - self._start_t
 
-    def remaining_seconds(self) -> Optional[float]:
+    def update_fraction(self, frac: float) -> None:
+        """Feed the pipeline's global progress fraction (0..1) and re-estimate.
+
+        The fraction is kept monotone non-decreasing (a writer reporting its own
+        local percent must not drag the whole-run fraction backwards). The EMA
+        commit happens here — once per progress emit — so ``remaining_seconds``
+        can be a side-effect-free read that callers may hit multiple times.
+        """
+        try:
+            f = float(frac)
+        except (TypeError, ValueError):
+            return
+        if f != f:  # NaN
+            return
+        f = min(1.0, max(0.0, f))
+        if f > self._frac:
+            self._frac = f
+        raw = self._raw_remaining()
+        if raw is None:
+            return
+        if self._smoothed_remaining is None:
+            self._smoothed_remaining = raw
+        else:
+            self._smoothed_remaining = (
+                _SMOOTH_ALPHA * raw + (1.0 - _SMOOTH_ALPHA) * self._smoothed_remaining
+            )
+
+    def _raw_remaining(self) -> Optional[float]:
+        """Unsmoothed remaining-seconds estimate from current elapsed + fraction.
+        Pure (no state mutation)."""
         elapsed = self.elapsed_seconds()
         if elapsed is None:
             return None
 
-        # Build the observed-duration map. Include the in-progress
-        # phase's partial time ONLY if it's substantial (>=5s) -- a
-        # just-started phase has sub-millisecond partial which, divided
-        # by a small share like 0.008, blows up to a projected total of
-        # near zero. The threshold filters out that pathological case
-        # while still picking up legitimate "this fuse phase is running
-        # long" signal once meaningful time has passed.
-        observed: Dict[str, float] = dict(self._phase_durations)
-        if self._current_phase is not None and self._current_phase_start is not None:
-            partial = time.monotonic() - self._current_phase_start
-            if partial >= _MIN_INPROGRESS_S:
-                observed[self._current_phase] = (
-                    observed.get(self._current_phase, 0.0) + partial
-                )
+        f = self._frac
+        # Live linear extrapolation from actual progress: reaching fraction f in
+        # `elapsed` seconds implies elapsed*(1-f)/f left. Self-calibrating,
+        # monotone in f.
+        live = None
+        if f > 1e-6 and elapsed >= _MIN_ELAPSED_S:
+            live = elapsed * (1.0 - f) / f
 
-        # Strategy 2: cached shares + observed (completed + substantial
-        # in-progress) phases.
-        if self._cached_shares and observed:
-            sum_observed_dur = sum(observed.values())
-            sum_observed_shares = sum(self._cached_shares.get(p, 0.0) for p in observed)
-            if sum_observed_shares > 0 and sum_observed_dur > 0:
-                projected_total = sum_observed_dur / sum_observed_shares
-                return max(0.0, projected_total - elapsed)
+        # Cold-start prior (cached mean or rough model), decremented by elapsed.
+        prior = None
+        if self._prior_total_s:
+            prior = max(0.0, self._prior_total_s - elapsed)
 
-        # Strategy 1: cold start with cached total
-        if self._cached_total_s:
-            return max(0.0, self._cached_total_s - elapsed)
+        # Blend: prior early, live once there's enough progress to trust it.
+        if live is not None and prior is not None:
+            if f >= _F_HI:
+                raw = live
+            elif f <= _F_LO:
+                raw = prior
+            else:
+                w = (f - _F_LO) / (_F_HI - _F_LO)
+                raw = (1.0 - w) * prior + w * live
+        elif live is not None:
+            raw = live
+        elif prior is not None:
+            raw = prior
+        else:
+            return None
+        return max(0.0, raw)
 
-        # Strategy 3: no cache; extrapolate from completed-phase count.
-        # Crude but better than silence.
-        completed = list(self._phase_durations)
-        if completed:
-            done_fraction = len(completed) / max(len(PHASE_ORDER), 1)
-            if done_fraction > 0:
-                projected = elapsed / done_fraction
-                return max(0.0, projected - elapsed)
+    def remaining_seconds(self) -> Optional[float]:
+        """Smoothed remaining-seconds estimate (side-effect-free read).
 
-        return None
+        Returns the EMA committed by :meth:`update_fraction`. Before any
+        progress emit it falls back to the raw prior estimate so an early
+        caller still gets a number rather than ``None`` once enough wall time
+        has passed.
+        """
+        if self._smoothed_remaining is not None:
+            return max(0.0, self._smoothed_remaining)
+        return self._raw_remaining()
 
     def eta_clock(self) -> Optional[datetime]:
         rem = self.remaining_seconds()

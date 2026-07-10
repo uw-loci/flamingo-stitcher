@@ -184,14 +184,23 @@ except Exception:
     _DASK_PROCESSING_CHUNKS = (64, 512, 512)
 
 
-# Rough cold-start time-estimate constants (seconds). Only used when the timing
-# cache has no measured total for a config — deliberately approximate (the user
-# is told it's a guess) and superseded by real timings as runs accumulate.
-#   _ROUGH_S_PER_TILE_CH : load + preprocess + registration share, per tile per
-#                          channel (weakly plane-dependent, folded into below).
-#   _ROUGH_S_PER_OUT_UNIT: fuse + write, per (tile × plane × channel) of OUTPUT
-#                          voxels, i.e. after XY/Z downsampling.
-_ROUGH_S_PER_TILE_CH = 4.0
+# Rough cold-start time-estimate constants. Only used when the timing cache has
+# no measured total for a config — deliberately approximate (order-of-magnitude)
+# and superseded by real timings and by the live progress extrapolation as the
+# run proceeds. The point of the cold-start prior is only to put the FIRST few
+# estimates in the right ballpark; the live ETA self-corrects from actual pace.
+#   _ROUGH_LOAD_MBPS   : effective throughput of the load + preprocess phase
+#                          (raw read + illumination fuse + downsample), MB of
+#                          INPUT per second. Input volume dominates this phase,
+#                          so it's sized from the actual on-disk bytes rather
+#                          than a flat per-tile guess (a 1662-plane 2-illumination
+#                          tile costs far more than a 200-plane single-illum one).
+#   _ROUGH_S_PER_TILE_CH : small fixed per-tile-per-channel overhead (open/seek/
+#                          registration), on top of the volume term.
+#   _ROUGH_S_PER_OUT_UNIT: fuse + write, per OUTPUT voxel-unit (tile × plane ×
+#                          channel after XY/Z downsampling).
+_ROUGH_LOAD_MBPS = 200.0
+_ROUGH_S_PER_TILE_CH = 1.5
 _ROUGH_S_PER_OUT_UNIT = 0.08
 
 
@@ -263,7 +272,19 @@ def rough_run_seconds(tiles, config) -> float:
     ds_xy = max(1, getattr(config, "downsample_xy", 1) or 1)
     ds_z = max(1, getattr(config, "downsample_z", 1) or 1)
 
-    load_register = _ROUGH_S_PER_TILE_CH * n_tiles * n_channels
+    # Load + preprocess is dominated by moving the raw input through
+    # read → illumination-fuse → downsample, so size it from actual on-disk
+    # bytes (planes × frame area × 2 bytes × illumination sides × channels).
+    in_bytes = 0.0
+    for t in tiles:
+        fw = int(getattr(t, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+        fh = int(getattr(t, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
+        n_illum = max(1, len(getattr(t, "illumination_sides", []) or [0]))
+        in_bytes += float(t.n_planes) * fw * fh * 2.0 * n_illum * n_channels
+    load_seconds = in_bytes / (_ROUGH_LOAD_MBPS * 1e6)
+    overhead = _ROUGH_S_PER_TILE_CH * n_tiles * n_channels
+    load_register = load_seconds + overhead
+
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
     fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
     return load_register + fuse_write
@@ -2322,6 +2343,13 @@ class StitchingPipeline:
         if self._estimator is not None:
             if phase and phase != getattr(self._estimator, "_current_phase", None):
                 self._estimator.start_phase(phase)
+            # Anchor the whole-run ETA to the pipeline's monotone global percent
+            # (per-tile in preprocess, per-region in fusion). This is what makes
+            # the estimate stable and self-correcting.
+            try:
+                self._estimator.update_fraction((pct or 0) / 100.0)
+            except Exception:
+                pass
             tail = self._estimator.format_label()
             if tail and tail != "estimating...":
                 # Separator + explicit "overall:" label so this whole-run ETA
@@ -2450,7 +2478,11 @@ class StitchingPipeline:
             tiles, self.config, acquisition_dir=acquisition_dir, output_dir=output_dir
         )
         self.logger.info(f"Stitching ETA key: {key.serialize()}")
-        return MultiPhaseEstimator(StitchingTimingCache(), key)
+        # Rough cold-start prior (order-of-magnitude); the estimator prefers a
+        # cached measured total when this config has run before, and refines
+        # both live from the global progress fraction.
+        prior = rough_run_seconds(tiles, self.config)
+        return MultiPhaseEstimator(StitchingTimingCache(), key, prior_total_s=prior)
 
     def _build_output_basename(self, acquisition_dir: Path) -> str:
         """Build a descriptive base filename from acquisition path and settings.
@@ -3450,8 +3482,16 @@ class StitchingPipeline:
                                 compute=True,
                                 lock=False,
                             )
+                        # Advance the global percent across regions so the
+                        # (often long) fuse phase drives a live, moving ETA
+                        # instead of sitting at a flat per-channel value. Fuse
+                        # spans ~50–85%; give each channel an equal slice and
+                        # interpolate by completed regions within it.
+                        n_ch = max(len(process_channels), 1)
+                        ch_frac = (ridx + 1) / max(len(regions), 1)
+                        region_pct = 50 + int(35 * (ch_idx + ch_frac) / n_ch)
                         self._progress_fn(
-                            compute_pct,
+                            region_pct,
                             f"Channel {ch_id}: fused region "
                             f"{ridx + 1}/{len(regions)}",
                         )
