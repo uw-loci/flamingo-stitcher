@@ -61,6 +61,14 @@ _SETTINGS_GROUP = "StitchingDialog"
 # file picker reopens there even when the queue is empty.
 _LAST_BROWSE_KEY = "StitchingShared/last_browse_dir"
 
+# Shown in the pinned memory-estimate label before tiles are discovered (the
+# estimate needs the tile geometry), so the always-visible row explains why it's
+# empty rather than just sitting blank.
+_ESTIMATES_PLACEHOLDER = (
+    "<span style='color:#888;'>Discover tiles to see in-memory &amp; streaming "
+    "memory estimates and output size.</span>"
+)
+
 
 def _napari_available() -> bool:
     """True if napari can be imported.
@@ -1041,15 +1049,9 @@ class StitchingDialog(PersistentDialog):
         content_layout.addWidget(self._bg_zero_panel)
 
         # --- Action buttons ---
+        # (Discover Tiles is pinned in the frozen Output row at the top; the
+        # run controls stay here at the bottom.)
         btn_layout = QHBoxLayout()
-
-        self._discover_btn = QPushButton("Discover Tiles")
-        self._discover_btn.setToolTip(
-            "Scan all queued directories for tile data\n"
-            "(optional — Run will auto-discover if needed)"
-        )
-        self._discover_btn.clicked.connect(self._on_discover)
-        btn_layout.addWidget(self._discover_btn)
 
         self._run_btn = QPushButton("Run All")
         self._run_btn.setToolTip(
@@ -1500,6 +1502,17 @@ class StitchingDialog(PersistentDialog):
         out_browse_btn = QPushButton("Browse...")
         out_browse_btn.clicked.connect(self._browse_output_dir)
         row.addWidget(out_browse_btn)
+
+        # Discover Tiles pinned top-right so it's reachable without scrolling to
+        # the action bar. Same widget the action-button logic manages (enable
+        # state / call-to-action styling); it just lives up here now.
+        self._discover_btn = QPushButton("Discover Tiles")
+        self._discover_btn.setToolTip(
+            "Scan all queued directories for tile data\n"
+            "(optional — Run will auto-discover if needed)"
+        )
+        self._discover_btn.clicked.connect(self._on_discover)
+        row.addWidget(self._discover_btn)
         v.addLayout(row)
 
         # One-line summary: dir | ~size | free space. Empty until a dir is set.
@@ -1514,7 +1527,7 @@ class StitchingDialog(PersistentDialog):
         # to use the horizontal space rather than stack tall. =====
         # Memory: in-memory vs streaming peak, colour-coded — the headline the
         # user watches while tuning options. Rich text for per-term colour.
-        self._memory_label = QLabel("")
+        self._memory_label = QLabel(_ESTIMATES_PLACEHOLDER)
         self._memory_label.setTextFormat(Qt.RichText)
         self._memory_label.setWordWrap(True)
         self._memory_label.setStyleSheet("font-size: 11px;")
@@ -2038,7 +2051,7 @@ class StitchingDialog(PersistentDialog):
             ]
 
         if not tile_sets:
-            self._memory_label.setText("")
+            self._memory_label.setText(_ESTIMATES_PLACEHOLDER)
             self._last_mem_estimate = None
             self._update_memory_indicator()
             return
@@ -2147,7 +2160,7 @@ class StitchingDialog(PersistentDialog):
             )
         except Exception as e:
             self._logger.debug(f"Memory estimate failed: {e}")
-            self._memory_label.setText("")
+            self._memory_label.setText(_ESTIMATES_PLACEHOLDER)
             self._last_mem_estimate = None
             self._update_memory_indicator()
         # Time estimate shares the same triggers (config + discovery changes).
