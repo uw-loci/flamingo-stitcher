@@ -52,6 +52,15 @@ SHAREABLE_CONFIG_FIELDS = (
     "tiff_pyramids",
     "background_zero_enabled",
     "background_zero_thresholds",
+    "border_qc_enabled",
+    "border_qc_mode",
+    "border_qc_all_channels",
+    "border_qc_include_z_seams",
+    "border_qc_json",
+    "border_qc_alpha",
+    "border_qc_beta",
+    "border_qc_min_component_px",
+    "border_qc_z_stride",
     # File-specific (recorded for provenance; GUI loader skips these):
     "pixel_size_um",
     "z_step_um",
@@ -668,6 +677,20 @@ class StitchingConfig:
     # stage-only registration) weighted blending produced visible dark seam
     # dips; max holds up and is also lighter on memory than blend.
     tile_overlap_fusion: str = "max"
+
+    # --- Tile-border artifact QC (diagnostic; see border_qc.py) ---
+    # When enabled, after preprocessing the reference channel is scanned for
+    # sharp intensity steps along neighboring-tile seams; a plain-text report is
+    # written next to the run log. Off by default (opt-in diagnostic).
+    border_qc_enabled: bool = False
+    border_qc_mode: str = "mip"  # "mip" (length) | "full" (area+Z) | "pairs"
+    border_qc_all_channels: bool = False  # else reference channel only
+    border_qc_include_z_seams: bool = False  # niche: Z-tiled mosaics
+    border_qc_json: bool = False  # also emit a machine-readable JSON twin
+    border_qc_alpha: float = 4.0  # step vs local-gradient ratio
+    border_qc_beta: float = 3.0  # step vs noise floor
+    border_qc_min_component_px: int = 10  # drop flagged blobs smaller than this
+    border_qc_z_stride: int = 1  # subsample Z in full mode when huge
 
     # OME-Zarr sharding options
     zarr_chunks: Tuple = (32, 256, 256)  # Inner chunk shape (~4 MB per chunk)
@@ -2484,6 +2507,128 @@ class StitchingPipeline:
         prior = rough_run_seconds(tiles, self.config)
         return MultiPhaseEstimator(StitchingTimingCache(), key, prior_total_s=prior)
 
+    # ------------------------------------------------------------------
+    # Tile-border artifact QC (diagnostic)
+    # ------------------------------------------------------------------
+    def _qc_report_dir(self, output_path=None) -> Path:
+        """Directory for the border-QC text report: next to the run log.
+
+        Prefers the active file-log handler's directory (where GUI runs write
+        flamingo-stitcher_*.log); falls back to the output folder, then cwd.
+        """
+        import logging as _logging
+
+        for h in _logging.getLogger().handlers:
+            base = getattr(h, "baseFilename", None)
+            if base:
+                d = Path(base).parent
+                if d.exists():
+                    return d
+        if output_path is not None:
+            try:
+                p = Path(output_path)
+                d = p if p.is_dir() else p.parent
+                d.mkdir(parents=True, exist_ok=True)
+                return d
+            except Exception:
+                pass
+        return Path.cwd()
+
+    def _border_qc_params(self):
+        from flamingo_stitcher import border_qc
+
+        mode = getattr(self.config, "border_qc_mode", "mip")
+        if mode not in border_qc._VALID_MODES:
+            mode = "mip"
+        return border_qc.BorderQCParams(
+            mode=mode,
+            alpha=float(self.config.border_qc_alpha),
+            beta=float(self.config.border_qc_beta),
+            min_component_px=int(self.config.border_qc_min_component_px),
+            z_stride=max(1, int(self.config.border_qc_z_stride)),
+            include_z_seams=bool(self.config.border_qc_include_z_seams),
+        )
+
+    def _run_border_qc(
+        self, channel_tile_data, tiles, acquisition_dir, voxel_size_um, output_path
+    ):
+        """Scan neighbor-tile seams for sharp steps; write a report by the log."""
+        import json as _json
+
+        from flamingo_stitcher import border_qc
+
+        params = self._border_qc_params()
+        self._progress_fn(50, "Running tile-border QC...")
+        self.logger.info(f"Running tile-border artifact QC (mode={params.mode})...")
+        report = border_qc.run_border_qc(
+            channel_tile_data,
+            tiles,
+            pixel_size_um=float(voxel_size_um["x"]),
+            ds_xy=int(self.config.downsample_xy or 1),
+            ds_z=int(self.config.downsample_z or 1),
+            z_step_um=float(voxel_size_um["z"]),
+            reg_channel=int(self.config.reg_channel),
+            params=params,
+            logger=self.logger,
+            cancelled_fn=self._cancelled_fn,
+        )
+        acq_name = Path(acquisition_dir).name or "acquisition"
+        text = border_qc.format_report_text(report, acquisition=acq_name)
+        out_dir = self._qc_report_dir(output_path)
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        report_path = out_dir / f"border_qc_{acq_name}_{stamp}.txt"
+        try:
+            report_path.write_text(text)
+        except Exception as e:
+            self.logger.warning(f"Could not write border-QC report: {e}")
+            report_path = None
+        if self.config.border_qc_json and report_path is not None:
+            try:
+                (report_path.with_suffix(".json")).write_text(
+                    _json.dumps(border_qc.report_to_json(report, acquisition=acq_name), indent=2)
+                )
+            except Exception:
+                pass
+        self.logger.info(
+            f"Border QC: {report.n_pairs_flagged}/{report.n_pairs_checked} seams flagged"
+            + (f" — report at {report_path}" if report_path else "")
+        )
+        # Echo the report into the run log too (flagged pairs only — concise).
+        for line in text.splitlines():
+            self.logger.info(line)
+        return report
+
+    def _run_border_qc_streaming(
+        self, tiles, process_channels, voxel_size_um, output_path,
+        acquisition_dir, reg_reuse_ch, reg_reuse_data,
+    ):
+        """Streaming border QC. Reuses the registered ref-channel spill when
+        available; otherwise materializes the ref channel just for QC."""
+        own_tmp = None
+        try:
+            if reg_reuse_data is not None:
+                ctd = {reg_reuse_ch: reg_reuse_data}
+            else:
+                ref_ch = self.config.reg_channel
+                if ref_ch not in process_channels:
+                    ref_ch = process_channels[0]
+                own_tmp = (
+                    _scratch_base_dir(self.config, output_path)
+                    / ".stitch_tmp"
+                    / f"qc_ch{ref_ch:02d}"
+                )
+                probe = self._preprocess_single_tile(tiles[0], ref_ch)
+                shape = probe.shape
+                del probe
+                data = self._materialize_tiles_to_disk(tiles, ref_ch, shape, own_tmp)
+                ctd = {ref_ch: data}
+            self._run_border_qc(ctd, tiles, acquisition_dir, voxel_size_um, output_path)
+        finally:
+            if own_tmp is not None:
+                import shutil as _shutil
+
+                _shutil.rmtree(own_tmp, ignore_errors=True)
+
     def _build_output_basename(self, acquisition_dir: Path) -> str:
         """Build a descriptive base filename from acquisition path and settings.
 
@@ -2830,6 +2975,16 @@ class StitchingPipeline:
         if self._cancelled_fn():
             self.logger.info("Pipeline cancelled by user")
             return output_path
+
+        # --- Optional: tile-border artifact QC (diagnostic) ---
+        if self.config.border_qc_enabled and not self._cancelled_fn():
+            try:
+                self._run_border_qc(
+                    channel_tile_data, tiles, acquisition_dir,
+                    voxel_size_um, output_path,
+                )
+            except Exception as e:  # QC must never fail a run
+                self.logger.warning(f"Border QC pass failed (skipped): {e}")
 
         # ============================================================
         # IN-MEMORY PATH (original)
@@ -3261,6 +3416,16 @@ class StitchingPipeline:
                 shutil.rmtree(reg_reuse_dir, ignore_errors=True)
             self.logger.info("Pipeline cancelled by user")
             return output_path
+
+        # --- Optional: tile-border artifact QC (diagnostic, streaming) ---
+        if self.config.border_qc_enabled and not self._cancelled_fn():
+            try:
+                self._run_border_qc_streaming(
+                    tiles, process_channels, voxel_size_um, output_path,
+                    acquisition_dir, reg_reuse_ch, reg_reuse_data,
+                )
+            except Exception as e:  # QC must never fail a run
+                self.logger.warning(f"Border QC pass failed (skipped): {e}")
 
         # --- Step 4+5: Fuse each channel, compute, accumulate ---
         # Tile spill-to-disk: each tile is preprocessed exactly once and

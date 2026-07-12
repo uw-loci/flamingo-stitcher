@@ -1001,10 +1001,34 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._chunk_size_combo, 3, 1, 1, 3)
 
-        # Proc Row 4: Legend
+        # Proc Row 4: Tile-border artifact QC (diagnostic)
+        self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
+        self._border_qc_cb.setToolTip(
+            "After preprocessing, scan neighboring-tile seams for sharp\n"
+            "intensity steps (stitching artifacts). Writes a plain-text report\n"
+            "next to the run log listing the offending tile pairs. Reference\n"
+            "channel only; cheap (reads only the thin border strips).\n\n"
+            "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
+            "single-pixel steps."
+        )
+        proc_layout.addWidget(self._border_qc_cb, 4, 0)
+        self._border_qc_label = QLabel("QC detail:")
+        proc_layout.addWidget(self._border_qc_label, 4, 1)
+        self._border_qc_mode_combo = QComboBox()
+        self._border_qc_mode_combo.addItem("MIP length (fast)", "mip")
+        self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
+        self._border_qc_mode_combo.addItem("Pairs only", "pairs")
+        self._border_qc_mode_combo.setToolTip(
+            "MIP length: Z max-project, report affected border length (fast).\n"
+            "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
+            "Pairs only: just the list of offending tile pairs."
+        )
+        proc_layout.addWidget(self._border_qc_mode_combo, 4, 2, 1, 2)
+
+        # Proc Row 5: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 4, 0, 1, 4)
+        proc_layout.addWidget(legend, 5, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
@@ -2345,6 +2369,8 @@ class StitchingDialog(PersistentDialog):
         config.deconvolution_enabled = self._deconv_cb.isChecked()
         config.content_based_fusion = self._content_fusion_cb.isChecked()
         config.skip_registration = self._skip_reg_cb.isChecked()
+        config.border_qc_enabled = self._border_qc_cb.isChecked()
+        config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
         config.registration_binning = self._reg_binning_combo.currentData()
         config.package_ozx = self._ozx_cb.isChecked()
         config.tiff_pyramids = self._tiff_pyramids_cb.isChecked()
@@ -2516,6 +2542,7 @@ class StitchingDialog(PersistentDialog):
             ("registration_binning", self._reg_binning_combo),
             ("streaming_mode", self._streaming_combo),
             ("output_chunksize", self._chunk_size_combo),
+            ("border_qc_mode", self._border_qc_mode_combo),
         ]
         for name, combo in combo_fields:
             if has(name):
@@ -2530,6 +2557,7 @@ class StitchingDialog(PersistentDialog):
             ("skip_registration", self._skip_reg_cb),
             ("package_ozx", self._ozx_cb),
             ("tiff_pyramids", self._tiff_pyramids_cb),
+            ("border_qc_enabled", self._border_qc_cb),
         ]
         for name, cb in check_fields:
             if has(name):
@@ -4166,6 +4194,8 @@ class StitchingDialog(PersistentDialog):
         s.setValue("channels", self._channels_edit.text())
         s.setValue("streaming_mode", self._streaming_combo.currentIndex())
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
+        s.setValue("border_qc", self._border_qc_cb.isChecked())
+        s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
@@ -4313,6 +4343,12 @@ class StitchingDialog(PersistentDialog):
         skip_reg = s.value("skip_registration", False, type=bool)
         self._skip_reg_cb.setChecked(skip_reg)
 
+        self._border_qc_cb.setChecked(s.value("border_qc", False, type=bool))
+        qc_mode = s.value("border_qc_mode", "mip", type=str)
+        _qi = self._border_qc_mode_combo.findData(qc_mode)
+        if _qi >= 0:
+            self._border_qc_mode_combo.setCurrentIndex(_qi)
+
         reg_binning_idx = s.value("reg_binning", 1, type=int)  # default = index 1
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():
             self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
@@ -4429,6 +4465,8 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("channels", self._channels_edit.text())
         s.setValue("streaming_mode", self._streaming_combo.currentIndex())
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
+        s.setValue("border_qc", self._border_qc_cb.isChecked())
+        s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
@@ -4574,6 +4612,12 @@ class NativeStitchingDialog(StitchingDialog):
 
         skip_reg = s.value("skip_registration", False, type=bool)
         self._skip_reg_cb.setChecked(skip_reg)
+
+        self._border_qc_cb.setChecked(s.value("border_qc", False, type=bool))
+        qc_mode = s.value("border_qc_mode", "mip", type=str)
+        _qi = self._border_qc_mode_combo.findData(qc_mode)
+        if _qi >= 0:
+            self._border_qc_mode_combo.setCurrentIndex(_qi)
 
         reg_binning_idx = s.value("reg_binning", 1, type=int)
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():

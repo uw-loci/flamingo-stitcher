@@ -18,7 +18,7 @@ structure (registration works when enabled). Supports 1 or 2 illumination sides.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence, Tuple
+from typing import Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -74,8 +74,15 @@ def write_synth_acquisition(
     z_start_mm: float = 10.0,
     z_step_um: float = 5.0,
     seed: int = 0,
+    inject_border_step: Optional[dict] = None,
 ) -> Path:
-    """Write a tiny synthetic raw acquisition. Returns the acquisition dir."""
+    """Write a tiny synthetic raw acquisition. Returns the acquisition dir.
+
+    ``inject_border_step`` (for border-QC tests) adds a constant to one tile's
+    edge strip so that tile disagrees with its neighbor along that seam. Keys:
+    ``tile=(ix,iy)``, ``edge`` in {left,right,top,bottom}, ``magnitude``,
+    optional ``width_px`` (default = the overlap width) and ``z_slice=(z0,z1)``.
+    """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ny, nx = grid
@@ -114,6 +121,26 @@ def write_synth_acquisition(
             )
             y0, x0 = iy * step_px_y, ix * step_px_x
             crop = field[:, y0 : y0 + h, x0 : x0 + w]
+            if inject_border_step and tuple(inject_border_step["tile"]) == (ix, iy):
+                spec = inject_border_step
+                mag = float(spec["magnitude"])
+                edge = spec.get("edge", "right")
+                zc0, zc1 = spec.get("z_slice", (0, n_planes))
+                ow = max(1, int(round(w * overlap)))
+                oh = max(1, int(round(h * overlap)))
+                wpx = int(spec.get("width_px", ow if edge in ("left", "right") else oh))
+                # along-seam extent (Y for left/right edges, X for top/bottom)
+                a0, a1 = spec.get("along_slice", (0, h if edge in ("left", "right") else w))
+                crop = crop.astype(np.float32).copy()
+                if edge == "right":
+                    crop[zc0:zc1, a0:a1, -wpx:] += mag
+                elif edge == "left":
+                    crop[zc0:zc1, a0:a1, :wpx] += mag
+                elif edge == "bottom":
+                    crop[zc0:zc1, -wpx:, a0:a1] += mag
+                elif edge == "top":
+                    crop[zc0:zc1, :wpx, a0:a1] += mag
+                crop = np.clip(crop, 0, _UINT16_MAX).astype(field.dtype)
             for ci, ch in enumerate(channels):
                 scale = 1.0 - 0.25 * ci
                 for s in illum_sides:

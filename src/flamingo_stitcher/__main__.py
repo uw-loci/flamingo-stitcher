@@ -170,6 +170,22 @@ def main():
         help="Channel indices to process (default: all)",
     )
 
+    # QC / diagnostics
+    qc_group = parser.add_argument_group("QC & diagnostics")
+    qc_group.add_argument(
+        "--border-qc",
+        action="store_true",
+        help="Scan neighboring-tile seams for sharp intensity steps and write a "
+        "text report next to the run log",
+    )
+    qc_group.add_argument(
+        "--border-qc-mode",
+        choices=("mip", "full", "pairs"),
+        default="mip",
+        help="Border-QC detail: mip=border length (fast), full=area+Z-range, "
+        "pairs=offending pairs only (default: mip)",
+    )
+
     # Output format
     output_group = parser.add_argument_group("Output")
     output_group.add_argument(
@@ -313,6 +329,8 @@ def main():
         deconvolution_enabled=args.deconvolution,
         deconvolution_engine=args.deconv_engine,
         deconvolution_iterations=args.deconv_iterations,
+        border_qc_enabled=args.border_qc,
+        border_qc_mode=args.border_qc_mode,
     )
 
     # Output path
