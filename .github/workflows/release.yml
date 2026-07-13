@@ -22,6 +22,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Full history + tag objects so we can read the annotated tag's
+          # message (used as the release notes / in-app "What's new" box).
+          fetch-depth: 0
 
       - name: Derive version
         id: ver
@@ -90,10 +94,32 @@ jobs:
           name: FlamingoStitcher-Setup-${{ steps.ver.outputs.version }}
           path: installer/Output/*.exe
 
+      - name: Build release notes from the tag message
+        # The annotated tag's message body is the curated changelog. It becomes
+        # the release notes AND the text the in-app updater shows in its
+        # "What's new" box. Falls back to the full tag/commit message if there's
+        # no separate body, then to a minimal line so the notes are never empty.
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:body)')
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)')
+          fi
+          if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
+            BODY="Flamingo Stitcher ${{ steps.ver.outputs.version }}"
+          fi
+          printf '%s\n' "$BODY" > RELEASE_NOTES.md
+          echo "Release notes ($(wc -l < RELEASE_NOTES.md) lines):"
+          cat RELEASE_NOTES.md
+
       - name: Attach installer to GitHub Release
         if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v2
         with:
           files: installer/Output/*.exe
+          # Curated tag notes first; GitHub's auto-generated changelog (commit
+          # list + compare link) is appended below them.
+          body_path: RELEASE_NOTES.md
           generate_release_notes: true
           fail_on_unmatched_files: true
