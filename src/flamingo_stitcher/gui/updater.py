@@ -40,6 +40,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QProgressDialog,
     QPushButton,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -117,8 +118,8 @@ def fetch_latest_release_info(api_url: str) -> dict:
     Returns a dict with keys ``tag`` (raw GitHub tag, e.g. ``v0.1.4``),
     ``latest_version`` (the bare semver with a leading ``v`` stripped, for
     direct comparison with ``__version__``), ``html_url`` (the release page),
-    ``asset_url`` (installer download URL, or None), and ``asset_size``
-    (bytes, or None).
+    ``asset_url`` (installer download URL, or None), ``asset_size``
+    (bytes, or None), and ``body`` (the release notes / changelog text).
     """
     import json
     import urllib.request
@@ -148,6 +149,7 @@ def fetch_latest_release_info(api_url: str) -> dict:
         "html_url": str(data.get("html_url") or RELEASES_PAGE_URL),
         "asset_url": asset_url,
         "asset_size": asset_size,
+        "body": str(data.get("body") or ""),
     }
 
 
@@ -209,6 +211,7 @@ class UpdatePanel(QWidget):
         self._latest_url: Optional[str] = None
         self._latest_size: Optional[int] = None
         self._latest_version: Optional[str] = None
+        self._latest_notes: str = ""  # release notes / changelog text
         # Set when the user clicks "Update now" in the launch notification
         # before the asset URL is known; the next result consumes it and fires
         # the install instead of just updating the tab.
@@ -421,6 +424,7 @@ class UpdatePanel(QWidget):
         self._latest_url = payload.get("asset_url")
         self._latest_size = payload.get("asset_size")
         self._latest_version = latest
+        self._latest_notes = str(payload.get("body") or "")
 
         if _can_install_in_place(self._latest_url):
             self.btn_install.setText(f"Install update {latest}")
@@ -520,7 +524,7 @@ class UpdatePanel(QWidget):
         dlg = QDialog(self._window)
         dlg.setWindowTitle("Update available")
         dlg.setWindowIcon(self._window.windowIcon())
-        dlg.setMinimumWidth(380)
+        dlg.setMinimumWidth(460)
 
         layout = QVBoxLayout(dlg)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -541,6 +545,29 @@ class UpdatePanel(QWidget):
         )
         body.setWordWrap(True)
         layout.addWidget(body)
+
+        # Release notes ("What's new") in a read-only, scrolling box so a long
+        # changelog doesn't blow up the dialog. Rendered as Markdown when the Qt
+        # build supports it, else as plain text. Omitted when notes are empty
+        # (e.g. the cached-restore path, before a fresh check has run).
+        notes = (self._latest_notes or "").strip()
+        if notes:
+            notes_head = QLabel("What's new:")
+            nf = QFont(notes_head.font())
+            nf.setBold(True)
+            notes_head.setFont(nf)
+            layout.addWidget(notes_head)
+
+            notes_box = QTextEdit()
+            notes_box.setReadOnly(True)
+            notes_box.setMinimumHeight(150)
+            notes_box.setMaximumHeight(300)
+            notes_box.setLineWrapMode(QTextEdit.WidgetWidth)
+            try:
+                notes_box.setMarkdown(notes)
+            except Exception:
+                notes_box.setPlainText(notes)
+            layout.addWidget(notes_box)
 
         footer = QHBoxLayout()
         footer.addStretch(1)
