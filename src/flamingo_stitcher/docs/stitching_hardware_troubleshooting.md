@@ -273,6 +273,18 @@ See §8 of `lightsheet_stitching_options.md` for the install recipe.
 The Imaris option in the format dropdown disables itself when
 `import PyImarisWriter` fails.
 
+### Symptom: visible seams — a sharp step in brightness along tile borders
+
+Turn on **Detect border artifacts (QC)** in Processing Options (or
+`--border-qc` on the CLI) and re-run. It scans neighboring-tile seams
+for sharp ~1-pixel intensity steps and writes a plain-text report **next
+to the run log** listing the offending tile pairs (X↔Y, affected border
+length or area + Z-range). Reference channel only; cheap (reads just the
+thin border strips). Detection is most sensitive at **downsample_xy ≤ 2**
+— heavy XY downsampling averages a single-pixel step away. This tells you
+*which* seams are bad; likely causes to chase next are a flat-field /
+exposure mismatch between tiles, or misregistration.
+
 ---
 
 ## 3. Cross-System Gotchas
