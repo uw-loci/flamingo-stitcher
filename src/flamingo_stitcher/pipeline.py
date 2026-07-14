@@ -3682,6 +3682,17 @@ class StitchingPipeline:
                                 compute=True,
                                 lock=False,
                             )
+                        # Flush this region's writes so dirty pages of the
+                        # (multi-hundred-GB) fused memmap don't accumulate across
+                        # all regions. Without this the OS defers write-back and
+                        # the process working set balloons far past the modeled
+                        # fuse allocation (the on-disk fused output is meant to be
+                        # off-RAM) — which on Windows (USS counts modified
+                        # file-mapped pages) tripped the memory watchdog with a
+                        # figure that is write-back lag, not real allocation. The
+                        # msync only writes the ~region-sized dirty set, so it's
+                        # cheap next to the region's fuse compute.
+                        stacked.flush()
                         # Advance the global percent across regions so the
                         # (often long) fuse phase drives a live, moving ETA
                         # instead of sitting at a flat per-channel value. Fuse
