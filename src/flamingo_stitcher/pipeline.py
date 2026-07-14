@@ -2603,31 +2603,58 @@ class StitchingPipeline:
         acquisition_dir, reg_reuse_ch, reg_reuse_data,
     ):
         """Streaming border QC. Reuses the registered ref-channel spill when
-        available; otherwise materializes the ref channel just for QC."""
-        own_tmp = None
-        try:
-            if reg_reuse_data is not None:
-                ctd = {reg_reuse_ch: reg_reuse_data}
-            else:
-                ref_ch = self.config.reg_channel
-                if ref_ch not in process_channels:
-                    ref_ch = process_channels[0]
-                own_tmp = (
-                    _scratch_base_dir(self.config, output_path)
-                    / ".stitch_tmp"
-                    / f"qc_ch{ref_ch:02d}"
-                )
-                probe = self._preprocess_single_tile(tiles[0], ref_ch)
-                shape = probe.shape
-                del probe
-                data = self._materialize_tiles_to_disk(tiles, ref_ch, shape, own_tmp)
-                ctd = {ref_ch: data}
-            self._run_border_qc(ctd, tiles, acquisition_dir, voxel_size_um, output_path)
-        finally:
-            if own_tmp is not None:
-                import shutil as _shutil
+        available; otherwise materializes the ref channel just for QC.
 
-                _shutil.rmtree(own_tmp, ignore_errors=True)
+        Returns ``(ref_ch, tile_data, tmp_dir)`` for a spill this method
+        materialized itself (registration was skipped, so there was none to
+        reuse) so the caller can hand it to the fusion loop instead of
+        preprocessing + spilling every tile a *second* time; returns
+        ``(None, None, None)`` when it reused the registration spill (nothing
+        new to hand off).
+        """
+        if reg_reuse_data is not None:
+            # Reuse the registration spill; we own nothing to hand back.
+            self._run_border_qc(
+                {reg_reuse_ch: reg_reuse_data}, tiles,
+                acquisition_dir, voxel_size_um, output_path,
+            )
+            return None, None, None
+
+        ref_ch = self.config.reg_channel
+        if ref_ch not in process_channels:
+            ref_ch = process_channels[0]
+        own_tmp = (
+            _scratch_base_dir(self.config, output_path)
+            / ".stitch_tmp"
+            / f"qc_ch{ref_ch:02d}"
+        )
+        # Materialize the reference channel once. A hard failure here leaves a
+        # useless partial spill — drop it and re-raise (the caller swallows).
+        try:
+            probe = self._preprocess_single_tile(tiles[0], ref_ch)
+            shape = probe.shape
+            del probe
+            data = self._materialize_tiles_to_disk(tiles, ref_ch, shape, own_tmp)
+        except BaseException:
+            import shutil as _shutil
+
+            _shutil.rmtree(own_tmp, ignore_errors=True)
+            raise
+
+        # The report itself is best-effort: a failure must not discard the
+        # freshly-materialized spill, which the fusion loop will reuse.
+        try:
+            self._run_border_qc(
+                {ref_ch: data}, tiles,
+                acquisition_dir, voxel_size_um, output_path,
+            )
+        except Exception as e:
+            self.logger.warning(f"Border QC report failed (skipped): {e}")
+
+        # Hand the spill back so the fusion loop reuses it instead of doing a
+        # full second preprocess pass of every tile (the redundant pass this
+        # method used to force when registration was skipped).
+        return ref_ch, data, own_tmp
 
     def _build_output_basename(self, acquisition_dir: Path) -> str:
         """Build a descriptive base filename from acquisition path and settings.
@@ -3420,10 +3447,18 @@ class StitchingPipeline:
         # --- Optional: tile-border artifact QC (diagnostic, streaming) ---
         if self.config.border_qc_enabled and not self._cancelled_fn():
             try:
-                self._run_border_qc_streaming(
+                qc_ch, qc_data, qc_dir = self._run_border_qc_streaming(
                     tiles, process_channels, voxel_size_um, output_path,
                     acquisition_dir, reg_reuse_ch, reg_reuse_data,
                 )
+                # If QC materialized its own ref-channel spill (registration was
+                # skipped, so there was none to reuse), keep it and hand it to
+                # the fusion loop below — otherwise QC silently doubles the
+                # preprocess (a full extra spill of every tile).
+                if qc_data is not None and reg_reuse_data is None:
+                    reg_reuse_ch = qc_ch
+                    reg_reuse_data = qc_data
+                    reg_reuse_dir = qc_dir
             except Exception as e:  # QC must never fail a run
                 self.logger.warning(f"Border QC pass failed (skipped): {e}")
 

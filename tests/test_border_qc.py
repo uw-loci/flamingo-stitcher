@@ -226,6 +226,58 @@ def test_end_to_end_flags_injected_seam(tmp_path):
     assert z0 <= 6 and z1 >= 9
 
 
+def test_streaming_qc_reuses_spill_when_registration_skipped(tmp_path):
+    """With registration skipped + border QC on, the reference channel must be
+    materialized to disk ONCE: QC's own spill is handed to the fusion loop
+    instead of being deleted and re-preprocessed. Regression guard for the
+    doubled-preprocess bug (QC → qc_chNN, fusion → chNN)."""
+    pytest.importorskip("multiview_stitcher")
+    pytest.importorskip("tifffile")
+    from _synth_acq import write_synth_acquisition
+
+    from flamingo_stitcher.pipeline import (
+        StitchingConfig,
+        StitchingPipeline,
+        discover_tiles,
+    )
+
+    acq = write_synth_acquisition(
+        tmp_path / "acq",
+        grid=(2, 2),
+        overlap=0.2,
+        n_planes=8,
+        channels=(3,),
+        illum_sides=(0,),
+        frame_size=(48, 48),
+    )
+    assert len(discover_tiles(acq)) == 4
+
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.skip_registration = True
+    cfg.streaming_mode = True
+    cfg.output_format = "ome-tiff"
+    cfg.resource_guard_enabled = False
+    cfg.flat_field_correction = False
+    cfg.reg_channel = 3
+    cfg.border_qc_enabled = True
+    cfg.border_qc_mode = "mip"
+    cfg.output_chunksize = {"z": 4, "y": 16, "x": 16}
+
+    pipe = StitchingPipeline(cfg)
+    calls = {"n": 0}
+    orig = pipe._materialize_tiles_to_disk
+
+    def counting(*a, **k):
+        calls["n"] += 1
+        return orig(*a, **k)
+
+    pipe._materialize_tiles_to_disk = counting
+    pipe.run(acq, tmp_path / "out")
+
+    # One materialize pass for the single (reference) channel — not two.
+    assert calls["n"] == 1, f"expected 1 materialize pass, got {calls['n']}"
+
+
 def test_find_neighbor_pairs_skips_gap():
     # Missing middle tile in a row -> the gap yields no X-pair across it.
     tiles = [_T(0.0, 0.0), _T(2.0, 0.0)]  # gap of 2*pitch
