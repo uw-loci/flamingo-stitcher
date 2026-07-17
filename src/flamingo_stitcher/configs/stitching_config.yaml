@@ -48,12 +48,22 @@ registration:
     y: 4
     x: 4
 
-  # Minimum phase-correlation quality score (0.0 - 1.0).
-  # Tile pairs below this threshold are treated as unregistered.
-  # Lower values accept noisier matches (useful for sparse/dim data).
-  # Higher values reject questionable matches (use for high-SNR data).
+  # Minimum phase-correlation quality score (0.0 - 1.0, Spearman correlation).
+  # Tile pairs below this threshold are treated as unregistered (tiles fall
+  # back to their stage position). Lower values accept noisier matches
+  # (useful for sparse/dim data); higher values reject questionable matches.
+  # 0.2 proved too permissive — low-content tiles (background / featureless
+  # bright blur) cleared it with a garbage shift; 0.4 rejects those.
   # Typical range: 0.1 (lenient) to 0.5 (strict).
-  quality_threshold: 0.2
+  quality_threshold: 0.4
+
+  # Maximum distance (µm) a tile may be moved from its stage position by
+  # registration. multiview-stitcher's phase correlation bounds a shift to the
+  # tile SIZE, not the overlap, so a low-content tile can be flung ~a full tile
+  # away and open a gap. After registration, any tile whose correction exceeds
+  # this is reset to its stage position. 0.0 = auto: the smaller of the X/Y
+  # overlap widths, so a tile can never move more than one overlap (no gaps).
+  max_shift_um: 0.0
 
   # Global optimization — iterative edge-pruning inspired by BigStitcher
   # (Horl et al., Nature Methods 2019).

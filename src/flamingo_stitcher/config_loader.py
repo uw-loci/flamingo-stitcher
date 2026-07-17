@@ -308,6 +308,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         }
     if reg.get("quality_threshold") is not None:
         config_obj.quality_threshold = float(reg["quality_threshold"])
+    if reg.get("max_shift_um") is not None:
+        config_obj.max_registration_shift_um = float(reg["max_shift_um"])
     gopt = reg.get("global_optimization", {})
     if gopt.get("absolute_tolerance") is not None:
         config_obj.global_opt_abs_tol = float(gopt["absolute_tolerance"])

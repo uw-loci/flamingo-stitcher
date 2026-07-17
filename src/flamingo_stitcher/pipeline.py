@@ -46,6 +46,8 @@ SHAREABLE_CONFIG_FIELDS = (
     "downsample_z",
     "skip_registration",
     "registration_binning",
+    "quality_threshold",
+    "max_registration_shift_um",
     "streaming_mode",
     "output_chunksize",
     "package_ozx",
@@ -608,7 +610,18 @@ class StitchingConfig:
     registration_binning: Dict[str, int] = field(
         default_factory=lambda: {"z": 2, "y": 4, "x": 4}
     )
-    quality_threshold: float = 0.2  # Min phase correlation quality
+    quality_threshold: float = 0.4  # Min phase-correlation quality (Spearman).
+    # Was 0.2 — too permissive: low-content tiles (background / featureless
+    # bright blur) clear a 0.2 correlation with a garbage shift. 0.4 makes those
+    # pairs fall back to the stage position instead of being trusted.
+    # Max distance (µm) a tile may be moved from its stage position by
+    # registration. multiview-stitcher's phase correlation bounds the shift to
+    # the tile SIZE, not the overlap, so a low-content tile can be flung ~a full
+    # tile away, opening gaps. After registration, any tile whose net lateral
+    # correction exceeds this bound is reverted to its stage position (see
+    # _register_tiles). 0.0 = auto: use the smaller of the X/Y overlap widths, so
+    # a tile can never move more than one overlap (gaps become impossible).
+    max_registration_shift_um: float = 0.0
     # Global optimization residual thresholds — inspired by BigStitcher's
     # iterative edge-pruning algorithm (Hörl et al., Nature Methods 2019).
     # Edges with residuals exceeding abs_tol are removed (if graph stays
@@ -4412,8 +4425,11 @@ class StitchingPipeline:
                         "rel_tol": self.config.global_opt_rel_tol,
                     },
                 )
+            params = self._clamp_registration_shifts(
+                list(params), tile_data, voxel_size_um
+            )
             self.logger.info("  Registration complete")
-            return list(params), "registered"
+            return params, "registered"
 
         except Exception as e:
             self.logger.error(f"  Registration failed: {e}")
@@ -4422,6 +4438,97 @@ class StitchingPipeline:
 
         finally:
             reg_logger.setLevel(_saved_level)
+
+    def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):
+        """Revert tiles that registration moved farther than the expected
+        overlap back to their stage position.
+
+        multiview-stitcher's phase correlation bounds a pairwise shift to the
+        tile SIZE, not the overlap (see registration.phase_correlation_
+        registration: ``max_shift_per_dim = max(im.shape)``), so a low-content
+        tile — background, or a featureless bright blur — can be flung most of a
+        tile away on a garbage correlation peak and open a gap between tiles.
+
+        Cap each tile's net per-axis correction at ``max_registration_shift_um``
+        (0 = auto: the smaller of the X/Y overlap widths, so a tile can never
+        move more than one overlap → gaps become impossible). Over-budget tiles
+        are reset to identity, i.e. their stage position — never worse than
+        stage-only mode for that tile. Returns the (possibly clamped) params.
+        """
+        import numpy as _np
+
+        n = len(params)
+        if n == 0:
+            return params
+
+        # Frame extent (µm) from the reference volume + processing voxel size.
+        try:
+            shp = tile_data[0][0].shape
+            ny, nx = int(shp[-2]), int(shp[-1])
+        except Exception:
+            return params  # can't size the bound → leave params untouched
+        vx = float(voxel_size_um.get("x", 1.0))
+        vy = float(voxel_size_um.get("y", 1.0))
+        frame_x_um, frame_y_um = nx * vx, ny * vy
+
+        def _min_pitch_um(vals):
+            u = sorted({round(v, 4) for v in vals})
+            gaps = [b - a for a, b in zip(u, u[1:]) if b - a > 1e-6]
+            return (min(gaps) * 1000.0) if gaps else None
+
+        xpitch = _min_pitch_um([t.x_mm for _v, t in tile_data])
+        ypitch = _min_pitch_um([t.y_mm for _v, t in tile_data])
+        overlaps = [
+            o
+            for o in (
+                (frame_x_um - xpitch) if xpitch is not None else None,
+                (frame_y_um - ypitch) if ypitch is not None else None,
+            )
+            if o is not None and o > 0
+        ]
+
+        bound = float(getattr(self.config, "max_registration_shift_um", 0.0) or 0.0)
+        auto = bound <= 0.0
+        if auto:
+            bound = min(overlaps) if overlaps else 0.1 * min(frame_x_um, frame_y_um)
+        # Never revert on a sub-pixel rounding quirk.
+        bound = max(bound, 2.0 * max(vx, vy))
+
+        clamped = []
+        n_reverted = 0
+        max_seen = 0.0
+        for param in params:
+            try:
+                arr = _np.asarray(param)
+                if arr.ndim == 3:  # leading singleton time axis (t, x_in, x_out)
+                    arr = arr[0]
+                mag = float(_np.max(_np.abs(arr[:3, 3])))  # (z, y, x) shift in µm
+            except Exception:
+                clamped.append(param)
+                continue
+            max_seen = max(max_seen, mag)
+            if mag > bound and hasattr(param, "copy"):
+                # Reset to stage position by zeroing the correction, in place on
+                # a copy so the param keeps its exact type + coords (xr.DataArray
+                # for real MVS params, ndarray in tests) — a bare identity would
+                # drop the coords rebase_affine needs downstream.
+                reverted = param.copy()
+                buf = reverted.values if hasattr(reverted, "values") else reverted
+                mat = buf[0] if buf.ndim == 3 else buf
+                mat[:3, :3] = _np.eye(3)
+                mat[:3, 3] = 0.0
+                clamped.append(reverted)
+                n_reverted += 1
+            else:
+                clamped.append(param)
+
+        src = "auto=min overlap width" if auto else "config"
+        self.logger.info(
+            f"  Registration shift clamp: bound {bound:.1f} µm ({src}); "
+            f"{n_reverted}/{n} tiles exceeded it and were reset to their stage "
+            f"position (max shift seen {max_seen:.1f} µm)."
+        )
+        return clamped
 
     def _fuse_with_fallback(self, fuse_fn, sims, fuse_kwargs):
         """Call multiview_stitcher.fusion.fuse, retrying without
@@ -4996,6 +5103,10 @@ class StitchingPipeline:
                             "rel_tol": self.config.global_opt_rel_tol,
                         },
                     )
+
+                params = self._clamp_registration_shifts(
+                    list(params), tile_data, voxel_size_um
+                )
 
                 # Apply transforms
                 for msim, param in zip(msims, params):
