@@ -966,8 +966,32 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._reg_binning_combo, 2, 2, 1, 2)
 
-        # Proc Row 3: Fusion chunk size
-        proc_layout.addWidget(QLabel("Fusion chunk size:"), 3, 0)
+        # Proc Row 3: Max registration shift (registration sub-option; only
+        # meaningful when registration runs, so it greys out with Skip reg).
+        self._max_reg_shift_label = QLabel("Max reg. shift:")
+        proc_layout.addWidget(self._max_reg_shift_label, 3, 0)
+        self._max_reg_shift_spin = _NoScrollDoubleSpinBox()
+        self._max_reg_shift_spin.setRange(0.0, 100000.0)
+        self._max_reg_shift_spin.setDecimals(1)
+        self._max_reg_shift_spin.setSingleStep(5.0)
+        self._max_reg_shift_spin.setSuffix(" µm")
+        # 0 shows "Auto" — the pipeline then uses one overlap width as the cap.
+        self._max_reg_shift_spin.setSpecialValueText("Auto (one overlap)")
+        self._max_reg_shift_spin.setValue(0.0)
+        self._max_reg_shift_spin.setToolTip(
+            "Cap how far registration may move a tile from its stage position.\n\n"
+            "multiview-stitcher bounds a phase-correlation shift to the tile SIZE,\n"
+            "not the overlap, so a low-content tile (background / featureless blur)\n"
+            "can be flung ~a full tile away and open a gap. Tiles whose correction\n"
+            "exceeds this cap are reset to their stage position.\n\n"
+            "Auto (0) = the smaller of the X/Y overlap widths, so a tile can never\n"
+            "move more than one overlap (gaps impossible). Set a smaller value to\n"
+            "allow only fine refinement. Ignored when Skip registration is on."
+        )
+        proc_layout.addWidget(self._max_reg_shift_spin, 3, 1, 1, 3)
+
+        # Proc Row 4: Fusion chunk size
+        proc_layout.addWidget(QLabel("Fusion chunk size:"), 4, 0)
         self._chunk_size_combo = QComboBox()
         # Dask graph granularity for the fuse step. Separate from
         # zarr_chunks (the final storage chunk size that determines
@@ -999,9 +1023,9 @@ class StitchingDialog(PersistentDialog):
             "step is unexpectedly slow and you have RAM headroom.\n"
             "Small helps on tight-RAM systems at the cost of throughput."
         )
-        proc_layout.addWidget(self._chunk_size_combo, 3, 1, 1, 3)
+        proc_layout.addWidget(self._chunk_size_combo, 4, 1, 1, 3)
 
-        # Proc Row 4: Tile-border artifact QC (diagnostic)
+        # Proc Row 5: Tile-border artifact QC (diagnostic)
         self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
         self._border_qc_cb.setToolTip(
             "After preprocessing, scan neighboring-tile seams for sharp\n"
@@ -1011,9 +1035,9 @@ class StitchingDialog(PersistentDialog):
             "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
             "single-pixel steps."
         )
-        proc_layout.addWidget(self._border_qc_cb, 4, 0)
+        proc_layout.addWidget(self._border_qc_cb, 5, 0)
         self._border_qc_label = QLabel("QC detail:")
-        proc_layout.addWidget(self._border_qc_label, 4, 1)
+        proc_layout.addWidget(self._border_qc_label, 5, 1)
         self._border_qc_mode_combo = QComboBox()
         self._border_qc_mode_combo.addItem("MIP length (fast)", "mip")
         self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
@@ -1023,12 +1047,12 @@ class StitchingDialog(PersistentDialog):
             "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
             "Pairs only: just the list of offending tile pairs."
         )
-        proc_layout.addWidget(self._border_qc_mode_combo, 4, 2, 1, 2)
+        proc_layout.addWidget(self._border_qc_mode_combo, 5, 2, 1, 2)
 
-        # Proc Row 5: Legend
+        # Proc Row 6: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 5, 0, 1, 4)
+        proc_layout.addWidget(legend, 6, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
@@ -1993,6 +2017,9 @@ class StitchingDialog(PersistentDialog):
         """Enable/disable registration controls based on skip state."""
         self._reg_binning_combo.setEnabled(not checked)
         self._reg_binning_label.setEnabled(not checked)
+        # Max reg. shift only applies when registration runs.
+        self._max_reg_shift_spin.setEnabled(not checked)
+        self._max_reg_shift_label.setEnabled(not checked)
 
     def _on_downsample_xy_changed(self, _index: int):
         """Grey out Z combo when XY is iso (iso overrides both factors)."""
@@ -2369,6 +2396,7 @@ class StitchingDialog(PersistentDialog):
         config.deconvolution_enabled = self._deconv_cb.isChecked()
         config.content_based_fusion = self._content_fusion_cb.isChecked()
         config.skip_registration = self._skip_reg_cb.isChecked()
+        config.max_registration_shift_um = float(self._max_reg_shift_spin.value())
         config.border_qc_enabled = self._border_qc_cb.isChecked()
         config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
         config.registration_binning = self._reg_binning_combo.currentData()
@@ -2563,6 +2591,11 @@ class StitchingDialog(PersistentDialog):
             if has(name):
                 cb.setChecked(bool(cfg[name]))
                 applied += 1
+
+        # Spin-box value fields.
+        if has("max_registration_shift_um"):
+            self._max_reg_shift_spin.setValue(float(cfg["max_registration_shift_um"]))
+            applied += 1
 
         # Background zeroing: enable state now; per-channel thresholds can only
         # be applied once channels are known, so stash them for replay after
@@ -4197,6 +4230,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("border_qc", self._border_qc_cb.isChecked())
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
+        s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
@@ -4352,6 +4386,7 @@ class StitchingDialog(PersistentDialog):
         reg_binning_idx = s.value("reg_binning", 1, type=int)  # default = index 1
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():
             self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
+        self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
@@ -4468,6 +4503,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("border_qc", self._border_qc_cb.isChecked())
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
+        s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
@@ -4622,6 +4658,7 @@ class NativeStitchingDialog(StitchingDialog):
         reg_binning_idx = s.value("reg_binning", 1, type=int)
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():
             self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
+        self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
