@@ -109,6 +109,32 @@ def _get_git_version() -> Optional[str]:
     return None
 
 
+def stitcher_provenance() -> Dict[str, Any]:
+    """Software-provenance fields for embedding in stitch_metadata.json.
+
+    Records the Flamingo Stitcher version, whether this was a frozen (installer)
+    or source build, and — for source builds — the git describe string. This is
+    what lets anyone reading a stitched output later know exactly which stitcher
+    produced it. Every lookup is best-effort so it can never break a run.
+    """
+    import sys
+
+    try:
+        from flamingo_stitcher import __version__ as fs_version
+    except Exception:
+        fs_version = "?"
+
+    frozen = bool(getattr(sys, "frozen", False))
+    prov: Dict[str, Any] = {
+        "stitcher_version": fs_version,
+        "stitcher_build": "frozen" if frozen else "source",
+    }
+    git = _get_git_version() if not frozen else None
+    if git:
+        prov["stitcher_git"] = git
+    return prov
+
+
 def _pkg_version(dist_name: str) -> str:
     """Installed version of a distribution, or '?' if unavailable.
 
@@ -4985,6 +5011,7 @@ class StitchingPipeline:
 
         metadata = {
             "version": 2,
+            **stitcher_provenance(),
             "source_acquisition": str(acquisition_dir),
             "voxel_size_um": voxel_size_um,
             "store_path": store_path,
@@ -5315,6 +5342,7 @@ class StitchingPipeline:
             }
 
         metadata = {
+            **stitcher_provenance(),
             "source_acquisition": str(acquisition_dir),
             "voxel_size_um": voxel_size_um,
             "downsample_xy": self.config.downsample_xy,
