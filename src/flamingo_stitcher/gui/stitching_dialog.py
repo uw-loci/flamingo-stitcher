@@ -9,7 +9,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PyQt5.QtCore import QProcess, QSettings, Qt, QThread, pyqtSignal
+from PyQt5.QtCore import QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
 from PyQt5.QtWidgets import (
     QAbstractItemView,
@@ -399,6 +399,30 @@ class StitchingDialog(PersistentDialog):
         queue_layout.addWidget(self._queue_table)
 
         queue_btn_layout = QHBoxLayout()
+
+        # Discover Tiles is the FIRST action in the queue row and is accent-
+        # coloured to draw the eye — it's the easy-to-forget step between adding
+        # directories and running. It flashes while the queue has items added
+        # since the last Discover (see _discover_needed and the flash timer).
+        self._discover_btn = QPushButton("Discover Tiles")
+        self._discover_btn.setToolTip(
+            "Scan all queued directories for tile data so channels, frame size\n"
+            "and Z step are detected before you Run.\n"
+            "Flashes when directories were added since the last Discover.\n"
+            "(Optional — Run will auto-discover if needed.)"
+        )
+        self._discover_btn.clicked.connect(self._on_discover)
+        queue_btn_layout.addWidget(self._discover_btn)
+
+        # Flash state: True once the queue changes (item added) until Discover
+        # runs. The timer toggles the button between its steady accent style and
+        # a brighter highlight while _discover_needed is set.
+        self._discover_needed = False
+        self._discover_flash_on = False
+        self._discover_flash_timer = QTimer(self)
+        self._discover_flash_timer.setInterval(550)
+        self._discover_flash_timer.timeout.connect(self._on_discover_flash_tick)
+
         self._add_btn = QPushButton("Add...")
         self._add_btn.setToolTip("Add an acquisition directory to the queue")
         self._add_btn.clicked.connect(self._add_to_queue)
@@ -1359,6 +1383,9 @@ class StitchingDialog(PersistentDialog):
                 "output_path": None,
             }
         )
+        # A directory was added, so a Discover is now due — flag it so the
+        # Discover Tiles button flashes until the user runs it.
+        self._discover_needed = True
         self._update_queue_table()
 
         # Auto-set output directory from first item. Also re-set if the field
@@ -1519,19 +1546,18 @@ class StitchingDialog(PersistentDialog):
             self._discover_btn.setEnabled(True)
             self._run_btn.setEnabled(True)
             self._set_btn_green(self._run_btn)
-            self._set_btn_default(self._discover_btn)
         elif self._queue:
             # Queue exists but nothing pending (all done/error)
             self._discover_btn.setEnabled(False)
             self._run_btn.setEnabled(False)
-            self._set_btn_default(self._discover_btn)
             self._set_btn_default(self._run_btn)
         else:
             # Empty queue
             self._discover_btn.setEnabled(False)
             self._run_btn.setEnabled(False)
-            self._set_btn_default(self._discover_btn)
             self._set_btn_default(self._run_btn)
+        # Discover button accent/flash reflects whether a Discover is due.
+        self._refresh_discover_style()
 
     def _build_frozen_output_row(self, parent_layout):
         """Pinned Output row at the very top of the tab.
@@ -1557,17 +1583,6 @@ class StitchingDialog(PersistentDialog):
         out_browse_btn = QPushButton("Browse...")
         out_browse_btn.clicked.connect(self._browse_output_dir)
         row.addWidget(out_browse_btn)
-
-        # Discover Tiles pinned top-right so it's reachable without scrolling to
-        # the action bar. Same widget the action-button logic manages (enable
-        # state / call-to-action styling); it just lives up here now.
-        self._discover_btn = QPushButton("Discover Tiles")
-        self._discover_btn.setToolTip(
-            "Scan all queued directories for tile data\n"
-            "(optional — Run will auto-discover if needed)"
-        )
-        self._discover_btn.clicked.connect(self._on_discover)
-        row.addWidget(self._discover_btn)
         v.addLayout(row)
 
         # One-line summary: dir | ~size | free space. Empty until a dir is set.
@@ -1703,6 +1718,9 @@ class StitchingDialog(PersistentDialog):
                 item["status"] = "error"
                 item["error"] = str(e)
 
+        # Discover has now run for everything pending, so clear the "due" flag
+        # and stop the button flashing.
+        self._discover_needed = False
         self._update_queue_table()
         total = sum(len(it["tiles"]) for it in self._queue if it["tiles"])
         ok = sum(1 for it in pending if it["tiles"])
@@ -3769,6 +3787,53 @@ class StitchingDialog(PersistentDialog):
         """Reset a button to the default (platform) appearance."""
         btn.setStyleSheet("")
 
+    def _set_btn_discover(self, btn, highlight=False):
+        """Accent style for the Discover Tiles button.
+
+        A calm blue accent (steady) so it stands out from the neutral
+        Add/Remove buttons without competing with the green Run call-to-action;
+        an amber highlight is the bright frame used while flashing.
+        """
+        if highlight:
+            bg, hover = "#FFB300", "#FFA000"  # amber flash frame
+        else:
+            bg, hover = "#1E88E5", "#1976D2"  # steady blue accent
+        btn.setStyleSheet(
+            f"QPushButton {{ background-color: {bg}; color: white; "
+            f"font-weight: bold; padding: 6px 14px; }}"
+            f"QPushButton:hover {{ background-color: {hover}; }}"
+            f"QPushButton:disabled {{ background-color: #888; color: #ccc; }}"
+        )
+
+    def _on_discover_flash_tick(self):
+        """Toggle the Discover button between its steady accent and the bright
+        highlight (driven by _discover_flash_timer while a Discover is due)."""
+        self._discover_flash_on = not self._discover_flash_on
+        self._set_btn_discover(self._discover_btn, highlight=self._discover_flash_on)
+
+    def _start_discover_flash(self):
+        if not self._discover_flash_timer.isActive():
+            self._discover_flash_on = True
+            self._set_btn_discover(self._discover_btn, highlight=True)
+            self._discover_flash_timer.start()
+
+    def _stop_discover_flash(self):
+        self._discover_flash_timer.stop()
+        self._discover_flash_on = False
+
+    def _refresh_discover_style(self):
+        """Apply the Discover button's accent/flash style from current state:
+        disabled -> plain; enabled + Discover due -> flashing; enabled +
+        up-to-date -> steady accent."""
+        if not self._discover_btn.isEnabled():
+            self._stop_discover_flash()
+            self._set_btn_default(self._discover_btn)
+        elif self._discover_needed:
+            self._start_discover_flash()
+        else:
+            self._stop_discover_flash()
+            self._set_btn_discover(self._discover_btn, highlight=False)
+
     # --- Logging helper ---
 
     def _log(self, message: str):
@@ -4136,6 +4201,7 @@ class StitchingDialog(PersistentDialog):
         # Lock the panel while the preview is running.
         self._bg_zero_panel.setEnabled(False)
         self._discover_btn.setEnabled(False)
+        self._refresh_discover_style()  # stop flashing while disabled
         self._run_btn.setEnabled(False)
 
         worker = _PreviewWorker(config, acquisition_dir, channels, tiles)
