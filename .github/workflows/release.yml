@@ -102,6 +102,14 @@ jobs:
         if: github.ref_type == 'tag'
         shell: bash
         run: |
+          # actions/checkout on a tag push leaves a LIGHTWEIGHT tag locally, so
+          # %(contents:body) would read the tagged COMMIT's message (including
+          # its "Claude-Session:" trailer) instead of the curated annotated-tag
+          # notes. Re-fetch the real tag object so we read the tag, not the
+          # commit.
+          git fetch --force origin \
+            "refs/tags/${GITHUB_REF_NAME}:refs/tags/${GITHUB_REF_NAME}" || true
+
           BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents:body)')
           if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
             BODY=$(git for-each-ref "refs/tags/${GITHUB_REF_NAME}" --format='%(contents)')
@@ -109,6 +117,9 @@ jobs:
           if [ -z "$(printf '%s' "$BODY" | tr -d '[:space:]')" ]; then
             BODY="Flamingo Stitcher ${{ steps.ver.outputs.version }}"
           fi
+          # Belt-and-suspenders: strip commit trailers that must never surface in
+          # user-facing release notes, even if a commit message leaks through.
+          BODY=$(printf '%s\n' "$BODY" | grep -v -E '^(Claude-Session|Co-authored-by):')
           printf '%s\n' "$BODY" > RELEASE_NOTES.md
           echo "Release notes ($(wc -l < RELEASE_NOTES.md) lines):"
           cat RELEASE_NOTES.md
