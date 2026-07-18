@@ -1162,7 +1162,7 @@ def estimate_memory_usage(
     # per-block cost super-linearly for small chunks.
     content_based = bool(
         getattr(config, "content_based_fusion", False)
-        and getattr(config, "tile_overlap_fusion", "max") != "max"
+        and getattr(config, "tile_overlap_fusion", "max") not in ("max", "brightest")
     )
     halo = 2 * 11 if content_based else 0  # 2 × default sigma_2
     block_vox = (chunk_z + 2 * halo) * (chunk_y + 2 * halo) * (chunk_x + 2 * halo)
@@ -2090,6 +2090,56 @@ def _fuse_leonardo(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         "Use 'Setup Preprocessing...' in the stitching dialog to install."
     )
     return np.maximum(left, right)
+
+
+# Stride used to subsample each axis when ranking tiles by brightness for the
+# "brightest" tile-overlap mode. A coarse 1/stride^3 sample is plenty to *rank*
+# tiles; a full-volume mean would force a compute of every (possibly memmapped)
+# tile just to sort them.
+_BRIGHTNESS_STRIDE = 4
+
+
+def _priority_coalesce_fusion(transformed_views):
+    """Winner-take-all tile-overlap fusion: each output pixel is taken whole from
+    the highest-priority view that covers it (no per-pixel mixing).
+
+    ``multiview_stitcher.fusion.fuse_np`` calls this per output block with
+    ``transformed_views`` shaped ``(n_views, *block)`` — float, ``NaN`` where a
+    view doesn't cover a pixel. Views are pre-sorted brightest→dimmest by the
+    caller (``_build_fusion_inputs``), so axis-0 order *is* the priority: fill
+    from view 0, then patch any still-uncovered pixels from view 1, and so on.
+
+    Because the priority order is a single global ranking (not per-block), a
+    given world pixel always resolves to the same tile regardless of which
+    output block contains it — so there are no seams *within* the data and the
+    result is bit-identical under chunk-aligned super-block batching, exactly
+    like ``max_fusion``.
+    """
+    tv = np.asarray(transformed_views)
+    if tv.shape[0] == 0:
+        return tv
+    result = tv[0].copy()
+    for i in range(1, tv.shape[0]):
+        missing = np.isnan(result)
+        if not missing.any():
+            break
+        result[missing] = tv[i][missing]
+    return result
+
+
+def _tile_brightness(volume) -> float:
+    """Mean intensity of a tile, used to rank tiles for the "brightest" overlap
+    mode. Cheap by design — a strided subsample (see ``_BRIGHTNESS_STRIDE``) is
+    enough to *order* tiles and avoids computing every memmapped volume in full.
+    Returns ``-inf`` on failure so an unreadable tile sorts last rather than
+    crashing fusion.
+    """
+    try:
+        s = _BRIGHTNESS_STRIDE
+        sub = volume[::s, ::s, ::s] if volume.ndim == 3 else volume
+        return float(np.asarray(sub).mean())
+    except Exception:
+        return float("-inf")
 
 
 def _estimate_destripe_workers(
@@ -4337,7 +4387,8 @@ class StitchingPipeline:
             chunk_vox = 64 * 256 * 256
         content = bool(
             getattr(self.config, "content_based_fusion", False)
-            and getattr(self.config, "tile_overlap_fusion", "max") != "max"
+            and getattr(self.config, "tile_overlap_fusion", "max")
+            not in ("max", "brightest")
         )
         # ~9-tile local overlap; content-based adds a halo + extra weight buffers.
         coexist = 3.0 if content else 2.0
@@ -4607,6 +4658,21 @@ class StitchingPipeline:
 
         import dask.array as da
 
+        if self.config.tile_overlap_fusion == "brightest":
+            # Rank tiles by mean intensity and place them brightest-first, so the
+            # winner-take-all fusion_func (which fills each pixel from the first
+            # covering view) draws every overlap pixel from the brightest tile.
+            # reg_params is positionally aligned with tile_data, so reorder both
+            # together to keep each tile's registration transform attached.
+            order = sorted(
+                range(len(tile_data)),
+                key=lambda i: _tile_brightness(tile_data[i][0]),
+                reverse=True,
+            )
+            tile_data = [tile_data[i] for i in order]
+            if reg_params and len(reg_params) == len(order):
+                reg_params = [reg_params[i] for i in order]
+
         msims = []
         for volume, tile_info in tile_data:
             translation_um = {
@@ -4653,6 +4719,16 @@ class StitchingPipeline:
 
             fuse_kwargs["fusion_func"] = max_fusion
             self.logger.info("  Tile-overlap fusion: maximum intensity (np.nanmax)")
+        elif self.config.tile_overlap_fusion == "brightest":
+            # Winner-take-all: each overlap pixel is taken whole from the
+            # brightest tile covering it (tiles pre-sorted brightest-first
+            # above). No per-pixel mixing and no blending/content weights —
+            # like max_fusion but selecting a whole tile rather than a pixel.
+            fuse_kwargs["fusion_func"] = _priority_coalesce_fusion
+            self.logger.info(
+                "  Tile-overlap fusion: brightest tile wins whole overlap "
+                "(winner-take-all, global priority)"
+            )
         else:
             self.logger.info("  Tile-overlap fusion: weighted blend (cosine)")
             if self.config.content_based_fusion:

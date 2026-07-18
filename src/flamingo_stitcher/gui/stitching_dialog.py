@@ -631,6 +631,7 @@ class StitchingDialog(PersistentDialog):
         for label, value in [
             ("Maximum", "max"),
             ("Blend", "blend"),
+            ("Brightest tile", "brightest"),
         ]:
             self._tile_fusion_combo.addItem(label, value)
         self._tile_fusion_combo.setToolTip(
@@ -645,7 +646,13 @@ class StitchingDialog(PersistentDialog):
             "  Maximum — pixel-wise maximum across tiles. Keeps the brighter\n"
             "            tile in the overlap so signal can't be diluted. Best\n"
             "            for sparse / sub-FOV samples (e.g. a thin object that\n"
-            "            doesn't fill the field of view)."
+            "            doesn't fill the field of view).\n\n"
+            "  Brightest tile — winner-take-all. Ranks tiles by overall mean\n"
+            "            intensity and, in every overlap, takes ALL pixels from\n"
+            "            the brighter tile (not a per-pixel max). Avoids the\n"
+            "            per-pixel noise-picking of Maximum and the seam dip of\n"
+            "            Blend — a clean, self-consistent patchwork of whole\n"
+            "            tiles. Best when tiles differ in exposure/illumination."
         )
         tile_fuse_box.addWidget(self._tile_fusion_combo)
         settings_layout.addLayout(tile_fuse_box, 1, 4)
