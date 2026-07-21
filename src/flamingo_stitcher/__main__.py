@@ -89,6 +89,17 @@ def main():
         help="Dual-illumination fusion method (default: max)",
     )
     preproc_group.add_argument(
+        "--split-illumination",
+        action="store_true",
+        help=(
+            "Diagnostic: do NOT fuse the two light-sheet sides. Stitch each "
+            "illumination path independently and write it as its own output "
+            "channel (Channel_<ch>_I0, Channel_<ch>_I1), so a per-side artifact "
+            "can be told apart from one introduced by fusing. Doubles the output "
+            "channel count and forces streaming mode."
+        ),
+    )
+    preproc_group.add_argument(
         "--tile-overlap-fusion",
         choices=["blend", "max", "brightest"],
         default="max",
@@ -312,6 +323,7 @@ def main():
         frame_width=args.frame_width,
         frame_height=args.frame_height,
         illumination_fusion=args.illumination_fusion,
+        split_illumination=args.split_illumination,
         tile_overlap_fusion=args.tile_overlap_fusion,
         flat_field_correction=args.flat_field,
         destripe=args.destripe,

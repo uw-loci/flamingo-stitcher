@@ -33,6 +33,7 @@ OVERALL_ETA_SEP = "   ·   "
 # them from the actual acquisition). Order is presentation-only.
 SHAREABLE_CONFIG_FIELDS = (
     "illumination_fusion",
+    "split_illumination",
     "tile_overlap_fusion",
     "output_format",
     "tiff_compression",
@@ -658,6 +659,13 @@ class StitchingConfig:
 
     # Illumination fusion
     illumination_fusion: str = "max"  # "max", "mean", or "leonardo"
+    # Diagnostic: when True, do NOT fuse the two light-sheet illumination sides.
+    # Each side is stitched independently and written as its own output channel
+    # (e.g. Channel_3_I0, Channel_3_I1), so a per-side artifact (a seam/step that
+    # only appears after fusing the sides, vs. one already present within a single
+    # light path) can be told apart in one viewer. Forces streaming mode (the
+    # split doubles the output channel count). Single-side tiles are unaffected.
+    split_illumination: bool = False
 
     # Output format:
     #   ome-zarr-sharded — Zarr v3, OME-NGFF v0.5, sharded (napari only)
@@ -2949,8 +2957,30 @@ class StitchingPipeline:
         output_path.mkdir(parents=True, exist_ok=True)
 
         # --- Determine streaming vs in-memory mode (before loading) ---
-        mem_est = estimate_memory_usage(tiles, process_channels, self.config)
+        # When splitting illumination, each side becomes its own output channel,
+        # so size the output (disk guard, streaming vs in-memory) on the EXPANDED
+        # channel count, not the raw one.
+        output_units = self._output_channel_units(tiles, process_channels)
+        _est_channels = (
+            list(range(len(output_units)))
+            if len(output_units) != len(process_channels)
+            else process_channels
+        )
+        mem_est = estimate_memory_usage(tiles, _est_channels, self.config)
         use_streaming = self.config.streaming_mode
+        if getattr(self.config, "split_illumination", False) and len(
+            output_units
+        ) != len(process_channels):
+            # The split path is implemented only in the streaming fuse loop (it
+            # materializes single-side tiles per output channel). Force streaming
+            # so a small dataset that would otherwise go in-memory still splits.
+            if not use_streaming:
+                self.logger.info(
+                    "Split illumination: forcing streaming mode "
+                    f"({len(output_units)} output channels from "
+                    f"{len(process_channels)} acquired channels)"
+                )
+            use_streaming = True
         if use_streaming is None:
             use_streaming = mem_est["auto_streaming"]
             self.logger.info(
@@ -3575,11 +3605,18 @@ class StitchingPipeline:
         stacked = None
         fused_memmap_path = None
 
+        # Expand real channels into output channels. Normally 1:1 (side=None →
+        # fuse illumination); with split_illumination each two-sided channel
+        # becomes one output channel per light path (side set → no fusion), so
+        # the loop below writes e.g. "3_I0" and "3_I1" as separate channels.
+        output_units = self._output_channel_units(tiles, process_channels)
+        n_out = max(len(output_units), 1)
+
         tmp_root = _scratch_base_dir(self.config, output_path) / ".stitch_tmp"
         tmp_root.mkdir(parents=True, exist_ok=True)
         imaris_mode = self.config.output_format == "imaris"
         try:
-            for ch_idx, ch_id in enumerate(process_channels):
+            for ch_idx, (ch_id, src_ch, side) in enumerate(output_units):
                 if self._cancelled_fn():
                     self.logger.info("Pipeline cancelled by user")
                     # This early return isn't inside the write-phase finally, so
@@ -3590,11 +3627,11 @@ class StitchingPipeline:
                     shutil.rmtree(tmp_root, ignore_errors=True)
                     return output_path
 
-                fuse_pct = 50 + int(35 * (ch_idx + 0.5) / max(len(process_channels), 1))
+                fuse_pct = 50 + int(35 * (ch_idx + 0.5) / n_out)
                 self._progress_fn(
                     fuse_pct,
                     f"Fusing channel {ch_id} "
-                    f"({ch_idx + 1}/{len(process_channels)}) "
+                    f"({ch_idx + 1}/{n_out}) "
                     f"[materializing tiles]...",
                 )
                 self.logger.info(
@@ -3605,8 +3642,14 @@ class StitchingPipeline:
                 # Preprocess each tile once, spill to memmap on disk — unless
                 # this is the reference channel, whose tiles were already
                 # materialised for registration (C1): reuse that spill instead
-                # of preprocessing + writing every tile a second time.
-                if ch_id == reg_reuse_ch and reg_reuse_data is not None:
+                # of preprocessing + writing every tile a second time. The reused
+                # spill is the FUSED reference, so it only stands in for an
+                # unsplit (side is None) output channel.
+                if (
+                    side is None
+                    and src_ch == reg_reuse_ch
+                    and reg_reuse_data is not None
+                ):
                     ch_tmp_dir = reg_reuse_dir
                     tile_data = reg_reuse_data
                     reg_reuse_data = None  # consumed
@@ -3615,9 +3658,10 @@ class StitchingPipeline:
                         f"(skipping re-materialize)"
                     )
                 else:
-                    ch_tmp_dir = tmp_root / f"ch{ch_id:02d}"
+                    ch_tmp_dir = tmp_root / f"ch{ch_idx:02d}"
                     tile_data = self._materialize_tiles_to_disk(
-                        tiles, ch_id, expected_tile_shape, ch_tmp_dir
+                        tiles, src_ch, expected_tile_shape, ch_tmp_dir,
+                        illum_side=side,
                     )
                 if not tile_data:
                     self.logger.warning(f"No data for channel {ch_id}, skipping")
@@ -3625,21 +3669,21 @@ class StitchingPipeline:
                         shutil.rmtree(ch_tmp_dir, ignore_errors=True)
                     continue
 
-                compute_pct = 50 + int(
-                    35 * (ch_idx + 0.8) / max(len(process_channels), 1)
-                )
+                compute_pct = 50 + int(35 * (ch_idx + 0.8) / n_out)
                 self._progress_fn(
                     compute_pct,
                     f"Computing channel {ch_id} "
-                    f"({ch_idx + 1}/{len(process_channels)})...",
+                    f"({ch_idx + 1}/{n_out})...",
                 )
 
                 # Per-channel background-zero threshold, applied in the graph
                 # (per-chunk, no extra peak). Shared by both fusion paths.
+                # Thresholds are keyed by the real acquired channel, so both
+                # split sides inherit their parent channel's threshold.
                 bg_threshold = 0
                 if self.config.background_zero_enabled:
                     bg_threshold = int(
-                        self.config.background_zero_thresholds.get(ch_id, 0)
+                        self.config.background_zero_thresholds.get(src_ch, 0)
                     )
                     if bg_threshold > 0:
                         self.logger.info(
@@ -3662,7 +3706,7 @@ class StitchingPipeline:
                     # `stacked` never lives in RAM and writers stream from it.
                     nonlocal stacked, fused_memmap_path
                     if stacked is None:
-                        fused_shape = (len(process_channels), *shape_zyx)
+                        fused_shape = (n_out, *shape_zyx)
                         fused_memmap_path = tmp_root / "fused.dat"
                         stacked = np.memmap(
                             fused_memmap_path,
@@ -3787,9 +3831,8 @@ class StitchingPipeline:
                         # instead of sitting at a flat per-channel value. Fuse
                         # spans ~50–85%; give each channel an equal slice and
                         # interpolate by completed regions within it.
-                        n_ch = max(len(process_channels), 1)
                         ch_frac = (ridx + 1) / max(len(regions), 1)
-                        region_pct = 50 + int(35 * (ch_idx + ch_frac) / n_ch)
+                        region_pct = 50 + int(35 * (ch_idx + ch_frac) / n_out)
                         self._progress_fn(
                             region_pct,
                             f"Channel {ch_id}: fused region "
@@ -3868,6 +3911,13 @@ class StitchingPipeline:
 
                 channel_origins.append(origin_um)
                 fused_channel_ids.append(ch_id)
+
+            # Drop any never-reused reference spill (its fused tiles don't stand
+            # in for a split side channel) so its memmaps are released before the
+            # tmp_root cleanup below removes the backing files.
+            if reg_reuse_data is not None:
+                reg_reuse_data = None
+                gc.collect()
         except Exception:
             # Release the memmap before bubbling so the file can be removed.
             if stacked is not None:
@@ -4087,16 +4137,25 @@ class StitchingPipeline:
             out[z] = np.clip(plane, 0, 65535).astype(np.uint16)
         return out
 
-    def _preprocess_single_tile(self, tile: RawTileInfo, ch_id: int) -> np.ndarray:
+    def _preprocess_single_tile(
+        self, tile: RawTileInfo, ch_id: int, illum_side: Optional[int] = None
+    ) -> np.ndarray:
         """Load and preprocess a single tile for one channel.
 
         Applies the full preprocessing chain: illumination fusion,
         depth attenuation, destripe, deconvolution, downsample, camera flip.
         Returns a uint16 numpy array ready for fusion.
+
+        ``illum_side`` selects a single light path instead of fusing the two
+        (used by the ``split_illumination`` diagnostic). When set and present on
+        the tile, only that side is loaded and illumination fusion is skipped; if
+        the requested side is absent the tile's available side(s) are used.
         """
         illum_files = tile.raw_files.get(ch_id, {})
         if not illum_files:
             raise ValueError(f"No raw files for channel {ch_id} in {tile.folder}")
+        if illum_side is not None and illum_side in illum_files:
+            illum_files = {illum_side: illum_files[illum_side]}
 
         illum_volumes = {}
         for illum_side, raw_path in illum_files.items():
@@ -4173,12 +4232,39 @@ class StitchingPipeline:
 
         return volume
 
+    def _output_channel_units(
+        self, tiles: List[RawTileInfo], process_channels: List[int]
+    ) -> List[Tuple[Any, int, Optional[int]]]:
+        """Expand each real channel into the output channels to fuse+write.
+
+        Returns ``[(label, real_ch, side), ...]``. Normally one unit per real
+        channel with ``label == real_ch`` (int) and ``side=None`` (illumination
+        fused as configured) — byte-for-byte the historical behaviour. When
+        ``split_illumination`` is on, a channel with >1 illumination side is
+        expanded into one unit per side (``side`` set, so no fusion) with a
+        ``"{ch}_I{side}"`` string label; single-side channels are left as-is.
+        Order follows ``process_channels`` so channel slots stay deterministic.
+        """
+        split = bool(getattr(self.config, "split_illumination", False))
+        units: List[Tuple[Any, int, Optional[int]]] = []
+        for ch in process_channels:
+            sides = sorted(
+                {s for t in tiles for s in (t.raw_files.get(ch, {}) or {}).keys()}
+            )
+            if split and len(sides) > 1:
+                for s in sides:
+                    units.append((f"{ch}_I{s}", ch, s))
+            else:
+                units.append((ch, ch, None))
+        return units
+
     def _materialize_tiles_to_disk(
         self,
         tiles: List[RawTileInfo],
         ch_id: int,
         expected_shape: tuple,
         tmp_dir: Path,
+        illum_side: Optional[int] = None,
     ) -> List[Tuple[Any, RawTileInfo]]:
         """Preprocess each tile exactly once and spill to a memmap file.
 
@@ -4226,7 +4312,7 @@ class StitchingPipeline:
             # preprocessing (flat-field/illum/depth atten/destripe/deconv/
             # downsample/X-flip) happens on this thread; numpy releases
             # the GIL for the heavy ops so multiple workers overlap cleanly.
-            vol = self._preprocess_single_tile(tile, ch_id)
+            vol = self._preprocess_single_tile(tile, ch_id, illum_side=illum_side)
             if vol.shape != expected_shape:
                 raise RuntimeError(
                     f"Tile {i} shape {vol.shape} != expected {expected_shape}"
