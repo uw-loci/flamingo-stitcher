@@ -633,13 +633,21 @@ class StitchingDialog(PersistentDialog):
             ("Max", "max"),
             ("Mean", "mean"),
             ("Leonardo FUSE", "leonardo"),
+            ("Separate (keep light paths)", "separate"),
         ]:
             self._fusion_combo.addItem(label, value)
         self._fusion_combo.setToolTip(
             "Combines the LEFT and RIGHT light-sheet illumination sides of a\n"
             "single tile. Has no effect when only one illumination side was\n"
             "acquired. This is NOT how adjacent tiles are combined — see\n"
-            "'Tile overlap'."
+            "'Tile overlap'.\n\n"
+            "  Max / Mean / Leonardo FUSE — fuse the two sides into one channel.\n\n"
+            "  Separate (keep light paths) — DIAGNOSTIC: do NOT fuse. Stitch each\n"
+            "    side independently and write it as its own output channel\n"
+            "    (Channel_<ch>_I0, Channel_<ch>_I1) in the same file, so you can\n"
+            "    flip between them in one viewer and tell a per-side artifact\n"
+            "    apart from one introduced by fusing. Doubles the output channel\n"
+            "    count and runs in streaming mode."
         )
         settings_layout.addWidget(self._fusion_combo, 1, 3)
 
@@ -1080,23 +1088,10 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._border_qc_mode_combo, 5, 2, 1, 2)
 
-        # Proc Row 6: Split illumination (diagnostic)
-        self._split_illum_cb = QCheckBox("Output light paths separately")
-        self._split_illum_cb.setToolTip(
-            "Diagnostic: do NOT fuse the two light-sheet illumination sides.\n"
-            "Each light path is stitched independently and written as its own\n"
-            "output channel (Channel_<ch>_I0, Channel_<ch>_I1), so you can flip\n"
-            "between them in one viewer and tell a per-side artifact apart from\n"
-            "one introduced by fusing the sides.\n\n"
-            "Doubles the output channel count and forces streaming mode.\n"
-            "No effect on single-illumination acquisitions."
-        )
-        proc_layout.addWidget(self._split_illum_cb, 6, 0, 1, 4)
-
-        # Proc Row 7: Legend
+        # Proc Row 6: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 7, 0, 1, 4)
+        proc_layout.addWidget(legend, 6, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
@@ -1115,7 +1110,6 @@ class StitchingDialog(PersistentDialog):
             self._deconv_cb,
             self._flat_field_cb,
             self._skip_reg_cb,
-            self._split_illum_cb,
         ):
             _cb.toggled.connect(self._refresh_memory_estimate)
         for _combo in (
@@ -2424,8 +2418,16 @@ class StitchingDialog(PersistentDialog):
         _frame = self._frame_size_combo.currentData()
         config.frame_width = _frame
         config.frame_height = _frame
-        config.illumination_fusion = self._fusion_combo.currentData()
-        config.split_illumination = self._split_illum_cb.isChecked()
+        # "Separate" is a value of the illumination-fusion combo, not a real
+        # fusion method: it means "don't fuse — keep each light path as its own
+        # output channel". Map it to the pipeline's split_illumination flag and
+        # leave illumination_fusion at its default (unused when splitting).
+        _illum = self._fusion_combo.currentData()
+        if _illum == "separate":
+            config.split_illumination = True
+        else:
+            config.split_illumination = False
+            config.illumination_fusion = _illum
         config.tile_overlap_fusion = self._tile_fusion_combo.currentData()
         config.output_format = self._format_combo.currentData()
         config.flat_field_correction = self._flat_field_cb.isChecked()
@@ -2622,7 +2624,6 @@ class StitchingDialog(PersistentDialog):
             ("destripe_fast", self._destripe_fast_cb),
             ("deconvolution_enabled", self._deconv_cb),
             ("content_based_fusion", self._content_fusion_cb),
-            ("split_illumination", self._split_illum_cb),
             ("skip_registration", self._skip_reg_cb),
             ("package_ozx", self._ozx_cb),
             ("tiff_pyramids", self._tiff_pyramids_cb),
@@ -2632,6 +2633,13 @@ class StitchingDialog(PersistentDialog):
             if has(name):
                 cb.setChecked(bool(cfg[name]))
                 applied += 1
+
+        # split_illumination is surfaced as the "separate" entry of the
+        # illumination-fusion combo, not a checkbox — a loaded config that split
+        # the light paths should select it (overriding the illumination_fusion
+        # method applied above, which is unused/ignored when splitting).
+        if has("split_illumination") and bool(cfg["split_illumination"]):
+            applied += self._set_combo_by_data(self._fusion_combo, "separate")
 
         # Spin-box value fields.
         if has("max_registration_shift_um"):
@@ -4308,7 +4316,6 @@ class StitchingDialog(PersistentDialog):
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
-        s.setValue("split_illumination", self._split_illum_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
         s.setValue("package_ozx", self._ozx_cb.isChecked())
         s.setValue("tiff_pyramids", self._tiff_pyramids_cb.isChecked())
@@ -4432,9 +4439,6 @@ class StitchingDialog(PersistentDialog):
 
         content_fusion = s.value("content_based_fusion", False, type=bool)
         self._content_fusion_cb.setChecked(content_fusion)
-        self._split_illum_cb.setChecked(
-            s.value("split_illumination", False, type=bool)
-        )
 
         chunk_idx = s.value("chunk_size_idx", 2, type=int)
         if 0 <= chunk_idx < self._chunk_size_combo.count():
@@ -4585,7 +4589,6 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
-        s.setValue("split_illumination", self._split_illum_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
         s.setValue("package_ozx", self._ozx_cb.isChecked())
         s.setValue("tiff_pyramids", self._tiff_pyramids_cb.isChecked())
@@ -4709,9 +4712,6 @@ class NativeStitchingDialog(StitchingDialog):
 
         content_fusion = s.value("content_based_fusion", False, type=bool)
         self._content_fusion_cb.setChecked(content_fusion)
-        self._split_illum_cb.setChecked(
-            s.value("split_illumination", False, type=bool)
-        )
 
         chunk_idx = s.value("chunk_size_idx", 2, type=int)
         if 0 <= chunk_idx < self._chunk_size_combo.count():
