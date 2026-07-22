@@ -5,6 +5,14 @@ the standalone application entry point. napari is *not* required here — only
 the optional background-zero preview uses it, and it degrades gracefully.
 """
 
-from .stitching_dialog import NativeStitchingDialog, StitchingDialog
+from .stitching_dialog import (
+    MultiViewStitchingDialog,
+    NativeStitchingDialog,
+    StitchingDialog,
+)
 
-__all__ = ["StitchingDialog", "NativeStitchingDialog"]
+__all__ = [
+    "StitchingDialog",
+    "NativeStitchingDialog",
+    "MultiViewStitchingDialog",
+]

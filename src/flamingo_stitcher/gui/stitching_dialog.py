@@ -70,6 +70,32 @@ _ESTIMATES_PLACEHOLDER = (
 )
 
 
+def _fmt_gb(gb: float) -> str:
+    """Human-readable data size from a value in GiB, scaling MB / GB / TB.
+
+    The estimate code works in GiB (bytes / 1024**3). Printing that with a
+    fixed ``{:.0f} GB`` collapses any sub-GB size to a misleading "0 GB"
+    (a 0.4 GB output read as nothing). Scale the unit instead so small jobs
+    show MB and huge ones show TB. Binary units throughout (matches the rest
+    of the estimate math, which is 1024-based).
+    """
+    try:
+        gb = float(gb)
+    except (TypeError, ValueError):
+        return "? GB"
+    if gb < 0:
+        gb = 0.0
+    if gb >= 1024.0:
+        return f"{gb / 1024.0:.1f} TB"
+    if gb >= 1.0:
+        return f"{gb:.1f} GB"
+    mb = gb * 1024.0
+    if mb >= 1.0:
+        return f"{mb:.0f} MB"
+    kb = mb * 1024.0
+    return f"{kb:.0f} KB" if kb >= 1.0 else "0 MB"
+
+
 def _napari_available() -> bool:
     """True if napari can be imported.
 
@@ -1657,7 +1683,7 @@ class StitchingDialog(PersistentDialog):
         parts = []
         est = getattr(self, "_last_mem_estimate", None)
         if est and est.get("output_gb"):
-            parts.append(f"~{est['output_gb']:.0f} GB output")
+            parts.append(f"~{_fmt_gb(est['output_gb'])} output")
         try:
             import shutil
 
@@ -2200,10 +2226,10 @@ class StitchingDialog(PersistentDialog):
             )
             self._memory_label.setText(
                 f"<span style='color:{_colour(in_mem_gb)};font-weight:bold;'>"
-                f"In-memory: ~{in_mem_gb:.0f} GB</span> &nbsp;|&nbsp; "
+                f"In-memory: ~{_fmt_gb(in_mem_gb)}</span> &nbsp;|&nbsp; "
                 f"<span style='color:{_colour(stream_gb)};font-weight:bold;'>"
-                f"Streaming: ~{stream_gb:.1f} GB</span> &nbsp;|&nbsp; "
-                f"Output: ~{est['output_gb']:.0f} GB"
+                f"Streaming: ~{_fmt_gb(stream_gb)}</span> &nbsp;|&nbsp; "
+                f"Output: ~{_fmt_gb(est['output_gb'])}"
                 f"{ram_str}"
                 f"{queue_hint}"
                 f"{mode_hint}"
@@ -2231,15 +2257,15 @@ class StitchingDialog(PersistentDialog):
             fusion_note = ""
             if est.get("fusion_gb") is not None:
                 fusion_note = (
-                    f"  Fusion working set: ~{est['fusion_gb']:.1f} GB "
+                    f"  Fusion working set: ~{_fmt_gb(est['fusion_gb'])} "
                     f"(~{est.get('views_per_block', '?')} tiles/block)\n"
                 )
             self._log(
                 f"Memory estimate{worst_suffix} (system RAM: {sys_ram:.0f} GB):\n"
-                f"  In-memory mode: ~{est['in_memory_gb']:.0f} GB peak\n"
-                f"  Streaming mode: ~{est['streaming_gb']:.1f} GB peak\n"
+                f"  In-memory mode: ~{_fmt_gb(est['in_memory_gb'])} peak\n"
+                f"  Streaming mode: ~{_fmt_gb(est['streaming_gb'])} peak\n"
                 f"{fusion_note}"
-                f"  Output size:    ~{est['output_gb']:.0f} GB\n"
+                f"  Output size:    ~{_fmt_gb(est['output_gb'])}\n"
                 f"  Recommendation: {'Streaming (low memory)' if est['auto_streaming'] else 'In-memory (fast)'}"
             )
         except Exception as e:
@@ -2919,11 +2945,11 @@ class StitchingDialog(PersistentDialog):
                 fused_memmap_gb = est["output_gb"] if use_streaming else 0.0
                 needed_gb = est["output_gb"] + spill_gb + fused_memmap_gb
                 if out_free_gb < needed_gb * 1.1:
-                    parts = [f"~{est['output_gb']:.0f} GB output"]
+                    parts = [f"~{_fmt_gb(est['output_gb'])} output"]
                     if spill_gb:
-                        parts.append(f"~{spill_gb:.0f} GB tile spill")
+                        parts.append(f"~{_fmt_gb(spill_gb)} tile spill")
                     if fused_memmap_gb:
-                        parts.append(f"~{fused_memmap_gb:.0f} GB fused memmap")
+                        parts.append(f"~{_fmt_gb(fused_memmap_gb)} fused memmap")
                     disk_warnings.append(
                         f"  • {item['path'].name}: "
                         f"need {' + '.join(parts)}, "
@@ -4782,3 +4808,159 @@ class NativeStitchingDialog(StitchingDialog):
         # (e.g. Destripe True but pystripe not installed on this box). Re-run
         # the availability gate so unavailable options end up unchecked+disabled.
         self._update_preprocessing_availability()
+
+
+_MULTIVIEW_SETTINGS_GROUP = "MultiViewStitchingDialog"
+
+
+class MultiViewStitchingDialog(StitchingDialog):
+    """Stitching for multi-angle (rotation) acquisitions.
+
+    A separate tab so multi-view fusion stays out of the normal single-angle
+    flow. Same folder-per-tile discovery and pipeline as the base dialog, but
+    multi-view fusion is forced on and the rotation controls are exposed. The
+    rotation sign / center conventions are validated on synthetic data but NOT
+    yet confirmed on the instrument — verify with a two-angle test acquisition
+    (flip the sign if the views come out mirrored).
+    """
+
+    # Distinct QSettings group so this tab's state doesn't clobber the base
+    # tab's. MUST stay a STRING — the base uses ``s.beginGroup(self._settings_group)``.
+    # (A past crash came from shadowing this name with a QWidget; the widget
+    # container is ``self._config_container``, kept separate.)
+    _settings_group = _MULTIVIEW_SETTINGS_GROUP
+
+    def __init__(self, parent=None, **kwargs):
+        super().__init__(parent=parent, **kwargs)
+        self.setWindowTitle("Tile Stitching (Multi-View)")
+
+    def _add_dialog_extras(self, content_layout) -> None:
+        """Inject the rotation banner + controls at the top of the scroll area.
+
+        Called from the base ``_setup_ui`` hook, so the widgets exist before
+        ``_restore_settings`` runs. No QMovie / animation here — that was a
+        suspect in the historical run-start crash.
+        """
+        banner = QLabel(
+            "⚠ Multi-view (rotation) stitching — fuses several rotation "
+            "angles into one volume. For normal single-angle acquisitions use the "
+            "‘Tile Stitching’ tab instead."
+        )
+        banner.setWordWrap(True)
+        banner.setStyleSheet(
+            "background:#fff3cd; color:#664d03; border:1px solid #ffe69c;"
+            "border-radius:4px; padding:6px;"
+        )
+        content_layout.addWidget(banner)
+
+        group = QGroupBox("Multi-View (rotation)")
+        v = QVBoxLayout()
+
+        note = QLabel(
+            "Each view is placed by a rotation about the vertical (Y) axis; "
+            "overlaps are resolved by registration and uncovered regions are "
+            "zero-filled."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color:#555; font-size:11px;")
+        v.addWidget(note)
+
+        center_row = QHBoxLayout()
+        center_row.addWidget(QLabel("Rotation center:"))
+        self._mv_center_combo = QComboBox()
+        self._mv_center_combo.addItem("Auto (tile centroid)", "auto")
+        self._mv_center_combo.addItem("Manual (X, Z)", "manual")
+        self._mv_center_combo.currentIndexChanged.connect(
+            self._mv_update_center_enabled
+        )
+        center_row.addWidget(self._mv_center_combo)
+        center_row.addWidget(QLabel("X"))
+        self._mv_cx_spin = QDoubleSpinBox()
+        self._mv_cx_spin.setRange(-1000.0, 1000.0)
+        self._mv_cx_spin.setDecimals(3)
+        self._mv_cx_spin.setSuffix(" mm")
+        center_row.addWidget(self._mv_cx_spin)
+        center_row.addWidget(QLabel("Z"))
+        self._mv_cz_spin = QDoubleSpinBox()
+        self._mv_cz_spin.setRange(-1000.0, 1000.0)
+        self._mv_cz_spin.setDecimals(3)
+        self._mv_cz_spin.setSuffix(" mm")
+        center_row.addWidget(self._mv_cz_spin)
+        center_row.addStretch()
+        v.addLayout(center_row)
+
+        sign_row = QHBoxLayout()
+        sign_row.addWidget(QLabel("Rotation sign:"))
+        self._mv_sign_combo = QComboBox()
+        self._mv_sign_combo.addItem("+1", 1.0)
+        self._mv_sign_combo.addItem("−1", -1.0)
+        self._mv_sign_combo.setToolTip(
+            "Handedness relating the stage angle to the fusion rotation.\n"
+            "Confirm on the rig with a two-angle test if views don't align."
+        )
+        sign_row.addWidget(self._mv_sign_combo)
+        sign_row.addStretch()
+        v.addLayout(sign_row)
+
+        group.setLayout(v)
+        content_layout.addWidget(group)
+        self._mv_update_center_enabled()
+
+    def _mv_update_center_enabled(self) -> None:
+        manual = self._mv_center_combo.currentData() == "manual"
+        self._mv_cx_spin.setEnabled(manual)
+        self._mv_cz_spin.setEnabled(manual)
+
+    def _build_config(self):
+        config = super()._build_config()
+        config.multiview_fusion = True
+        config.rotation_sign = float(self._mv_sign_combo.currentData())
+        if self._mv_center_combo.currentData() == "manual":
+            # UI is in mm; the pipeline's rotation center is in µm.
+            config.rotation_center_um = (
+                self._mv_cx_spin.value() * 1000.0,
+                self._mv_cz_spin.value() * 1000.0,
+            )
+        else:
+            config.rotation_center_um = None
+        return config
+
+    def _set_config_controls_enabled(self, enabled: bool):
+        """Lock the rotation controls during a run, like the base config inputs."""
+        super()._set_config_controls_enabled(enabled)
+        # May be called before _add_dialog_extras has built the controls.
+        if not hasattr(self, "_mv_sign_combo"):
+            return
+        self._mv_center_combo.setEnabled(enabled)
+        self._mv_sign_combo.setEnabled(enabled)
+        if enabled:
+            self._mv_update_center_enabled()  # spins follow Auto/Manual mode
+        else:
+            self._mv_cx_spin.setEnabled(False)
+            self._mv_cz_spin.setEnabled(False)
+
+    def _save_settings(self):
+        super()._save_settings()
+        s = QSettings()
+        s.beginGroup(self._settings_group)
+        s.setValue("mv_center_mode", self._mv_center_combo.currentData())
+        s.setValue("mv_cx_mm", self._mv_cx_spin.value())
+        s.setValue("mv_cz_mm", self._mv_cz_spin.value())
+        s.setValue("mv_rotation_sign", self._mv_sign_combo.currentData())
+        s.endGroup()
+
+    def _restore_settings(self):
+        super()._restore_settings()
+        s = QSettings()
+        s.beginGroup(self._settings_group)
+        mode = s.value("mv_center_mode", "auto")
+        idx = self._mv_center_combo.findData(mode)
+        if idx >= 0:
+            self._mv_center_combo.setCurrentIndex(idx)
+        self._mv_cx_spin.setValue(float(s.value("mv_cx_mm", 0.0)))
+        self._mv_cz_spin.setValue(float(s.value("mv_cz_mm", 0.0)))
+        sidx = self._mv_sign_combo.findData(float(s.value("mv_rotation_sign", 1.0)))
+        if sidx >= 0:
+            self._mv_sign_combo.setCurrentIndex(sidx)
+        s.endGroup()
+        self._mv_update_center_enabled()

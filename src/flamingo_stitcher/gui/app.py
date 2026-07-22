@@ -165,6 +165,7 @@ def main() -> int:
         set_default_geometry_manager,
     )
     from flamingo_stitcher.gui.stitching_dialog import (
+        MultiViewStitchingDialog,
         NativeStitchingDialog,
         StitchingDialog,
     )
@@ -193,12 +194,15 @@ def main() -> int:
     # The dialogs are QWidget subclasses, so they embed directly as tab pages.
     multi = StitchingDialog(parent=window)
     single = NativeStitchingDialog(parent=window)
+    multiview = MultiViewStitchingDialog(parent=window)
     # Standalone has no 3D Sample View, so hide the "Load … into Sample View"
     # completion button (the load_stitched_requested signal has no receiver here).
     multi.set_sample_view_available(False)
     single.set_sample_view_available(False)
+    multiview.set_sample_view_available(False)
     tabs.addTab(multi, "Multi-Acquisition")
     tabs.addTab(single, "Single Workflow")
+    tabs.addTab(multiview, "Multi-View")
 
     # Updates tab — checks GitHub Releases for newer installers (standalone
     # build only; the in-app Py2Flamingo dialogs ship their own updates).

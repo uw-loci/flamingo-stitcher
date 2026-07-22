@@ -725,6 +725,21 @@ class StitchingConfig:
     # dips; max holds up and is also lighter on memory than blend.
     tile_overlap_fusion: str = "max"
 
+    # --- Multi-view (rotation) fusion ---
+    # When on, tiles carrying a non-zero rotation-stage angle (RawTileInfo.
+    # angle_deg, read from Workflow.txt at discovery) are placed by a rotation
+    # about the vertical Y axis before fusion, so several angles fuse into one
+    # common frame. Off by default → single-angle runs are byte-identical
+    # (_tile_metadata_affine returns None for every tile).
+    multiview_fusion: bool = False
+    # Rotation axis (x, z) in world µm. None → derived from the tile positions
+    # (centroid of x, z-midpoint) at fuse time.
+    rotation_center_um: Optional[Tuple[float, float]] = None
+    # Physical handedness relating stage angle to the fusion rotation (+1/−1).
+    # Validated on synthetic data; RIG-VALIDATE the sign/center on a real
+    # two-angle acquisition (flip to -1 if the views come out mirrored).
+    rotation_sign: float = 1.0
+
     # --- Tile-border artifact QC (diagnostic; see border_qc.py) ---
     # When enabled, after preprocessing the reference channel is scanned for
     # sharp intensity steps along neighboring-tile seams; a plain-text report is
@@ -2148,6 +2163,47 @@ def _tile_brightness(volume) -> float:
         return float(np.asarray(sub).mean())
     except Exception:
         return float("-inf")
+
+
+def _rotation_affine_zyx(
+    angle_deg: float,
+    center_x_um: float,
+    center_z_um: float,
+    rotation_sign: float = 1.0,
+) -> np.ndarray:
+    """4×4 affine (in z, y, x, 1 order) rotating a view about the vertical Y axis.
+
+    Maps a view acquired at rotation-stage angle ``angle_deg`` into the common
+    (unrotated) frame: a rotation in the X–Z plane about
+    (``center_x_um``, ``center_z_um``), Y unchanged. ``rotation_sign`` (+1/−1)
+    selects the physical handedness — validated on synthetic data; the sign and
+    center must still be confirmed on the instrument with a two-angle test
+    (RIG-VALIDATE). The matrix multiplies homogeneous world coordinates in the
+    (z, y, x, 1) order multiview-stitcher expects.
+    """
+    import math
+
+    a = math.radians(rotation_sign * angle_deg)
+    ca, sa = math.cos(a), math.sin(a)
+    cx, cz = center_x_um, center_z_um
+    # Rotation about the point (cx, cz) → translation terms carry the center.
+    tz = cz * (1.0 - ca) + cx * sa
+    tx = cx * (1.0 - ca) - cz * sa
+    m = np.array(
+        [
+            [ca, 0.0, -sa, tz],
+            [0.0, 1.0, 0.0, 0.0],
+            [sa, 0.0, ca, tx],
+            [0.0, 0.0, 0.0, 1.0],
+        ],
+        dtype=float,
+    )
+    # Snap entries that are within rounding error of an integer (e.g. the
+    # sin(180°)=1.2e-16 residual) so axis-aligned rotations (90°/180°) stay exact
+    # and don't spuriously grow the fused union by a voxel.
+    near = np.abs(m - np.round(m)) < 1e-9
+    m[near] = np.round(m[near])
+    return m
 
 
 def _estimate_destripe_workers(
@@ -4496,6 +4552,38 @@ class StitchingPipeline:
             chosen = min(4, int(ram_cap), n_chunks)
         return max(1, chosen)
 
+    def _resolve_rotation_center_um(
+        self, tiles: List[RawTileInfo]
+    ) -> Tuple[float, float]:
+        """Rotation-axis (x, z) in world µm. Config value wins; else tile centroid."""
+        if self.config.rotation_center_um is not None:
+            cx, cz = self.config.rotation_center_um
+            return float(cx), float(cz)
+        if not tiles:
+            return 0.0, 0.0
+        xs = [t.x_mm * 1000.0 for t in tiles]
+        zs = [(t.z_min_mm + t.z_max_mm) * 0.5 * 1000.0 for t in tiles]
+        return sum(xs) / len(xs), sum(zs) / len(zs)
+
+    def _tile_metadata_affine(
+        self, tile_info: RawTileInfo, rot_center_um: Tuple[float, float]
+    ) -> Optional[np.ndarray]:
+        """Rotation affine for a tile, or None (identity) for single-angle tiles.
+
+        Baked into the metadata transform at sim-construction so registration
+        refines on top of the already-rotated placement. Returns None (so no
+        affine is applied) whenever multi-view fusion is off or the tile sits at
+        angle 0 — keeping single-angle runs byte-identical.
+        """
+        if not self.config.multiview_fusion or abs(tile_info.angle_deg) < 1e-9:
+            return None
+        return _rotation_affine_zyx(
+            tile_info.angle_deg,
+            rot_center_um[0],
+            rot_center_um[1],
+            self.config.rotation_sign,
+        )
+
     def _register_tiles(
         self,
         tile_data: List[Tuple[Any, RawTileInfo]],
@@ -4535,6 +4623,10 @@ class StitchingPipeline:
 
         # Build SpatialImages with stage positions
         self.logger.info("  Building tile spatial images for registration...")
+        # Multi-view: rotation axis for placing angled views (None-op when off).
+        rot_center_um = self._resolve_rotation_center_um(
+            [ti for _, ti in tile_data]
+        )
         msims = []
         for volume, tile_info in tile_data:
             translation_um = {
@@ -4550,6 +4642,7 @@ class StitchingPipeline:
                 dims=["z", "y", "x"],
                 scale=voxel_size_um,
                 translation=translation_um,
+                affine=self._tile_metadata_affine(tile_info, rot_center_um),
                 transform_key=mvs_io.METADATA_TRANSFORM_KEY,
             )
             msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
@@ -4759,6 +4852,10 @@ class StitchingPipeline:
             if reg_params and len(reg_params) == len(order):
                 reg_params = [reg_params[i] for i in order]
 
+        # Multi-view: rotation axis for placing angled views (None-op when off).
+        rot_center_um = self._resolve_rotation_center_um(
+            [ti for _, ti in tile_data]
+        )
         msims = []
         for volume, tile_info in tile_data:
             translation_um = {
@@ -4774,6 +4871,7 @@ class StitchingPipeline:
                 dims=["z", "y", "x"],
                 scale=voxel_size_um,
                 translation=translation_um,
+                affine=self._tile_metadata_affine(tile_info, rot_center_um),
                 transform_key=mvs_io.METADATA_TRANSFORM_KEY,
             )
             msim = msi_utils.get_msim_from_sim(sim, scale_factors=[])
@@ -5694,11 +5792,20 @@ class StitchingPipeline:
                     f"are placed from the Start-Position Z, so verify Z alignment."
                 )
             if int(flags.get("n_angles", 1) or 1) > 1:
-                self.logger.warning(
-                    f"Multi-angle acquisition (Number of angles="
-                    f"{flags.get('n_angles')}). This stitcher fuses a single angle "
-                    f"only — rotation between angles is not applied."
-                )
+                if self.config.multiview_fusion:
+                    self.logger.info(
+                        f"Multi-angle acquisition (Number of angles="
+                        f"{flags.get('n_angles')}). Multi-view fusion is ON — "
+                        f"views are placed by rotation about the Y axis."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Multi-angle acquisition (Number of angles="
+                        f"{flags.get('n_angles')}). Multi-view fusion is OFF — "
+                        f"rotation between angles is not applied. Enable "
+                        f"multi-view fusion (--multiview) to fuse the angles into "
+                        f"one frame."
+                    )
         except Exception as e:
             self.logger.debug(f"Capture/angle check skipped: {e}")
 

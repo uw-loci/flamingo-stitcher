@@ -183,6 +183,33 @@ def main():
         help="Channel indices to process (default: all)",
     )
 
+    # Multi-view (rotation)
+    mv_group = parser.add_argument_group("Multi-view (rotation)")
+    mv_group.add_argument(
+        "--multiview",
+        action="store_true",
+        help="Fuse a multi-angle acquisition into one volume: place each view by "
+        "a rotation about the vertical (Y) axis using its Workflow.txt angle. "
+        "No effect on single-angle data.",
+    )
+    mv_group.add_argument(
+        "--rotation-sign",
+        type=float,
+        choices=[1.0, -1.0],
+        default=1.0,
+        help="Handedness relating stage angle to the fusion rotation (default: 1). "
+        "Flip to -1 if the fused views come out mirrored (RIG-VALIDATE).",
+    )
+    mv_group.add_argument(
+        "--rotation-center",
+        type=float,
+        nargs=2,
+        metavar=("X_MM", "Z_MM"),
+        default=None,
+        help="Rotation axis (X, Z) in mm (default: auto — centroid of tile "
+        "positions). Only used with --multiview.",
+    )
+
     # QC / diagnostics
     qc_group = parser.add_argument_group("QC & diagnostics")
     qc_group.add_argument(
@@ -345,6 +372,13 @@ def main():
         deconvolution_iterations=args.deconv_iterations,
         border_qc_enabled=args.border_qc,
         border_qc_mode=args.border_qc_mode,
+        multiview_fusion=args.multiview,
+        rotation_sign=args.rotation_sign,
+        rotation_center_um=(
+            (args.rotation_center[0] * 1000.0, args.rotation_center[1] * 1000.0)
+            if args.rotation_center is not None
+            else None
+        ),
     )
 
     # Output path
