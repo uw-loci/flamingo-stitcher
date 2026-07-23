@@ -225,6 +225,17 @@ def main():
         help="Border-QC detail: mip=border length (fast), full=area+Z-range, "
         "pairs=offending pairs only (default: mip)",
     )
+    qc_group.add_argument(
+        "--preview-orientations",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="PNG",
+        help="Build a fast MIP-mosaic preview of all 8 whole-mosaic "
+        "orientations and write a labelled contact sheet, then exit. Use it to "
+        "pick the correct orientation for a system. Optional PNG path "
+        "(default: orientation_preview.png next to the acquisition).",
+    )
 
     # Output format
     output_group = parser.add_argument_group("Output")
@@ -322,6 +333,46 @@ def main():
             f"Total raw files: {sum(sum(len(v) for v in t.raw_files.values()) for t in tiles)}"
         )
         sys.exit(0)
+
+    # Orientation preview: assemble a MIP mosaic under all 8 orientations,
+    # write a labelled contact sheet, and exit. Lets a user pick the correct
+    # whole-mosaic orientation for a system (invaluable for beads, where it is
+    # hard to judge otherwise) without running a full stitch.
+    if args.preview_orientations is not None:
+        from .orientation import (
+            build_mip_mosaic,
+            orientation_previews,
+            read_microscope_name,
+            render_contact_sheet,
+            resolve_output_orientation,
+        )
+
+        mosaic = build_mip_mosaic(acq_dir, pixel_size_um=args.pixel_size_um)
+        if mosaic is None:
+            print("Could not build an orientation preview (no tiles/MIPs).")
+            sys.exit(1)
+        out_png = (
+            Path(args.preview_orientations)
+            if args.preview_orientations
+            else acq_dir / "orientation_preview.png"
+        )
+        written = render_contact_sheet(orientation_previews(mosaic), out_png)
+        name = read_microscope_name(acq_dir)
+        preset = resolve_output_orientation(acq_dir)
+        print(f"\nMicroscope name: {name or '(none found)'}")
+        print(f"Current preset : {preset or '(none)'}")
+        if written:
+            print(f"Wrote 8-orientation contact sheet: {written}")
+            print(
+                "Open it and note the panel (name) where the sample is framed "
+                "correctly — that's this system's whole-mosaic orientation."
+            )
+        else:
+            print(
+                "Pillow not available to render the contact sheet; install "
+                "pillow, or use the GUI orientation preview."
+            )
+        sys.exit(0 if written else 2)
 
     # Resolve XY pixel size: explicit flag wins, else derive from the
     # acquisition's objective (ScopeSettings.txt), else the legacy default.

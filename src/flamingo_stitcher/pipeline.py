@@ -780,6 +780,14 @@ class StitchingConfig:
     # X axis is inverted relative to stage X (common in lightsheet systems).
     camera_x_inverted: bool = True
 
+    # Whole-mosaic display orientation, applied to the FINAL fused output (not
+    # per tile), so seams/registration are unaffected. A dihedral transform of
+    # the assembled XY plane — one of the 8 rotation×mirror orientations —
+    # chosen per microscope so the sample is framed correctly (e.g. low stage X
+    # on the right, low stage Y at the bottom). "identity" reproduces the
+    # historical output. See flamingo_stitcher.orientation.MosaicOrientation.
+    output_orientation: str = "identity"
+
     # Processing
     flat_field_correction: bool = False  # BaSiCPy flat-field correction
     destripe: bool = False  # Run PyStripe destriping

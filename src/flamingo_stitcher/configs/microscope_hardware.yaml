@@ -43,8 +43,34 @@ optics:
 
   # Camera X axis is inverted relative to stage X axis.
   # Common in light-sheet systems where the camera sees a mirror image.
-  # If True, tile data is flipped in X before stitching.
+  # If True, tile data is flipped in X before stitching. This is a PER-TILE
+  # correction that affects registration; leave it as-is unless seams break.
+  # For overall sample framing (which way is up/right), use the whole-mosaic
+  # "output_orientation" presets below instead.
   camera_x_inverted: true
+
+# Per-microscope WHOLE-MOSAIC display orientation, keyed by the "Microscope
+# name" recorded in the acquisition's ScopeSettings.txt / FlamingoMetaData.txt
+# (match is case-insensitive). Applied to the FINAL fused output (not per tile),
+# so it never affects registration/seams — it just rotates/mirrors the finished
+# mosaic so the sample is framed correctly. Pick one with the GUI's orientation
+# preview, --output-orientation NAME, or let the stitcher auto-match by name.
+#
+# Value is one of the 8 dihedral orientations (see
+# flamingo_stitcher.orientation.MosaicOrientation.NAMES):
+#   identity, rot90, rot180, rot270,
+#   flip_h, flip_v, transpose, anti_transpose
+microscopes:
+  # Standard Flamingo systems keep the historical output framing.
+  n7:
+    output_orientation: identity
+
+  # ASLM / TSPIM system (objective on the RIGHT, single illumination). Intended
+  # framing: lowest numeric Y = BOTTOM of sample, lowest numeric X = RIGHT of
+  # sample. Confirm the exact orientation with the GUI/CLI orientation preview
+  # on a real dataset, then set it here.
+  #   aslm-25x:
+  #     output_orientation: rot180
 
 # Laser / illumination channels
 # Channel wavelengths used as defaults for per-channel deconvolution.
