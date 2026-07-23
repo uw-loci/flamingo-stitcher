@@ -1215,10 +1215,16 @@ class StitchingDialog(PersistentDialog):
         self._log_toggle = QPushButton("▶ Log")
         self._log_toggle.setCheckable(True)
         self._log_toggle.setChecked(False)
+        # A clear header bar (background + border) so it's obvious this is a
+        # collapsible pane, not just a label — the log otherwise blends into the
+        # controls above it when open.
         self._log_toggle.setStyleSheet(
-            "QPushButton { text-align: left; border: none; "
-            "padding: 4px 2px; font-weight: bold; color: #555; }"
-            "QPushButton:hover { color: #333; }"
+            "QPushButton { text-align: left; padding: 5px 8px; font-weight: bold; "
+            "color: #333; background-color: #ececec; "
+            "border: 1px solid #b0b0b0; border-radius: 4px; }"
+            "QPushButton:hover { background-color: #e0e0e0; }"
+            "QPushButton:checked { background-color: #dbe7f3; "
+            "border-color: #7aa7d0; }"
         )
         self._log_toggle.toggled.connect(self._on_log_toggle)
         layout.addWidget(self._log_toggle)
@@ -1269,6 +1275,12 @@ class StitchingDialog(PersistentDialog):
             )
             log_layout.addLayout(log_body_row)
         self._log_group.setLayout(log_layout)
+        # A visible frame around the open log so the pane's extent is obvious
+        # (it previously blended into the surrounding controls).
+        self._log_group.setStyleSheet(
+            "QGroupBox { border: 1px solid #7aa7d0; border-radius: 4px; "
+            "margin-top: 2px; padding: 6px; }"
+        )
         self._log_group.setVisible(False)  # collapsed initially
         layout.addWidget(self._log_group)
 
@@ -2027,10 +2039,11 @@ class StitchingDialog(PersistentDialog):
         self._log_group.setVisible(checked)
         self._log_toggle.setText(("▼ " if checked else "▶ ") + "Log")
 
-    def _expand_log(self):
-        """Ensure the log is visible (called when a run starts)."""
-        if not self._log_toggle.isChecked():
-            self._log_toggle.setChecked(True)
+    # The Log pane is entirely user-controlled: its open/closed state is
+    # persisted (QSettings "log_expanded", default closed) and restored on
+    # launch. A run no longer force-opens it — auto-opening pushed the always-
+    # visible Progress section off small screens and overrode the remembered
+    # preference. Progress is shown by the phase pills below regardless.
 
     def _set_config_controls_enabled(self, enabled: bool):
         """Enable/disable every config control as a unit for run locking.
@@ -2836,7 +2849,6 @@ class StitchingDialog(PersistentDialog):
             return
 
         self._log_text.clear()
-        self._expand_log()
         self._reset_step_progress()
         n_pending = len(pending)
         self._log(f"Starting batch stitching: {n_pending} directories\n")
@@ -4139,7 +4151,6 @@ class StitchingDialog(PersistentDialog):
         if not self._choose_install_location():
             return
 
-        self._expand_log()
         self._log("\n=== Setting up flat-field environment (pixi) ===")
         self._setup_env_btn.setEnabled(False)
         self._setup_env_btn.setText("Setting up…")
