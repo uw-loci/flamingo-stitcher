@@ -1350,7 +1350,7 @@ def _read_aoi_from_workflow(workflow_file: Path) -> Optional[Tuple[int, int]]:
     try:
         if not workflow_file.exists():
             return None
-        content = workflow_file.read_text(errors="replace")
+        content = _read_text_resilient(workflow_file)
     except OSError:
         return None
     w = re.search(r"AOI width\s*=\s*(\d+)", content)
@@ -1505,7 +1505,7 @@ def read_objective_magnification(acquisition_dir: Path) -> Optional[float]:
     if f is None:
         return None
     try:
-        content = f.read_text(errors="replace")
+        content = _read_text_resilient(f)
     except OSError:
         return None
     m = re.search(r"Objective lens magnification\s*=\s*([\d.]+)", content)
@@ -1544,7 +1544,7 @@ def _read_capture_and_angles(workflow_file: Optional[Path]) -> Dict[str, object]
     if workflow_file is None or not workflow_file.exists():
         return out
     try:
-        content = workflow_file.read_text(errors="replace")
+        content = _read_text_resilient(workflow_file)
     except OSError:
         return out
     modes = [
@@ -1677,6 +1677,42 @@ def _parse_tile_folder(folder: Path) -> Optional[RawTileInfo]:
     )
 
 
+def _read_text_resilient(
+    path: Path,
+    *,
+    retries: int = 4,
+    backoff_s: float = 0.25,
+) -> str:
+    """Read a small text metadata file, retrying transient OS read errors.
+
+    External drives — USB-C enclosures in particular — intermittently raise an
+    ``OSError`` (on Windows, ``[WinError 1392] The file or directory is
+    corrupted and unreadable`` / ``ERROR_FILE_CORRUPT``) on a read that
+    succeeds a moment later; the file itself is fine and opens normally in
+    another program. These ``*_Settings.txt`` / ``Workflow.txt`` companions are
+    tiny, so a short bounded retry with linear backoff recovers the read
+    without meaningfully slowing discovery. Re-raises the last ``OSError`` only
+    if every attempt fails, so callers can degrade gracefully.
+    """
+    last_err: Optional[OSError] = None
+    for attempt in range(1, retries + 1):
+        try:
+            return path.read_text(errors="replace")
+        except OSError as e:
+            last_err = e
+            logger.warning(
+                "Transient read error on %s (attempt %d/%d): %s",
+                path.name,
+                attempt,
+                retries,
+                e,
+            )
+            if attempt < retries:
+                time.sleep(backoff_s * attempt)
+    assert last_err is not None  # loop ran at least once
+    raise last_err
+
+
 def _read_z_range(folder: Path) -> Tuple[float, float]:
     """Read Z range from Workflow.txt in folder. Falls back to defaults."""
     wf = folder / "Workflow.txt"
@@ -1684,7 +1720,7 @@ def _read_z_range(folder: Path) -> Tuple[float, float]:
         logger.warning(f"No Workflow.txt in {folder.name}, using default Z range")
         return (0.0, 1.0)
 
-    content = wf.read_text(errors="replace")
+    content = _read_text_resilient(wf)
 
     z_min = 0.0
     z_max = 1.0
@@ -1710,7 +1746,7 @@ def _read_start_angle(workflow_file: Path) -> float:
     try:
         if not workflow_file.exists():
             return 0.0
-        content = workflow_file.read_text(errors="replace")
+        content = _read_text_resilient(workflow_file)
     except OSError:
         return 0.0
     m = re.search(
@@ -1727,7 +1763,7 @@ def _read_position_from_settings(settings_file: Path) -> Dict[str, float]:
     Returns:
         Dict with keys: x_mm, y_mm, z_min_mm, z_max_mm
     """
-    content = settings_file.read_text(errors="replace")
+    content = _read_text_resilient(settings_file)
 
     result = {"x_mm": 0.0, "y_mm": 0.0, "z_min_mm": 0.0, "z_max_mm": 1.0}
 
@@ -1759,7 +1795,7 @@ def _read_plane_spacing(workflow_file: Path) -> Optional[float]:
     if not workflow_file.exists():
         return None
 
-    content = workflow_file.read_text(errors="replace")
+    content = _read_text_resilient(workflow_file)
     match = re.search(r"Plane spacing \(um\) = ([\d.]+)", content)
     if match:
         return float(match.group(1))
@@ -1830,18 +1866,37 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                 settings_file = candidate
                 break
 
-        # Parse position from _Settings.txt or fall back to root Workflow.txt
+        # Parse position from _Settings.txt or fall back to root Workflow.txt.
+        # A tile whose _Settings.txt stays unreadable after the retries in
+        # _read_text_resilient (e.g. a persistent USB-C WinError 1392) must NOT
+        # abort discovery of the whole acquisition — degrade to the same
+        # grid-computed position used when the companion file is simply absent.
+        pos = None
         if settings_file:
-            pos = _read_position_from_settings(settings_file)
-        elif root_wf.exists():
-            # Fallback: compute from root Workflow.txt grid
-            pos = _compute_grid_position(root_wf, x_idx, y_idx, n_tiles_x, n_tiles_y)
-        else:
-            logger.warning(
-                f"No _Settings.txt or Workflow.txt for tile X{x_idx}_Y{y_idx}, "
-                f"using default positions"
-            )
-            pos = {"x_mm": 0.0, "y_mm": 0.0, "z_min_mm": 0.0, "z_max_mm": 1.0}
+            try:
+                pos = _read_position_from_settings(settings_file)
+            except OSError as e:
+                logger.warning(
+                    "Unreadable settings file %s (%s); falling back to grid "
+                    "position for tile X%d_Y%d",
+                    settings_file.name,
+                    e,
+                    x_idx,
+                    y_idx,
+                )
+                settings_file = None  # also route the angle read to the fallback
+        if pos is None:
+            if root_wf.exists():
+                # Fallback: compute from root Workflow.txt grid
+                pos = _compute_grid_position(
+                    root_wf, x_idx, y_idx, n_tiles_x, n_tiles_y
+                )
+            else:
+                logger.warning(
+                    f"No readable _Settings.txt or Workflow.txt for tile "
+                    f"X{x_idx}_Y{y_idx}, using default positions"
+                )
+                pos = {"x_mm": 0.0, "y_mm": 0.0, "z_min_mm": 0.0, "z_max_mm": 1.0}
 
         # Parse raw files for channel/illumination/planes metadata
         raw_files_dict: Dict[int, Dict[int, Path]] = {}
@@ -1917,7 +1972,7 @@ def _compute_grid_position(
     is passed in (derived from the discovered tile indices) rather than parsed
     from an ambiguous Workflow.txt field.
     """
-    content = workflow_file.read_text(errors="replace")
+    content = _read_text_resilient(workflow_file)
 
     # Read start position
     start_x = start_y = start_z = 0.0
