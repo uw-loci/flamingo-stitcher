@@ -449,6 +449,16 @@ class StitchingDialog(PersistentDialog):
         self._discover_flash_timer.setInterval(550)
         self._discover_flash_timer.timeout.connect(self._on_discover_flash_tick)
 
+        self._orientation_btn = QPushButton("Orientation Preview…")
+        self._orientation_btn.setToolTip(
+            "Preview all 8 whole-mosaic orientations for the selected\n"
+            "acquisition (built from its per-tile MIP files) so you can pick\n"
+            "the one where the sample is framed correctly. Useful when a new\n"
+            "microscope frames the mosaic differently. Does not run a stitch."
+        )
+        self._orientation_btn.clicked.connect(self._on_orientation_preview)
+        queue_btn_layout.addWidget(self._orientation_btn)
+
         self._add_btn = QPushButton("Add...")
         self._add_btn.setToolTip("Add an acquisition directory to the queue")
         self._add_btn.clicked.connect(self._add_to_queue)
@@ -1461,6 +1471,44 @@ class StitchingDialog(PersistentDialog):
                     self._queue_index -= 1
         self._update_queue_table()
         self._update_action_buttons()
+
+    def _on_orientation_preview(self):
+        """Open the whole-mosaic orientation preview for the chosen acquisition.
+
+        Uses the selected queue row, or the only/first queued item when nothing
+        is selected. Builds an 8-orientation MIP-mosaic preview so the user can
+        pick the orientation that frames the sample correctly.
+        """
+        if not self._queue:
+            QMessageBox.information(
+                self,
+                "Orientation preview",
+                "Add an acquisition to the queue first, then select it and "
+                "click Orientation Preview.",
+            )
+            return
+        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
+        row = rows[0] if rows else 0
+        if not (0 <= row < len(self._queue)):
+            row = 0
+        acq_path = self._queue[row].get("path")
+        if not acq_path:
+            QMessageBox.warning(
+                self, "Orientation preview", "That queue item has no path."
+            )
+            return
+        try:
+            from flamingo_stitcher.gui.orientation_preview_dialog import (
+                OrientationPreviewDialog,
+            )
+
+            dlg = OrientationPreviewDialog(acq_path, parent=self)
+            dlg.exec_()
+        except Exception as e:  # noqa: BLE001 - never let a preview crash the app
+            self._logger.exception("Orientation preview failed to open")
+            QMessageBox.critical(
+                self, "Orientation preview", f"Could not open preview:\n{e}"
+            )
 
     def _requeue_selected(self):
         """Reset selected finished items (Done / Error / Cancelled) to Pending.
