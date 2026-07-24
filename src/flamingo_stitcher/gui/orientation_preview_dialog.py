@@ -104,6 +104,9 @@ class OrientationPreviewDialog(QDialog):
         self.setWindowTitle(f"Orientation preview — {self._acq_path.name}")
         self.setMinimumSize(1100, 640)
         self._thread: Optional[_PreviewBuildThread] = None
+        # Selected Z-projection range (None = full stack); the Z-projection
+        # dropdown updates this. Must exist before _build_ui/_start_build read it.
+        self._z_range = None
         self._build_ui()
         self._start_build()
 
