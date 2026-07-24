@@ -42,35 +42,35 @@ optics:
   immersion_refractive_index: 1.33
 
   # Camera X axis is inverted relative to stage X axis.
-  # Common in light-sheet systems where the camera sees a mirror image.
-  # If True, tile data is flipped in X before stitching. This is a PER-TILE
-  # correction that affects registration; leave it as-is unless seams break.
-  # For overall sample framing (which way is up/right), use the whole-mosaic
-  # "output_orientation" presets below instead.
+  # Common in light-sheet systems where the camera sees a mirror image. If True,
+  # each tile is flipped in X before stitching. This is the LEGACY default used
+  # when a microscope has no "tile_orientation" preset below; leave it as-is for
+  # standard single-camera systems.
   camera_x_inverted: true
 
-# Per-microscope WHOLE-MOSAIC display orientation, keyed by the "Microscope
-# name" recorded in the acquisition's ScopeSettings.txt / FlamingoMetaData.txt
-# (match is case-insensitive). Applied to the FINAL fused output (not per tile),
-# so it never affects registration/seams — it just rotates/mirrors the finished
-# mosaic so the sample is framed correctly. Pick one with the GUI's orientation
-# preview, --output-orientation NAME, or let the stitcher auto-match by name.
+# Per-microscope PER-TILE orientation, keyed by the "Microscope name" recorded
+# in the acquisition's ScopeSettings.txt / FlamingoMetaData.txt (case-
+# insensitive). Applied to EACH TILE's pixels before placement, so tiles connect
+# — a 90°-rotated camera needs each tile transposed, a mirror needs a flip, etc.
+# Rotating the finished mosaic can't fix broken seams; this can. Pick the right
+# one with the GUI/CLI orientation preview (the panel where tissue is continuous
+# across seams), then set it here so it auto-applies by microscope name.
 #
 # Value is one of the 8 dihedral orientations (see
 # flamingo_stitcher.orientation.MosaicOrientation.NAMES):
 #   identity, rot90, rot180, rot270,
 #   flip_h, flip_v, transpose, anti_transpose
+# (flip_h == the legacy camera_x_inverted: true behaviour.)
 microscopes:
-  # Standard Flamingo systems keep the historical output framing.
+  # Standard Flamingo systems: legacy X-flip per tile.
   n7:
-    output_orientation: identity
+    tile_orientation: flip_h
 
-  # ASLM / TSPIM system (objective on the RIGHT, single illumination). Intended
-  # framing: lowest numeric Y = BOTTOM of sample, lowest numeric X = RIGHT of
-  # sample. Confirm the exact orientation with the GUI/CLI orientation preview
-  # on a real dataset, then set it here.
+  # ASLM / TSPIM system (objective on the RIGHT, single illumination). The
+  # camera is oriented differently — find the tile_orientation where tiles
+  # CONNECT using the orientation preview, then set it here.
   #   aslm-25x:
-  #     output_orientation: rot180
+  #     tile_orientation: transpose
 
 # Laser / illumination channels
 # Channel wavelengths used as defaults for per-channel deconvolution.

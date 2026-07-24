@@ -169,8 +169,15 @@ def load_orientation_presets() -> Dict[str, str]:
         scopes = (raw.get("microscopes") or {}) if isinstance(raw, dict) else {}
         out: Dict[str, str] = {}
         for name, entry in scopes.items():
-            if isinstance(entry, dict) and entry.get("output_orientation"):
-                ori = str(entry["output_orientation"]).strip().lower()
+            key = None
+            if isinstance(entry, dict):
+                # tile_orientation is the current key; output_orientation is the
+                # deprecated whole-mosaic name kept for backward compatibility.
+                key = entry.get("tile_orientation") or entry.get(
+                    "output_orientation"
+                )
+            if key:
+                ori = str(key).strip().lower()
                 if ori in MosaicOrientation.NAMES:
                     out[str(name).strip().lower()] = ori
         return out
@@ -250,8 +257,13 @@ def build_mip_mosaic(
     channel: Optional[int] = None,
     z_range: Optional[Tuple[float, float]] = None,
     label_tiles: bool = True,
+    tile_transform: Optional["MosaicOrientation"] = None,
 ) -> Optional[np.ndarray]:
-    """Assemble a fast low-res MIP mosaic (identity orientation) for preview.
+    """Assemble a fast low-res MIP mosaic for preview.
+
+    ``tile_transform`` (a MosaicOrientation) is applied to EACH TILE before it is
+    placed at its stage position — the per-tile reorientation that actually makes
+    tiles connect. ``None`` composites tiles as-is.
 
     Places each tile's max-projection at its stage position, so a user can judge
     the mosaic layout. Returns a 2-D ``float32`` array normalised to [0, 1], or
@@ -268,6 +280,23 @@ def build_mip_mosaic(
     so it rotates/flips with the tiles — the label shows where each tile lands
     in every orientation, for reference.
     """
+    loaded, pixel_size_um = _load_tile_mips(
+        acquisition_dir, pixel_size_um, channel, z_range
+    )
+    if not loaded:
+        return None
+    return _composite_tiles(
+        loaded, pixel_size_um, tile_transform, target_long_px, label_tiles
+    )
+
+
+def _load_tile_mips(
+    acquisition_dir: Path,
+    pixel_size_um: Optional[float],
+    channel: Optional[int],
+    z_range: Optional[Tuple[float, float]],
+) -> "Tuple[List[Tuple[float, float, np.ndarray, str]], float]":
+    """Read each tile's MIP once: ``([(x_mm, y_mm, mip, label), ...], pixel_um)``."""
     from flamingo_stitcher.pipeline import (  # lazy: avoid import cycle
         discover_flat_tiles,
         discover_tiles,
@@ -279,29 +308,43 @@ def build_mip_mosaic(
         tiles = discover_flat_tiles(acquisition_dir)
     if not tiles:
         logger.warning("Orientation preview: no tiles in %s", acquisition_dir)
-        return None
+        return [], pixel_size_um or 0.406
 
     if pixel_size_um is None:
         pixel_size_um = _guess_pixel_size_um(acquisition_dir)
 
-    # Per-tile MIPs (native px) + their mm extent + a reference label.
     loaded: List[Tuple[float, float, np.ndarray, str]] = []
-    frame_px = None
     for t in tiles:
         mip = _tile_mip(t, channel, z_range)
         if mip is None:
             continue
-        frame_px = max(frame_px or 0, max(mip.shape))
         loaded.append((float(t.x_mm), float(t.y_mm), mip, _tile_label(t)))
     if not loaded:
         logger.warning("Orientation preview: no MIPs could be read")
-        return None
+    return loaded, float(pixel_size_um)
 
-    fov_mm = (frame_px or 2048) * float(pixel_size_um) / 1000.0
+
+def _composite_tiles(
+    loaded: "List[Tuple[float, float, np.ndarray, str]]",
+    pixel_size_um: float,
+    tile_transform: Optional["MosaicOrientation"],
+    target_long_px: int,
+    label_tiles: bool,
+) -> np.ndarray:
+    """Composite tiles at their stage positions, transforming EACH TILE first.
+
+    ``tile_transform`` is applied to every tile's pixels BEFORE placement (the
+    placement grid — stage x→col, y→row — never changes). This is what actually
+    reorients the acquisition: adjacent tiles only connect when each tile's
+    content axes are aligned to the stage axes. Rotating the finished mosaic
+    would just rotate the (still-broken) seams. Tile labels are drawn upright at
+    the (fixed) tile centres so they stay readable in every orientation.
+    """
+    frame_px = max((max(m.shape) for _, _, m, _ in loaded), default=2048)
+    fov_mm = frame_px * float(pixel_size_um) / 1000.0
 
     xs = [x for x, _, _, _ in loaded]
     ys = [y for _, y, _, _ in loaded]
-    # mm span of tile CENTRES, padded by half a FOV each side (tiles centred).
     x_min, x_max = min(xs) - fov_mm / 2, max(xs) + fov_mm / 2
     y_min, y_max = min(ys) - fov_mm / 2, max(ys) + fov_mm / 2
     span_mm = max(x_max - x_min, y_max - y_min, 1e-6)
@@ -314,7 +357,10 @@ def build_mip_mosaic(
     tile_px = max(1, int(round(fov_mm / mm_per_px)))
     label_spots: List[Tuple[str, int, int]] = []
     for x_mm, y_mm, mip, label in loaded:
-        small = _resize(mip.astype(np.float32), tile_px, tile_px)
+        img = mip.astype(np.float32)
+        if tile_transform is not None:
+            img = tile_transform.apply2d(img)  # per-tile reorientation
+        small = _resize(img, tile_px, tile_px)
         cx = (x_mm - x_min) / mm_per_px
         cy = (y_mm - y_min) / mm_per_px
         r0 = int(round(cy - small.shape[0] / 2))
@@ -322,15 +368,11 @@ def build_mip_mosaic(
         _blit_max(canvas, small, r0, c0)
         label_spots.append((label, int(round(cy)), int(round(cx))))
 
-    # Normalise to [0, 1] with a robust upper percentile so a few hot beads
-    # don't wash the preview out.
     hi = float(np.percentile(canvas, 99.5)) if canvas.any() else 1.0
     if hi <= 0:
         hi = 1.0
     canvas = np.clip(canvas / hi, 0.0, 1.0)
 
-    # Burn tile labels last (onto the normalised canvas) so they read at full
-    # contrast and rotate/flip with the tiles under each orientation.
     if label_tiles:
         scale = max(2, tile_px // 40)
         for label, cy, cx in label_spots:
@@ -339,9 +381,32 @@ def build_mip_mosaic(
     return canvas
 
 
-def orientation_previews(mosaic: np.ndarray) -> "Dict[str, np.ndarray]":
-    """Return ``{orientation_name: transformed_mosaic}`` for all eight."""
-    return {n: MosaicOrientation(n).apply2d(mosaic) for n in MosaicOrientation.NAMES}
+def orientation_previews(
+    acquisition_dir: Path,
+    *,
+    pixel_size_um: Optional[float] = None,
+    target_long_px: int = 1000,
+    channel: Optional[int] = None,
+    z_range: Optional[Tuple[float, float]] = None,
+    label_tiles: bool = True,
+) -> "Dict[str, np.ndarray]":
+    """Build one mosaic per orientation, applying each PER TILE.
+
+    Returns ``{orientation_name: mosaic}`` for all eight. Each mosaic transforms
+    every tile's pixels by that orientation and then re-composites at the stage
+    grid — so the panels differ in how tiles CONNECT, not merely how the whole
+    image is rotated. The user picks the one where the tissue is continuous
+    across the seams. Tiles are read once and re-composited eight times.
+    """
+    loaded, px = _load_tile_mips(acquisition_dir, pixel_size_um, channel, z_range)
+    if not loaded:
+        return {}
+    return {
+        name: _composite_tiles(
+            loaded, px, MosaicOrientation(name), target_long_px, label_tiles
+        )
+        for name in MosaicOrientation.NAMES
+    }
 
 
 def _is_full_range(z_range: Optional[Tuple[float, float]]) -> bool:

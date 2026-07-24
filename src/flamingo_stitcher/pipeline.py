@@ -780,13 +780,14 @@ class StitchingConfig:
     # X axis is inverted relative to stage X (common in lightsheet systems).
     camera_x_inverted: bool = True
 
-    # Whole-mosaic display orientation, applied to the FINAL fused output (not
-    # per tile), so seams/registration are unaffected. A dihedral transform of
-    # the assembled XY plane — one of the 8 rotation×mirror orientations —
-    # chosen per microscope so the sample is framed correctly (e.g. low stage X
-    # on the right, low stage Y at the bottom). "identity" reproduces the
-    # historical output. See flamingo_stitcher.orientation.MosaicOrientation.
-    output_orientation: str = "identity"
+    # Per-tile camera→stage orientation. The camera can be mounted mirrored
+    # and/or rotated relative to the stage, so each tile's PIXELS must be
+    # reoriented before placement or adjacent tiles won't connect (a 90°-rotated
+    # camera needs each tile transposed, etc.). One of the 8 dihedral names
+    # (see flamingo_stitcher.orientation.MosaicOrientation.NAMES). Empty ""
+    # derives the legacy behaviour from camera_x_inverted (True→"flip_h",
+    # False→"identity"), so existing single-camera systems are unchanged.
+    tile_orientation: str = ""
 
     # Processing
     flat_field_correction: bool = False  # BaSiCPy flat-field correction
@@ -4401,14 +4402,24 @@ class StitchingPipeline:
         if self.config.deconvolution_enabled and _deconv_fast:
             volume = self._deconvolve_tile(volume, tile)
 
-        if self.config.camera_x_inverted:
-            # Return a stride-reversed view, not a contiguous copy. The caller
-            # (_materialize_tiles_to_disk) immediately writes into a memmap via
-            # `mm[:] = vol`, which handles non-contiguous sources without
-            # allocating a full-volume scratch buffer. The old
-            # np.ascontiguousarray() here cost an extra ~5.7 GB per tile on
-            # full-res data and OOM'd on channel 2 of multi-channel runs.
-            volume = volume[:, :, ::-1]
+        # Per-tile camera→stage orientation. Reorient each tile's pixels so its
+        # content axes align with the stage axes BEFORE placement — otherwise
+        # adjacent tiles don't connect (rotating the finished mosaic can't fix
+        # that). Empty tile_orientation preserves the legacy X-flip behaviour.
+        #
+        # These are stride tricks (transpose = view, [::-1] = reversed view), NOT
+        # contiguous copies. _materialize_tiles_to_disk writes into a memmap via
+        # `mm[:] = vol`, which handles non-contiguous sources without a
+        # full-volume scratch buffer (an np.ascontiguousarray() here cost ~5.7 GB
+        # extra per tile and OOM'd multi-channel runs). The per-channel
+        # expected_shape is derived from a preprocessed probe tile, so a
+        # transpose that swaps the frame dims stays consistent automatically.
+        from flamingo_stitcher.orientation import MosaicOrientation
+
+        ori_name = self.config.tile_orientation or (
+            "flip_h" if self.config.camera_x_inverted else "identity"
+        )
+        volume = MosaicOrientation.from_name(ori_name).apply_volume_xy(volume)
 
         return volume
 

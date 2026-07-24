@@ -93,9 +93,10 @@ def test_read_microscope_name_from_scope_settings(tmp_path):
 
 
 def test_preset_for_bundled_microscope():
-    # The bundled microscope_hardware.yaml ships an n7 preset (identity).
-    assert preset_for_microscope("n7") == "identity"
-    assert preset_for_microscope("N7") == "identity"  # case-insensitive
+    # The bundled microscope_hardware.yaml ships an n7 tile_orientation preset
+    # (flip_h — the legacy per-tile X-flip).
+    assert preset_for_microscope("n7") == "flip_h"
+    assert preset_for_microscope("N7") == "flip_h"  # case-insensitive
     assert preset_for_microscope("no-such-scope") is None
 
 
@@ -128,7 +129,14 @@ def _write_flat_acq_with_mips(tmp_path: Path) -> Path:
             f"_C02_I0_D1_P{_N_PLANES:05d}"
         )
         (acq / f"{base}.raw").write_bytes(raw_bytes)
-        mip = np.full((_AOI, _AOI), (xi * 2 + yi + 1) * 1000, dtype=np.uint16)
+        # Asymmetric per-tile content (a corner ramp) so a per-tile transform
+        # (flip/rot/transpose) actually changes the mosaic — a uniform tile
+        # would look identical under every orientation.
+        ramp = np.add.outer(
+            np.arange(_AOI, dtype=np.uint16) * 100,
+            np.arange(_AOI, dtype=np.uint16) * 10,
+        )
+        mip = (ramp + (xi * 2 + yi + 1) * 1000).astype(np.uint16)
         tifffile.imwrite(str(acq / f"{base}_MP.tif"), mip)
         # settings companion so discovery reads real positions
         (acq / f"{base}_Settings.txt").write_text(
@@ -149,12 +157,15 @@ def test_build_mip_mosaic_and_previews(tmp_path):
     assert float(mosaic.max()) == pytest.approx(1.0, abs=1e-6)
     assert mosaic.any()
 
-    previews = orientation_previews(mosaic)
+    previews = orientation_previews(acq, pixel_size_um=100.0, target_long_px=200)
     assert set(previews) == set(MosaicOrientation.NAMES)
-    # Rotations by 90/270 and transpose swap the axes.
-    assert previews["rot90"].shape == mosaic.shape[::-1]
-    assert previews["rot180"].shape == mosaic.shape
-    assert previews["transpose"].shape == mosaic.shape[::-1]
+    # Per-tile transforms keep the SAME placement grid, so every preview shares
+    # one canvas shape — the transform reorients tile CONTENT, not the mosaic.
+    shapes = {p.shape for p in previews.values()}
+    assert len(shapes) == 1
+    # Different orientations produce different mosaics (tiles reoriented in place).
+    assert not np.array_equal(previews["identity"], previews["rot180"])
+    assert not np.array_equal(previews["identity"], previews["transpose"])
 
 
 def test_build_mip_mosaic_no_tiles_returns_none(tmp_path):

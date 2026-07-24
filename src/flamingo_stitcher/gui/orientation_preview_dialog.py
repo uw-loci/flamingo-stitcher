@@ -75,7 +75,6 @@ class _PreviewBuildThread(QThread):
     def run(self) -> None:  # noqa: D401
         try:
             from flamingo_stitcher.orientation import (
-                build_mip_mosaic,
                 orientation_previews,
                 read_microscope_name,
                 resolve_output_orientation,
@@ -83,14 +82,16 @@ class _PreviewBuildThread(QThread):
 
             name = read_microscope_name(self._acq_path)
             preset = resolve_output_orientation(self._acq_path)
-            mosaic = build_mip_mosaic(self._acq_path, z_range=self._z_range)
-            if mosaic is None:
+            # One mosaic per orientation, each transforming EVERY TILE before
+            # placement — so the panels differ in how tiles CONNECT.
+            previews = orientation_previews(self._acq_path, z_range=self._z_range)
+            if not previews:
                 self.failed.emit(
                     "Could not build a preview — no tiles or MIP (*_MP.tif) "
                     "files were found in this acquisition."
                 )
                 return
-            self.done.emit(orientation_previews(mosaic), name, preset)
+            self.done.emit(previews, name, preset)
         except Exception as e:  # noqa: BLE001 - surface any failure to the UI
             self.failed.emit(f"Orientation preview failed: {e}")
 
@@ -210,11 +211,11 @@ class OrientationPreviewDialog(QDialog):
         ]
         self._header.setText(
             "  •  ".join(bits)
-            + "<br>Tiles are labelled by grid index (e.g. <b>X0Y0</b>) so you "
-            "can see where each lands in every orientation. Pick the panel where "
-            "the sample is framed correctly (e.g. low stage X on the right, low "
-            "stage Y at the bottom) — that orientation name is this system's "
-            "setting. If beads bury the structure, narrow the Z projection."
+            + "<br>Each panel re-orients <b>every tile</b> and re-tiles at the "
+            "stage grid. Pick the one where the tissue is <b>continuous across "
+            "the seams</b> (tiles connect) — not just where the whole image "
+            "looks rotated. Tiles are labelled by grid index (e.g. <b>X0Y0</b>). "
+            "If scattered beads hide the structure, narrow the Z projection."
         )
         self._clear_grid()
         cols = 4

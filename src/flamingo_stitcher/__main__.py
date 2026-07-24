@@ -361,13 +361,12 @@ def main():
                 print(f"   • {t.metadata_warning}")
         sys.exit(0)
 
-    # Orientation preview: assemble a MIP mosaic under all 8 orientations,
-    # write a labelled contact sheet, and exit. Lets a user pick the correct
-    # whole-mosaic orientation for a system (invaluable for beads, where it is
-    # hard to judge otherwise) without running a full stitch.
+    # Orientation preview: build one mosaic per orientation, each re-orienting
+    # EVERY TILE before placement, write a labelled contact sheet, and exit.
+    # Lets a user pick the per-tile orientation that makes tiles CONNECT
+    # (invaluable for beads) without running a full stitch.
     if args.preview_orientations is not None:
         from .orientation import (
-            build_mip_mosaic,
             orientation_previews,
             read_microscope_name,
             render_contact_sheet,
@@ -375,10 +374,10 @@ def main():
         )
 
         z_range = tuple(args.preview_z_range) if args.preview_z_range else None
-        mosaic = build_mip_mosaic(
+        previews = orientation_previews(
             acq_dir, pixel_size_um=args.pixel_size_um, z_range=z_range
         )
-        if mosaic is None:
+        if not previews:
             print("Could not build an orientation preview (no tiles/MIPs).")
             sys.exit(1)
         out_png = (
@@ -386,7 +385,7 @@ def main():
             if args.preview_orientations
             else acq_dir / "orientation_preview.png"
         )
-        written = render_contact_sheet(orientation_previews(mosaic), out_png)
+        written = render_contact_sheet(previews, out_png)
         name = read_microscope_name(acq_dir)
         preset = resolve_output_orientation(acq_dir)
         print(f"\nMicroscope name: {name or '(none found)'}")
@@ -394,8 +393,9 @@ def main():
         if written:
             print(f"Wrote 8-orientation contact sheet: {written}")
             print(
-                "Open it and note the panel (name) where the sample is framed "
-                "correctly — that's this system's whole-mosaic orientation."
+                "Open it and note the panel (name) where the tissue is "
+                "CONTINUOUS across the tile seams — that's this system's tile "
+                "orientation."
             )
         else:
             print(
