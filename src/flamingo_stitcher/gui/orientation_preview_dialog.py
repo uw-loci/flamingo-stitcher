@@ -20,6 +20,7 @@ import numpy as np
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
+    QComboBox,
     QDialog,
     QGridLayout,
     QHBoxLayout,
@@ -34,6 +35,20 @@ from PyQt5.QtWidgets import (
 from flamingo_stitcher.orientation import MosaicOrientation
 
 _CELL_PX = 260
+
+# Z-projection presets: label -> (lo, hi) plane fractions, or None for full.
+# "Bottom" = low plane indices (Z start); structure often lives there while the
+# full-stack projection is washed out by beads spread across all Z.
+_Z_PRESETS = [
+    ("Full stack", None),
+    ("Bottom 50%", (0.0, 0.5)),
+    ("Bottom 33%", (0.0, 0.33)),
+    ("Bottom 25%", (0.0, 0.25)),
+    ("Bottom 10%", (0.0, 0.10)),
+    ("Middle 50%", (0.25, 0.75)),
+    ("Top 50%", (0.5, 1.0)),
+    ("Top 25%", (0.75, 1.0)),
+]
 
 
 def _to_qpixmap(arr01: np.ndarray, max_px: int = _CELL_PX) -> QPixmap:
@@ -52,9 +67,10 @@ class _PreviewBuildThread(QThread):
     done = pyqtSignal(object, object, object)  # previews|None, name, preset
     failed = pyqtSignal(str)
 
-    def __init__(self, acq_path: Path, parent=None) -> None:
+    def __init__(self, acq_path: Path, z_range=None, parent=None) -> None:
         super().__init__(parent)
         self._acq_path = Path(acq_path)
+        self._z_range = z_range
 
     def run(self) -> None:  # noqa: D401
         try:
@@ -67,7 +83,7 @@ class _PreviewBuildThread(QThread):
 
             name = read_microscope_name(self._acq_path)
             preset = resolve_output_orientation(self._acq_path)
-            mosaic = build_mip_mosaic(self._acq_path)
+            mosaic = build_mip_mosaic(self._acq_path, z_range=self._z_range)
             if mosaic is None:
                 self.failed.emit(
                     "Could not build a preview — no tiles or MIP (*_MP.tif) "
@@ -113,8 +129,21 @@ class OrientationPreviewDialog(QDialog):
         outer.addWidget(scroll, 1)
 
         btn_row = QHBoxLayout()
+        btn_row.addWidget(QLabel("Z projection:"))
+        self._z_combo = QComboBox()
+        for label, _rng in _Z_PRESETS:
+            self._z_combo.addItem(label)
+        self._z_combo.setToolTip(
+            "Which Z planes to project. Structure often lives in part of the "
+            "stack (e.g. the bottom), while the full-stack projection is washed "
+            "out by beads across all depths. Changing this rebuilds the preview "
+            "by reading those planes from the raw data."
+        )
+        self._z_combo.currentIndexChanged.connect(self._on_z_changed)
+        btn_row.addWidget(self._z_combo)
+
         self._rebuild_btn = QPushButton("Rebuild")
-        self._rebuild_btn.setToolTip("Re-read the MIPs and rebuild the preview")
+        self._rebuild_btn.setToolTip("Re-read the data and rebuild the preview")
         self._rebuild_btn.clicked.connect(self._start_build)
         self._rebuild_btn.setEnabled(False)
         btn_row.addWidget(self._rebuild_btn)
@@ -124,15 +153,24 @@ class OrientationPreviewDialog(QDialog):
         btn_row.addWidget(close_btn)
         outer.addLayout(btn_row)
 
+    def _on_z_changed(self, index: int) -> None:
+        if 0 <= index < len(_Z_PRESETS):
+            self._z_range = _Z_PRESETS[index][1]
+            self._start_build()
+
     def _start_build(self) -> None:
         if self._thread is not None and self._thread.isRunning():
             return
         self._rebuild_btn.setEnabled(False)
         self._progress.setVisible(True)
+        full = self._z_range is None
         self._header.setText(
-            "Building preview from per-tile MIPs… reading *_MP.tif files."
+            "Building preview from per-tile MIPs…"
+            if full
+            else "Building preview — projecting the selected Z range from the "
+            "raw data (this reads image data, so it may take a moment)…"
         )
-        self._thread = _PreviewBuildThread(self._acq_path, self)
+        self._thread = _PreviewBuildThread(self._acq_path, self._z_range, self)
         self._thread.done.connect(self._on_done)
         self._thread.failed.connect(self._on_failed)
         self._thread.start()
@@ -157,15 +195,23 @@ class OrientationPreviewDialog(QDialog):
     ) -> None:
         self._progress.setVisible(False)
         self._rebuild_btn.setEnabled(True)
+        z_label = (
+            _Z_PRESETS[self._z_combo.currentIndex()][0]
+            if 0 <= self._z_combo.currentIndex() < len(_Z_PRESETS)
+            else "Full stack"
+        )
         bits = [
             f"Microscope: <b>{name or '(none found)'}</b>",
-            f"Current preset: <b>{preset or '(none)'}</b>",
+            f"Preset: <b>{preset or '(none)'}</b>",
+            f"Z: <b>{z_label}</b>",
         ]
         self._header.setText(
             "  •  ".join(bits)
-            + "<br>Pick the panel where the sample is framed correctly "
-            "(e.g. low stage X on the right, low stage Y at the bottom). "
-            "That orientation name is this system's setting."
+            + "<br>Tiles are labelled by grid index (e.g. <b>X0Y0</b>) so you "
+            "can see where each lands in every orientation. Pick the panel where "
+            "the sample is framed correctly (e.g. low stage X on the right, low "
+            "stage Y at the bottom) — that orientation name is this system's "
+            "setting. If beads bury the structure, narrow the Z projection."
         )
         self._clear_grid()
         cols = 4

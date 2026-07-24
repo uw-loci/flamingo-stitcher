@@ -248,14 +248,25 @@ def build_mip_mosaic(
     pixel_size_um: Optional[float] = None,
     target_long_px: int = 1000,
     channel: Optional[int] = None,
+    z_range: Optional[Tuple[float, float]] = None,
+    label_tiles: bool = True,
 ) -> Optional[np.ndarray]:
     """Assemble a fast low-res MIP mosaic (identity orientation) for preview.
 
-    Places each tile's max-projection (the per-tile ``*_MP.tif`` companion, or a
-    cheap strided MIP of the raw when absent) at its stage position, so a user
-    can judge the mosaic layout. Returns a 2-D ``float32`` array normalised to
-    [0, 1], or ``None`` if no tiles / MIPs could be read. This is a *preview*:
-    placement is by stage centre and is intentionally approximate.
+    Places each tile's max-projection at its stage position, so a user can judge
+    the mosaic layout. Returns a 2-D ``float32`` array normalised to [0, 1], or
+    ``None`` if no tiles / MIPs could be read. Placement is by stage centre and
+    is intentionally approximate.
+
+    ``z_range`` (lo, hi) as fractions in [0, 1] restricts the projection to a
+    sub-range of Z planes — e.g. ``(0.0, 0.25)`` projects only the bottom
+    quarter, revealing structure that the full-stack projection buries under
+    scattered beads. When ``None`` (full stack), the fast per-tile ``*_MP.tif``
+    companion is used; a sub-range reads the raw and projects just those planes.
+
+    ``label_tiles`` burns each tile's grid index (e.g. ``X0Y0``) into the mosaic
+    so it rotates/flips with the tiles — the label shows where each tile lands
+    in every orientation, for reference.
     """
     from flamingo_stitcher.pipeline import (  # lazy: avoid import cycle
         discover_flat_tiles,
@@ -273,23 +284,23 @@ def build_mip_mosaic(
     if pixel_size_um is None:
         pixel_size_um = _guess_pixel_size_um(acquisition_dir)
 
-    # Per-tile MIPs (native px) + their mm extent.
-    loaded: List[Tuple[float, float, np.ndarray]] = []
+    # Per-tile MIPs (native px) + their mm extent + a reference label.
+    loaded: List[Tuple[float, float, np.ndarray, str]] = []
     frame_px = None
     for t in tiles:
-        mip = _tile_mip(t, channel)
+        mip = _tile_mip(t, channel, z_range)
         if mip is None:
             continue
         frame_px = max(frame_px or 0, max(mip.shape))
-        loaded.append((float(t.x_mm), float(t.y_mm), mip))
+        loaded.append((float(t.x_mm), float(t.y_mm), mip, _tile_label(t)))
     if not loaded:
         logger.warning("Orientation preview: no MIPs could be read")
         return None
 
     fov_mm = (frame_px or 2048) * float(pixel_size_um) / 1000.0
 
-    xs = [x for x, _, _ in loaded]
-    ys = [y for _, y, _ in loaded]
+    xs = [x for x, _, _, _ in loaded]
+    ys = [y for _, y, _, _ in loaded]
     # mm span of tile CENTRES, padded by half a FOV each side (tiles centred).
     x_min, x_max = min(xs) - fov_mm / 2, max(xs) + fov_mm / 2
     y_min, y_max = min(ys) - fov_mm / 2, max(ys) + fov_mm / 2
@@ -301,20 +312,31 @@ def build_mip_mosaic(
     canvas = np.zeros((H, W), dtype=np.float32)
 
     tile_px = max(1, int(round(fov_mm / mm_per_px)))
-    for x_mm, y_mm, mip in loaded:
+    label_spots: List[Tuple[str, int, int]] = []
+    for x_mm, y_mm, mip, label in loaded:
         small = _resize(mip.astype(np.float32), tile_px, tile_px)
         cx = (x_mm - x_min) / mm_per_px
         cy = (y_mm - y_min) / mm_per_px
         r0 = int(round(cy - small.shape[0] / 2))
         c0 = int(round(cx - small.shape[1] / 2))
         _blit_max(canvas, small, r0, c0)
+        label_spots.append((label, int(round(cy)), int(round(cx))))
 
     # Normalise to [0, 1] with a robust upper percentile so a few hot beads
     # don't wash the preview out.
     hi = float(np.percentile(canvas, 99.5)) if canvas.any() else 1.0
     if hi <= 0:
         hi = 1.0
-    return np.clip(canvas / hi, 0.0, 1.0)
+    canvas = np.clip(canvas / hi, 0.0, 1.0)
+
+    # Burn tile labels last (onto the normalised canvas) so they read at full
+    # contrast and rotate/flip with the tiles under each orientation.
+    if label_tiles:
+        scale = max(2, tile_px // 40)
+        for label, cy, cx in label_spots:
+            if label:
+                _draw_label(canvas, label, cy, cx, scale)
+    return canvas
 
 
 def orientation_previews(mosaic: np.ndarray) -> "Dict[str, np.ndarray]":
@@ -322,20 +344,34 @@ def orientation_previews(mosaic: np.ndarray) -> "Dict[str, np.ndarray]":
     return {n: MosaicOrientation(n).apply2d(mosaic) for n in MosaicOrientation.NAMES}
 
 
-def _tile_mip(tile, channel: Optional[int]) -> Optional[np.ndarray]:
-    """Load a tile's max-projection: prefer the ``*_MP.tif`` companion."""
+def _is_full_range(z_range: Optional[Tuple[float, float]]) -> bool:
+    return z_range is None or (z_range[0] <= 0.0 and z_range[1] >= 1.0)
+
+
+def _tile_mip(
+    tile,
+    channel: Optional[int],
+    z_range: Optional[Tuple[float, float]] = None,
+) -> Optional[np.ndarray]:
+    """Load a tile's max-projection.
+
+    Full Z (default): use the fast per-tile ``*_MP.tif`` companion. A Z
+    sub-range: project just those planes from the raw/TIFF stack, so structure
+    confined to part of the stack isn't buried by the whole-stack projection.
+    """
     raw = _representative_raw(tile, channel)
     if raw is None:
         return None
-    mp = raw.with_name(raw.stem + "_MP.tif")
-    if mp.is_file():
-        try:
-            import tifffile
+    if _is_full_range(z_range):
+        mp = raw.with_name(raw.stem + "_MP.tif")
+        if mp.is_file():
+            try:
+                import tifffile
 
-            return np.asarray(tifffile.imread(str(mp)))
-        except Exception as e:  # noqa: BLE001
-            logger.debug("Could not read MIP %s: %s", mp.name, e)
-    return _cheap_mip_from_raw(raw, tile)
+                return np.asarray(tifffile.imread(str(mp)))
+            except Exception as e:  # noqa: BLE001
+                logger.debug("Could not read MIP %s: %s", mp.name, e)
+    return _mip_from_stack(raw, tile, z_range)
 
 
 def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
@@ -351,22 +387,122 @@ def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
     return by_illum[sorted(by_illum)[0]]
 
 
-def _cheap_mip_from_raw(raw: Path, tile) -> Optional[np.ndarray]:
-    """A cheap MIP from a raw file: max over a strided subset of Z planes."""
-    if raw.suffix.lower() != ".raw":
-        return None  # (Big)TIFF tiles: skip the heavy fallback for previews
+def _plane_bounds(
+    n: int, z_range: Optional[Tuple[float, float]]
+) -> Tuple[int, int, int]:
+    """(z0, z1, step) plane indices for a Z sub-range, capped at ~24 samples."""
+    if _is_full_range(z_range) or n <= 0:
+        z0, z1 = 0, n
+    else:
+        lo = min(max(z_range[0], 0.0), 1.0)
+        hi = min(max(z_range[1], 0.0), 1.0)
+        if hi < lo:
+            lo, hi = hi, lo
+        z0 = int(lo * n)
+        z1 = max(z0 + 1, int(round(hi * n)))
+        z1 = min(z1, n)
+    step = max(1, (z1 - z0) // 24)  # ≤ ~24 planes read per tile
+    return z0, z1, step
+
+
+def _mip_from_stack(
+    raw: Path, tile, z_range: Optional[Tuple[float, float]]
+) -> Optional[np.ndarray]:
+    """MIP over a (sub-)range of Z planes from a raw/TIFF tile stack."""
     try:
-        fw = int(getattr(tile, "frame_width", 2048) or 2048)
-        fh = int(getattr(tile, "frame_height", 2048) or 2048)
         n = int(getattr(tile, "n_planes", 0) or 0)
-        if n <= 0 or fw <= 0 or fh <= 0:
-            return None
-        mm = np.memmap(raw, dtype=np.uint16, mode="r", shape=(n, fh, fw))
-        step = max(1, n // 24)  # sample ~24 planes, not the whole stack
-        return np.max(mm[::step], axis=0)
-    except OSError as e:
-        logger.debug("Cheap MIP failed for %s: %s", raw.name, e)
+        z0, z1, step = _plane_bounds(n, z_range)
+        if raw.suffix.lower() == ".raw":
+            fw = int(getattr(tile, "frame_width", 2048) or 2048)
+            fh = int(getattr(tile, "frame_height", 2048) or 2048)
+            if n <= 0 or fw <= 0 or fh <= 0:
+                return None
+            mm = np.memmap(raw, dtype=np.uint16, mode="r", shape=(n, fh, fw))
+            return np.max(mm[z0:z1:step], axis=0)
+        # (Big)TIFF: read only the sampled pages in the range.
+        import tifffile
+
+        with tifffile.TiffFile(str(raw)) as tf:
+            pages = tf.pages
+            npages = len(pages)
+            if n <= 0 or n > npages:
+                z0, z1, step = _plane_bounds(npages, z_range)
+            idxs = list(range(z0, min(z1, npages), step))
+            if not idxs:
+                return None
+            stack = np.stack([np.asarray(pages[i].asarray()) for i in idxs])
+            return np.max(stack, axis=0)
+    except (OSError, ValueError) as e:
+        logger.debug("MIP-from-stack failed for %s: %s", raw.name, e)
         return None
+
+
+def _tile_label(tile) -> str:
+    """A short reference label for a tile — its grid index, e.g. ``X0Y0``."""
+    idx = getattr(tile, "tile_index", None)
+    if idx and len(idx) == 2:
+        return f"X{int(idx[0])}Y{int(idx[1])}"
+    return ""
+
+
+# 3×5 bitmap glyphs (rows top→bottom) for the tile-index labels. Kept tiny and
+# dependency-free so labels can be burned into the numpy mosaic (and thus rotate
+# with it) without Pillow/Qt.
+_FONT_3x5 = {
+    "0": ("111", "101", "101", "101", "111"),
+    "1": ("010", "110", "010", "010", "111"),
+    "2": ("111", "001", "111", "100", "111"),
+    "3": ("111", "001", "111", "001", "111"),
+    "4": ("101", "101", "111", "001", "001"),
+    "5": ("111", "100", "111", "001", "111"),
+    "6": ("111", "100", "111", "101", "111"),
+    "7": ("111", "001", "010", "010", "010"),
+    "8": ("111", "101", "111", "101", "111"),
+    "9": ("111", "101", "111", "001", "111"),
+    "X": ("101", "101", "010", "101", "101"),
+    "Y": ("101", "101", "010", "010", "010"),
+}
+
+
+def _draw_label(canvas: np.ndarray, text: str, cy: int, cx: int, scale: int) -> None:
+    """Burn ``text`` (3×5 bitmap font) centred near (cy, cx) into ``canvas``.
+
+    Draws a dark plate then bright glyph pixels so the label reads at any mosaic
+    brightness. Clipped to the canvas; off-canvas labels are skipped.
+    """
+    scale = max(1, int(scale))
+    gw, gh = 3, 5
+    adv = gw + 1  # 1-column gap between glyphs
+    text = "".join(ch for ch in text if ch in _FONT_3x5)
+    if not text:
+        return
+    total_w = (len(text) * adv - 1) * scale
+    total_h = gh * scale
+    top = int(cy - total_h / 2)
+    left = int(cx - total_w / 2)
+    H, W = canvas.shape
+    # Dark backing plate for contrast (with a small margin).
+    pad = scale
+    r0, r1 = max(0, top - pad), min(H, top + total_h + pad)
+    c0, c1 = max(0, left - pad), min(W, left + total_w + pad)
+    if r0 >= r1 or c0 >= c1:
+        return
+    canvas[r0:r1, c0:c1] *= 0.15
+    x = left
+    for ch in text:
+        glyph = _FONT_3x5[ch]
+        for gy in range(gh):
+            row = glyph[gy]
+            for gx in range(gw):
+                if row[gx] == "1":
+                    yy0 = top + gy * scale
+                    xx0 = x + gx * scale
+                    yy1, xx1 = yy0 + scale, xx0 + scale
+                    ay0, ax0 = max(0, yy0), max(0, xx0)
+                    ay1, ax1 = min(H, yy1), min(W, xx1)
+                    if ay0 < ay1 and ax0 < ax1:
+                        canvas[ay0:ay1, ax0:ax1] = 1.0
+        x += adv * scale
 
 
 def _guess_pixel_size_um(acquisition_dir: Path) -> float:

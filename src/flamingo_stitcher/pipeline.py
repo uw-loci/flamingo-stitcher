@@ -1345,6 +1345,10 @@ class RawTileInfo:
     # truncated). Kept so the caller (GUI/CLI) can WARN the user visibly rather
     # than only logging it: the run can continue, but the data may be off.
     metadata_warning: Optional[str] = None
+    # Integer grid index (x_idx, y_idx) from the flat filename (X###_Y###), when
+    # available. Used for user-facing tile labels (e.g. the orientation preview);
+    # None for folder-layout acquisitions whose folders carry mm, not indices.
+    tile_index: Optional[Tuple[int, int]] = None
 
     @property
     def z_step_mm(self) -> float:
@@ -1981,6 +1985,7 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                 frame_width=frame_w,
                 frame_height=frame_h,
                 metadata_warning=tile_warning,
+                tile_index=(x_idx, y_idx),
             )
         )
 

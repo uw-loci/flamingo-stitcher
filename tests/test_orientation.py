@@ -161,3 +161,38 @@ def test_build_mip_mosaic_no_tiles_returns_none(tmp_path):
     empty = tmp_path / "empty"
     empty.mkdir()
     assert build_mip_mosaic(empty) is None
+
+
+def test_build_mip_mosaic_z_range_reads_raw(tmp_path):
+    """A Z sub-range projects from the raw stack (not the full *_MP.tif)."""
+    acq = _write_flat_acq_with_mips(tmp_path)
+    m = build_mip_mosaic(
+        acq, pixel_size_um=100.0, target_long_px=200, z_range=(0.0, 0.5)
+    )
+    assert m is not None and m.ndim == 2 and m.any()
+
+
+def test_tile_label_from_index():
+    from flamingo_stitcher.orientation import _tile_label
+
+    class _T:
+        tile_index = (3, 5)
+
+    class _T2:
+        tile_index = None
+
+    assert _tile_label(_T()) == "X3Y5"
+    assert _tile_label(_T2()) == ""
+
+
+def test_plane_bounds():
+    from flamingo_stitcher.orientation import _plane_bounds
+
+    assert _plane_bounds(100, None)[:2] == (0, 100)
+    z0, z1, _ = _plane_bounds(100, (0.0, 0.25))
+    assert (z0, z1) == (0, 25)
+    z0, z1, _ = _plane_bounds(100, (0.75, 1.0))
+    assert (z0, z1) == (75, 100)
+    # A sub-range always yields at least one plane.
+    z0, z1, _ = _plane_bounds(4, (0.9, 0.95))
+    assert z1 > z0

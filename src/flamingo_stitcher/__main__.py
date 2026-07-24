@@ -236,6 +236,17 @@ def main():
         "pick the correct orientation for a system. Optional PNG path "
         "(default: orientation_preview.png next to the acquisition).",
     )
+    qc_group.add_argument(
+        "--preview-z-range",
+        nargs=2,
+        type=float,
+        default=None,
+        metavar=("LO", "HI"),
+        help="Restrict the orientation preview projection to a Z sub-range, as "
+        "plane fractions in [0,1] (e.g. 0 0.25 = bottom quarter). Reveals "
+        "structure the full-stack projection buries under scattered beads. "
+        "Default: full stack.",
+    )
 
     # Output format
     output_group = parser.add_argument_group("Output")
@@ -363,7 +374,10 @@ def main():
             resolve_output_orientation,
         )
 
-        mosaic = build_mip_mosaic(acq_dir, pixel_size_um=args.pixel_size_um)
+        z_range = tuple(args.preview_z_range) if args.preview_z_range else None
+        mosaic = build_mip_mosaic(
+            acq_dir, pixel_size_um=args.pixel_size_um, z_range=z_range
+        )
         if mosaic is None:
             print("Could not build an orientation preview (no tiles/MIPs).")
             sys.exit(1)
