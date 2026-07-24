@@ -316,15 +316,21 @@ def main():
     if args.dry_run:
         tiles = discover_tiles(acq_dir)
         if not tiles:
-            print("No tile folders found.")
+            from .pipeline import discover_flat_tiles
+
+            tiles = discover_flat_tiles(acq_dir)
+        if not tiles:
+            print("No tiles found.")
             sys.exit(1)
         print(f"\nFound {len(tiles)} tiles:\n")
         for i, t in enumerate(tiles):
+            flag = " ⚠" if getattr(t, "metadata_warning", None) else ""
             print(
                 f"  {i + 1:3d}. {t.folder.name}  "
                 f"X={t.x_mm:8.3f}  Y={t.y_mm:8.3f}  "
                 f"Z=[{t.z_min_mm:.3f}, {t.z_max_mm:.3f}]  "
                 f"planes={t.n_planes}  ch={t.channels}  illum={t.illumination_sides}"
+                f"{flag}"
             )
         xs = sorted(set(t.x_mm for t in tiles))
         ys = sorted(set(t.y_mm for t in tiles))
@@ -332,6 +338,16 @@ def main():
         print(
             f"Total raw files: {sum(sum(len(v) for v in t.raw_files.values()) for t in tiles)}"
         )
+        # Prominent data-quality warning — corrupt/degraded tiles the run would
+        # otherwise handle silently.
+        warned = [t for t in tiles if getattr(t, "metadata_warning", None)]
+        if warned:
+            print(
+                f"\n⚠  {len(warned)} of {len(tiles)} tiles had corrupt or "
+                f"degraded data (stitching can still run, but review them):"
+            )
+            for t in warned:
+                print(f"   • {t.metadata_warning}")
         sys.exit(0)
 
     # Orientation preview: assemble a MIP mosaic under all 8 orientations,

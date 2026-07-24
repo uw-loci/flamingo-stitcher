@@ -164,3 +164,32 @@ def test_discovery_survives_one_corrupt_settings_file(tmp_path, monkeypatch):
     # (Start X = 1.0, so tile index 0 -> 1.0), NOT its (unreadable) 50.0.
     fell_back = next(t for t in tiles if t.x_mm < 40.0)
     assert fell_back.x_mm == pytest.approx(1.0)
+
+    # The degraded tile is FLAGGED so the GUI/CLI can warn the user visibly,
+    # not just log it. The healthy tile carries no warning.
+    assert fell_back.metadata_warning is not None
+    assert "metadata" in fell_back.metadata_warning.lower()
+    assert healthy.metadata_warning is None
+
+
+def test_raw_size_warning_flags_truncated_and_ok(tmp_path):
+    """A short .raw is flagged as truncated; a correctly-sized one is not."""
+    from flamingo_stitcher.pipeline import _raw_size_warning
+
+    fw = fh = 8
+    n = 2
+    expected = n * fw * fh * 2  # 256 bytes
+
+    ok = tmp_path / "ok.raw"
+    ok.write_bytes(b"\x00" * expected)
+    assert _raw_size_warning(ok, n, fw, fh) is None
+
+    short = tmp_path / "short.raw"
+    short.write_bytes(b"\x00" * (expected // 2))
+    w = _raw_size_warning(short, n, fw, fh)
+    assert w is not None and "truncated" in w.lower()
+
+    # Non-raw (e.g. compressed TIFF) is not size-checked.
+    tif = tmp_path / "x.tif"
+    tif.write_bytes(b"\x00" * 4)
+    assert _raw_size_warning(tif, n, fw, fh) is None

@@ -1797,11 +1797,31 @@ class StitchingDialog(PersistentDialog):
 
         for item in pending:
             self._log(f"Scanning: {item['path'].name}")
+            item["warnings"] = []
             try:
                 tiles = self._discover_tiles_for_path(item["path"])
                 if tiles:
                     item["tiles"] = tiles
                     self._log(f"  Found {len(tiles)} tiles")
+                    # Surface per-tile data-quality warnings (corrupt / unreadable
+                    # metadata used a grid-estimated position; truncated image
+                    # files) prominently — a run can continue but the user must
+                    # know the data may be off.
+                    warned = [
+                        t for t in tiles if getattr(t, "metadata_warning", None)
+                    ]
+                    if warned:
+                        item["warnings"] = [t.metadata_warning for t in warned]
+                        self._log(
+                            f"  ⚠ {len(warned)} of {len(tiles)} tiles have "
+                            f"data-quality warnings:"
+                        )
+                        for t in warned[:12]:
+                            self._log(f"      • {t.metadata_warning}")
+                        if len(warned) > 12:
+                            self._log(
+                                f"      • …and {len(warned) - 12} more"
+                            )
                 else:
                     self._log("  No tiles found")
                     item["status"] = "error"
@@ -1819,6 +1839,10 @@ class StitchingDialog(PersistentDialog):
         total = sum(len(it["tiles"]) for it in self._queue if it["tiles"])
         ok = sum(1 for it in pending if it["tiles"])
         self._log(f"\nDiscovered {total} tiles across {ok}/{len(pending)} directories")
+
+        # A visible, can't-miss warning if any tile had corrupt/degraded data —
+        # the Log pane is collapsed by default, so a log line alone is not enough.
+        self._warn_on_discovery_issues(pending)
         self._update_action_buttons()
 
         # Auto-detect the Z step from the data on every Discover, overriding a
@@ -1898,6 +1922,44 @@ class StitchingDialog(PersistentDialog):
         # The full detail is logged above, but the log panel is collapsed by
         # default, so users miss what was detected (frame/AOI, pixel, Z, etc.).
         self._update_image_detected_hint()
+
+    def _warn_on_discovery_issues(self, pending):
+        """Pop a visible warning if any discovered tile had corrupt/degraded data.
+
+        Discovery is resilient — a tile with a corrupt/unreadable _Settings.txt
+        falls back to a grid-estimated position, and a truncated raw is flagged
+        rather than aborting the run. But those only reach the (collapsed) Log
+        pane, so this raises a modal summary the user can't miss. The stitch can
+        still proceed; the point is informed consent that the data may be off.
+        """
+        issues = [
+            (str(it["path"].name), w)
+            for it in pending
+            for w in it.get("warnings", [])
+        ]
+        if not issues:
+            return
+        n = len(issues)
+        dirs = sorted({name for name, _ in issues})
+        lines = [
+            f"{n} tile{'s' if n != 1 else ''} across "
+            f"{len(dirs)} acquisition{'s' if len(dirs) != 1 else ''} had "
+            "corrupt or degraded data during discovery.",
+            "",
+            "Stitching can still run, but these tiles may be mis-placed or "
+            "incomplete. Review before trusting the output:",
+            "",
+        ]
+        for name, w in issues[:15]:
+            lines.append(f"  • [{name}] {w}")
+        if n > 15:
+            lines.append(f"  • …and {n - 15} more (see the Log for the full list)")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Data-quality warnings")
+        box.setText("\n".join(lines))
+        box.setStandardButtons(QMessageBox.Ok)
+        box.exec_()
 
     def _update_image_detected_hint(self):
         """Refresh the always-visible "Tell me about your image" hint with the
@@ -3096,6 +3158,16 @@ class StitchingDialog(PersistentDialog):
                     return
                 item["tiles"] = tiles
                 self._log_tile_summary(tiles)
+                # Run may skip the explicit Discover step, so warn here too if
+                # any tile came back with corrupt/degraded data.
+                warned = [
+                    t for t in tiles if getattr(t, "metadata_warning", None)
+                ]
+                if warned:
+                    item["warnings"] = [t.metadata_warning for t in warned]
+                    for t in warned:
+                        self._log(f"  ⚠ {t.metadata_warning}")
+                    self._warn_on_discovery_issues([item])
             except Exception as e:
                 item["status"] = "error"
                 item["error"] = str(e)

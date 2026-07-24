@@ -1339,6 +1339,12 @@ class RawTileInfo:
     # Defaulting to the module FRAME_WIDTH/HEIGHT keeps older call sites valid.
     frame_width: int = FRAME_WIDTH
     frame_height: int = FRAME_HEIGHT
+    # Set when discovery had to degrade or infer this tile — e.g. a corrupt /
+    # unreadable _Settings.txt (position taken from the Workflow.txt grid) or a
+    # raw file whose byte size doesn't match its plane/frame geometry (possibly
+    # truncated). Kept so the caller (GUI/CLI) can WARN the user visibly rather
+    # than only logging it: the run can continue, but the data may be off.
+    metadata_warning: Optional[str] = None
 
     @property
     def z_step_mm(self) -> float:
@@ -1880,6 +1886,7 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
         # abort discovery of the whole acquisition — degrade to the same
         # grid-computed position used when the companion file is simply absent.
         pos = None
+        tile_warning: Optional[str] = None
         if settings_file:
             try:
                 pos = _read_position_from_settings(settings_file)
@@ -1891,6 +1898,10 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                     e,
                     x_idx,
                     y_idx,
+                )
+                tile_warning = (
+                    f"corrupt/unreadable metadata ({settings_file.name}); "
+                    f"position estimated from the acquisition grid"
                 )
                 settings_file = None  # also route the angle read to the fallback
         if pos is None:
@@ -1905,6 +1916,11 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                     f"X{x_idx}_Y{y_idx}, using default positions"
                 )
                 pos = {"x_mm": 0.0, "y_mm": 0.0, "z_min_mm": 0.0, "z_max_mm": 1.0}
+                tile_warning = (
+                    "no readable position metadata (_Settings.txt / "
+                    "Workflow.txt); using default (0, 0) — tile placement "
+                    "is unreliable"
+                )
 
         # Parse raw files for channel/illumination/planes metadata
         raw_files_dict: Dict[int, Dict[int, Path]] = {}
@@ -1937,6 +1953,12 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
         _sample = next(iter(next(iter(raw_files_dict.values())).values()))
         n_planes, frame_w, frame_h = _resolve_tile_geometry(_sample, n_planes, flat_aoi)
 
+        # Image-data sanity: a raw file whose byte size doesn't match its
+        # plane/frame geometry is likely truncated or corrupt. Flag it (the run
+        # can still proceed) so the caller can warn visibly.
+        img_warn = _raw_size_warning(_sample, n_planes, frame_w, frame_h)
+        tile_warning = "; ".join(w for w in (tile_warning, img_warn) if w) or None
+
         # Rotation-stage angle: prefer the tile's _Settings.txt, else root Workflow.txt.
         angle_deg = _read_start_angle(settings_file) if settings_file else 0.0
         if angle_deg == 0.0 and root_wf.exists():
@@ -1958,12 +1980,46 @@ def discover_flat_tiles(acquisition_dir: Path) -> List[RawTileInfo]:
                 angle_deg=angle_deg,
                 frame_width=frame_w,
                 frame_height=frame_h,
+                metadata_warning=tile_warning,
             )
         )
 
     tiles.sort(key=lambda t: (t.y_mm, t.x_mm))
     logger.info(f"Discovered {len(tiles)} flat-layout tiles in {acquisition_dir}")
     return tiles
+
+
+def _raw_size_warning(
+    path: Path, n_planes: int, frame_w: int, frame_h: int
+) -> Optional[str]:
+    """Return a warning if a ``.raw`` file's byte size is inconsistent.
+
+    A uint16 raw stack should be exactly ``n_planes * frame_w * frame_h * 2``
+    bytes. A smaller file is truncated; a mismatch either way suggests corrupt
+    or wrongly-sized data. Only checked for ``.raw`` (TIFF sizes vary with
+    compression). Read errors are themselves reported as a corruption signal.
+    """
+    try:
+        if path.suffix.lower() != ".raw":
+            return None
+        if n_planes <= 0 or frame_w <= 0 or frame_h <= 0:
+            return None
+        expected = int(n_planes) * int(frame_w) * int(frame_h) * 2
+        actual = path.stat().st_size
+        if actual == expected:
+            return None
+        if actual < expected:
+            pct = 100.0 * actual / expected if expected else 0.0
+            return (
+                f"image file {path.name} looks truncated "
+                f"({actual:,} of {expected:,} bytes, {pct:.0f}%)"
+            )
+        return (
+            f"image file {path.name} is larger than its geometry implies "
+            f"({actual:,} vs {expected:,} bytes)"
+        )
+    except OSError as e:
+        return f"image file {path.name} is unreadable ({e})"
 
 
 def _compute_grid_position(
