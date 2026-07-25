@@ -350,6 +350,10 @@ class StitchingDialog(PersistentDialog):
         # TileOrientation, or None to fall back to the saved per-microscope
         # preset / default). Applied in _build_config.
         self._session_orientation = None
+
+        # "Apply to all remaining" decision for existing outputs this batch:
+        # None (ask each time), "overwrite", or "rename".
+        self._overwrite_policy = None
         self._batch_channels = None
         self._batch_results = []  # List of (path, success, error_msg)
         # Last classified pipeline step; drives step-aware OOM advice on failure.
@@ -3023,6 +3027,8 @@ class StitchingDialog(PersistentDialog):
         self._batch_config = config
         self._batch_channels = self._parse_channels()
         self._batch_results = []
+        # Fresh existing-output decision each batch (ask again per Run).
+        self._overwrite_policy = None
 
         # Lock all config controls during the run (settings, processing
         # options, background zeroing) so they can't be toggled mid-stitch —
@@ -3235,6 +3241,21 @@ class StitchingDialog(PersistentDialog):
         # Compute output path
         acq_name = item["path"].name
         output_dir = Path(self._output_dir_edit.text()) / f"{acq_name}_stitched"
+
+        # Existing-output guard: the store name encodes the acquisition +
+        # settings, so an existing one means this exact stitch was run before.
+        # Ask before overwriting (Overwrite / Rename / Cancel) instead of
+        # silently replacing a prior result.
+        output_dir = self._resolve_existing_output(item, output_dir)
+        if output_dir is None:  # user cancelled → skip this item
+            item["status"] = "cancelled"
+            item["error"] = "Skipped — output already exists"
+            self._update_queue_table()
+            self._batch_results.append(
+                (item["path"], False, "Skipped — output already exists")
+            )
+            self._advance_queue()
+            return
         item["output_path"] = str(output_dir)
 
         # Update status
@@ -3248,6 +3269,63 @@ class StitchingDialog(PersistentDialog):
         # reclamation. Instant/no-op for the first item and whenever RAM is
         # already ample.
         self._launch_item_when_memory_ready(item, output_dir)
+
+    def _resolve_existing_output(self, item, output_dir):
+        """Decide what to do if this item's output already exists.
+
+        Returns the (possibly renamed) output dir to write to, or None to skip
+        this item. Honours a "apply to all remaining" decision made earlier in
+        the batch; otherwise prompts Overwrite / New folder / Cancel.
+        """
+        from flamingo_stitcher.pipeline import StitchingPipeline
+
+        try:
+            pipe = StitchingPipeline(self._build_config())
+            expected = pipe.expected_output_path(item["path"], output_dir)
+        except Exception:  # noqa: BLE001 - can't determine → old behaviour
+            return output_dir
+        if not expected.exists():
+            return output_dir
+        if self._overwrite_policy == "overwrite":
+            return output_dir
+        if self._overwrite_policy == "rename":
+            return self._unique_output_dir(pipe, item["path"], output_dir)
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Output already exists")
+        box.setText(
+            f"A stitched output already exists for '{item['path'].name}' with "
+            f"these settings:\n\n{expected}\n\nOverwrite it, write to a new "
+            f"numbered folder (keeping the old one), or skip this item?"
+        )
+        overwrite_btn = box.addButton("Overwrite", QMessageBox.DestructiveRole)
+        rename_btn = box.addButton("New folder", QMessageBox.AcceptRole)
+        box.addButton("Skip", QMessageBox.RejectRole)
+        apply_all = QCheckBox("Apply to all remaining")
+        box.setCheckBox(apply_all)
+        box.exec_()
+        clicked = box.clickedButton()
+
+        if clicked is rename_btn:
+            if apply_all.isChecked():
+                self._overwrite_policy = "rename"
+            return self._unique_output_dir(pipe, item["path"], output_dir)
+        if clicked is overwrite_btn:
+            if apply_all.isChecked():
+                self._overwrite_policy = "overwrite"
+            return output_dir
+        return None  # Skip
+
+    def _unique_output_dir(self, pipe, acq_path, output_dir):
+        """A sibling output dir whose store doesn't collide (…_stitched_2, _3)."""
+        base = Path(output_dir)
+        candidate = base
+        n = 2
+        while pipe.expected_output_path(acq_path, candidate).exists():
+            candidate = Path(str(base) + f"_{n}")
+            n += 1
+        return candidate
 
     # ---- Between-item memory-recovery gate -------------------------------
     _MEM_WAIT_TIMEOUT_S = 120.0  # stop waiting and proceed after this long

@@ -2992,6 +2992,29 @@ class StitchingPipeline:
 
         return base
 
+    # Primary output store extension by format (the one a re-run would clobber).
+    _PRIMARY_EXT = {
+        "ome-zarr-sharded": ".ome.zarr",
+        "ome-zarr-v2": ".ome.zarr",
+        "ome-tiff": ".ome.tif",
+        "imaris": ".ims",
+        "both": ".ome.zarr",  # zarr is the primary; .ome.tif is also written
+    }
+
+    def expected_output_path(
+        self, acquisition_dir: Path, output_dir: Path
+    ) -> Path:
+        """Path of the primary output store this config would write.
+
+        Lets the GUI/CLI detect an existing result (same acquisition + settings)
+        before running, so a re-run can prompt / skip / rename instead of
+        silently overwriting. The name encodes the enabled preprocessing tags,
+        so runs with different settings resolve to different files.
+        """
+        basename = self._build_output_basename(Path(acquisition_dir))
+        ext = self._PRIMARY_EXT.get(self.config.output_format, ".ome.zarr")
+        return Path(output_dir) / f"{basename}{ext}"
+
     def run(
         self,
         acquisition_dir: Path,

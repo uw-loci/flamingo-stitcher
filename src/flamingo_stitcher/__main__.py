@@ -301,6 +301,15 @@ def main():
         action="store_true",
         help="Use TensorStore backend for Zarr writes (faster for large data)",
     )
+    output_group.add_argument(
+        "--if-exists",
+        choices=("overwrite", "skip", "unique"),
+        default="overwrite",
+        help="What to do when the output already exists (same acquisition + "
+        "settings): overwrite (default; replace it), skip (leave it, don't "
+        "re-stitch), or unique (write to a new numbered folder, preserving the "
+        "old one).",
+    )
 
     # Pyramid
     pyramid_group = parser.add_argument_group("Multi-resolution pyramid")
@@ -511,6 +520,24 @@ def main():
 
     # Run
     pipeline = StitchingPipeline(config)
+
+    # Existing-output policy: the store name encodes the acquisition + settings,
+    # so an existing one means "same run again".
+    existing = pipeline.expected_output_path(acq_dir, output_path)
+    if existing.exists():
+        if args.if_exists == "skip":
+            print(f"Output already exists, skipping: {existing}")
+            sys.exit(0)
+        if args.if_exists == "unique":
+            base = Path(output_path)
+            n = 2
+            while pipeline.expected_output_path(acq_dir, base).exists():
+                base = Path(str(output_path) + f"_{n}")
+                n += 1
+            output_path = base
+            print(f"Output exists; writing to a new location: {output_path}")
+        else:
+            print(f"Overwriting existing output: {existing}")
     try:
         result = pipeline.run(acq_dir, output_path, channels=args.channels)
         print(f"\nStitched output: {result}")
