@@ -789,6 +789,15 @@ class StitchingConfig:
     # False→"identity"), so existing single-camera systems are unchanged.
     tile_orientation: str = ""
 
+    # Reverse the tile ORDER along a stage axis (place tiles X3 X2 X1 X0 instead
+    # of X0 X1 X2 X3) WITHOUT flipping tile pixels — the stage-sign degree of
+    # freedom, independent of tile_orientation. Needed when a stage axis runs
+    # opposite to the camera content direction (a system can need a per-tile
+    # flip in X but an order reversal in Y). Applied to the placement
+    # translation in _register_tiles.
+    reverse_x_tiles: bool = False
+    reverse_y_tiles: bool = False
+
     # Processing
     flat_field_correction: bool = False  # BaSiCPy flat-field correction
     destripe: bool = False  # Run PyStripe destriping
@@ -4766,8 +4775,14 @@ class StitchingPipeline:
         for volume, tile_info in tile_data:
             translation_um = {
                 "z": tile_info.z_min_mm * 1000.0,
-                "y": tile_info.y_mm * 1000.0,
-                "x": tile_info.x_mm * 1000.0,
+                "y": (
+                    -tile_info.y_mm if self.config.reverse_y_tiles else tile_info.y_mm
+                )
+                * 1000.0,
+                "x": (
+                    -tile_info.x_mm if self.config.reverse_x_tiles else tile_info.x_mm
+                )
+                * 1000.0,
             }
             if not isinstance(volume, da.Array):
                 volume = da.from_array(volume, chunks=_DASK_PROCESSING_CHUNKS)
@@ -4995,8 +5010,14 @@ class StitchingPipeline:
         for volume, tile_info in tile_data:
             translation_um = {
                 "z": tile_info.z_min_mm * 1000.0,
-                "y": tile_info.y_mm * 1000.0,
-                "x": tile_info.x_mm * 1000.0,
+                "y": (
+                    -tile_info.y_mm if self.config.reverse_y_tiles else tile_info.y_mm
+                )
+                * 1000.0,
+                "x": (
+                    -tile_info.x_mm if self.config.reverse_x_tiles else tile_info.x_mm
+                )
+                * 1000.0,
             }
             if not isinstance(volume, da.Array):
                 volume = da.from_array(volume, chunks=_DASK_PROCESSING_CHUNKS)
@@ -5476,8 +5497,14 @@ class StitchingPipeline:
             # Convert stage positions from mm to µm
             translation_um = {
                 "z": tile_info.z_min_mm * 1000.0,
-                "y": tile_info.y_mm * 1000.0,
-                "x": tile_info.x_mm * 1000.0,
+                "y": (
+                    -tile_info.y_mm if self.config.reverse_y_tiles else tile_info.y_mm
+                )
+                * 1000.0,
+                "x": (
+                    -tile_info.x_mm if self.config.reverse_x_tiles else tile_info.x_mm
+                )
+                * 1000.0,
             }
 
             # Wrap as dask array for lazy computation

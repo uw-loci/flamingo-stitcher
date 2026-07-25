@@ -174,6 +174,42 @@ def test_build_mip_mosaic_no_tiles_returns_none(tmp_path):
     assert build_mip_mosaic(empty) is None
 
 
+def test_reverse_order_changes_placement_not_pixels(tmp_path):
+    """Reversing tile order flips the layout without transforming tile pixels."""
+    acq = _write_flat_acq_with_mips(tmp_path)
+    normal = build_mip_mosaic(acq, pixel_size_um=100.0, target_long_px=200)
+    rev_x = build_mip_mosaic(
+        acq, pixel_size_um=100.0, target_long_px=200, reverse_x=True
+    )
+    assert normal is not None and rev_x is not None
+    assert normal.shape == rev_x.shape
+    # Reversing X order has an effect (tiles swap columns)...
+    assert not np.array_equal(rev_x, normal)
+    # ...but it does NOT flip each tile's pixels, so it is NOT a full left-right
+    # mirror of the mosaic (which would also mirror tile content).
+    assert not np.array_equal(rev_x, normal[:, ::-1])
+
+
+def test_save_and_resolve_user_orientation(tmp_path, monkeypatch):
+    """A saved per-microscope choice round-trips via resolve_tile_orientation."""
+    from flamingo_stitcher import orientation as orient
+
+    # Redirect the user-presets file into the tmp dir.
+    preset_file = tmp_path / "presets.json"
+    monkeypatch.setattr(orient, "_user_presets_path", lambda: preset_file)
+
+    acq = tmp_path / "acq"
+    acq.mkdir()
+    (acq / "ScopeSettings.txt").write_text("Microscope name = aslm-25x\n")
+
+    orient.save_microscope_orientation("aslm-25x", "transpose", False, True)
+    resolved = orient.resolve_tile_orientation(acq)
+    assert resolved is not None
+    assert resolved.name == "transpose"
+    assert resolved.reverse_x is False
+    assert resolved.reverse_y is True
+
+
 def test_build_mip_mosaic_z_range_reads_raw(tmp_path):
     """A Z sub-range projects from the raw stack (not the full *_MP.tif)."""
     acq = _write_flat_acq_with_mips(tmp_path)

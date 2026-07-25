@@ -248,6 +248,29 @@ def main():
         "Default: full stack.",
     )
 
+    orient_group = parser.add_argument_group("Tile orientation")
+    orient_group.add_argument(
+        "--tile-orientation",
+        default=None,
+        metavar="NAME",
+        help="Per-tile camera→stage orientation applied to EVERY tile so tiles "
+        "connect. One of: identity, rot90, rot180, rot270, flip_h, flip_v, "
+        "transpose, anti_transpose. Default: the saved per-microscope preset (by "
+        "acquisition name), else the legacy X-flip. Choose it with "
+        "--preview-orientations.",
+    )
+    orient_group.add_argument(
+        "--reverse-x-tiles",
+        action="store_true",
+        help="Reverse the tile ORDER along stage X (X3 X2 X1 X0) without flipping "
+        "the images — the stage-sign control, independent of --tile-orientation.",
+    )
+    orient_group.add_argument(
+        "--reverse-y-tiles",
+        action="store_true",
+        help="Reverse the tile order along stage Y.",
+    )
+
     # Output format
     output_group = parser.add_argument_group("Output")
     output_group.add_argument(
@@ -461,6 +484,27 @@ def main():
             else None
         ),
     )
+
+    # Tile orientation: an explicit --tile-orientation / --reverse-*-tiles flag
+    # wins; otherwise auto-apply the saved per-microscope preset (by acquisition
+    # name); otherwise the legacy default stays.
+    if args.tile_orientation:
+        config.tile_orientation = args.tile_orientation.strip().lower()
+        config.reverse_x_tiles = args.reverse_x_tiles
+        config.reverse_y_tiles = args.reverse_y_tiles
+    else:
+        from .orientation import resolve_tile_orientation
+
+        _ori = resolve_tile_orientation(acq_dir)
+        if _ori is not None and _ori.name:
+            config.tile_orientation = _ori.name
+            config.reverse_x_tiles = _ori.reverse_x
+            config.reverse_y_tiles = _ori.reverse_y
+        # A bare --reverse-*-tiles (without --tile-orientation) still applies.
+        if args.reverse_x_tiles:
+            config.reverse_x_tiles = True
+        if args.reverse_y_tiles:
+            config.reverse_y_tiles = True
 
     # Output path
     output_path = args.output or acq_dir / "stitched"

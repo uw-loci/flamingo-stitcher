@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import logging
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -232,7 +233,7 @@ def _child_dirs(d: Path) -> List[Path]:
 
 
 def resolve_output_orientation(acquisition_dir: Path) -> Optional[str]:
-    """Best-effort ``output_orientation`` for an acquisition via microscope name.
+    """Best-effort ``tile_orientation`` name for an acquisition via microscope name.
 
     Returns the matching preset name, or None when the microscope name is
     unknown / has no preset (caller keeps the configured/default orientation).
@@ -242,8 +243,94 @@ def resolve_output_orientation(acquisition_dir: Path) -> Optional[str]:
         return None
     ori = preset_for_microscope(name)
     if ori:
-        logger.info("Output-orientation preset '%s' → %s", name, ori)
+        logger.info("Tile-orientation preset '%s' → %s", name, ori)
     return ori
+
+
+# --------------------------------------------------------------------------- #
+# User-saved per-microscope orientation (chosen from the preview) — full
+# (tile_orientation, reverse_x, reverse_y), persisted to a user JSON file so it
+# survives restarts and so CLI + GUI share it. This is separate from the bundled
+# YAML presets (which ship a name only).
+# --------------------------------------------------------------------------- #
+@dataclass
+class TileOrientation:
+    """A complete tile-placement choice: pixel orientation + tile-order signs."""
+
+    name: str = ""  # one of MosaicOrientation.NAMES ("" = leave default)
+    reverse_x: bool = False
+    reverse_y: bool = False
+
+
+def _user_presets_path() -> Path:
+    return Path.home() / ".flamingo_stitcher" / "orientation_presets.json"
+
+
+def _read_user_presets() -> Dict[str, Dict]:
+    try:
+        import json
+
+        p = _user_presets_path()
+        if p.is_file():
+            data = json.loads(p.read_text())
+            if isinstance(data, dict):
+                return data
+    except Exception as e:  # noqa: BLE001 - best-effort
+        logger.debug("Could not read user orientation presets: %s", e)
+    return {}
+
+
+def save_microscope_orientation(
+    microscope_name: str, name: str, reverse_x: bool, reverse_y: bool
+) -> None:
+    """Persist the chosen orientation for a microscope (best-effort)."""
+    if not microscope_name:
+        return
+    try:
+        import json
+
+        presets = _read_user_presets()
+        presets[str(microscope_name).strip().lower()] = {
+            "tile_orientation": name,
+            "reverse_x": bool(reverse_x),
+            "reverse_y": bool(reverse_y),
+        }
+        path = _user_presets_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(presets, indent=2))
+        logger.info(
+            "Saved tile orientation for '%s': %s (revX=%s revY=%s)",
+            microscope_name,
+            name,
+            reverse_x,
+            reverse_y,
+        )
+    except Exception as e:  # noqa: BLE001 - persistence is best-effort
+        logger.warning("Could not save orientation for %s: %s", microscope_name, e)
+
+
+def resolve_tile_orientation(acquisition_dir: Path) -> Optional["TileOrientation"]:
+    """Full orientation for an acquisition, by microscope name.
+
+    Precedence: user-saved preset (name + reverse flags) > bundled YAML preset
+    (name only) > None (caller keeps the configured default). None means "no
+    saved choice for this system".
+    """
+    name = read_microscope_name(acquisition_dir)
+    if not name:
+        return None
+    key = name.strip().lower()
+    user = _read_user_presets().get(key)
+    if isinstance(user, dict) and user.get("tile_orientation"):
+        return TileOrientation(
+            name=str(user["tile_orientation"]).strip().lower(),
+            reverse_x=bool(user.get("reverse_x", False)),
+            reverse_y=bool(user.get("reverse_y", False)),
+        )
+    yaml_name = preset_for_microscope(name)
+    if yaml_name:
+        return TileOrientation(name=yaml_name)
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -258,6 +345,8 @@ def build_mip_mosaic(
     z_range: Optional[Tuple[float, float]] = None,
     label_tiles: bool = True,
     tile_transform: Optional["MosaicOrientation"] = None,
+    reverse_x: bool = False,
+    reverse_y: bool = False,
 ) -> Optional[np.ndarray]:
     """Assemble a fast low-res MIP mosaic for preview.
 
@@ -286,7 +375,13 @@ def build_mip_mosaic(
     if not loaded:
         return None
     return _composite_tiles(
-        loaded, pixel_size_um, tile_transform, target_long_px, label_tiles
+        loaded,
+        pixel_size_um,
+        tile_transform,
+        target_long_px,
+        label_tiles,
+        reverse_x=reverse_x,
+        reverse_y=reverse_y,
     )
 
 
@@ -330,15 +425,19 @@ def _composite_tiles(
     tile_transform: Optional["MosaicOrientation"],
     target_long_px: int,
     label_tiles: bool,
+    reverse_x: bool = False,
+    reverse_y: bool = False,
 ) -> np.ndarray:
     """Composite tiles at their stage positions, transforming EACH TILE first.
 
-    ``tile_transform`` is applied to every tile's pixels BEFORE placement (the
-    placement grid — stage x→col, y→row — never changes). This is what actually
-    reorients the acquisition: adjacent tiles only connect when each tile's
-    content axes are aligned to the stage axes. Rotating the finished mosaic
-    would just rotate the (still-broken) seams. Tile labels are drawn upright at
-    the (fixed) tile centres so they stay readable in every orientation.
+    ``tile_transform`` is applied to every tile's pixels BEFORE placement — this
+    reorients each tile's CONTENT so adjacent tiles connect. ``reverse_x`` /
+    ``reverse_y`` reverse the tile ORDER along that stage axis (place at the
+    mirrored position) WITHOUT touching the tile pixels — the separate degree of
+    freedom for a stage whose axis sign is inverted (X3 X2 X1 X0 instead of X0…
+    X3). Content orientation and tile order are independent: a system can need a
+    per-tile flip in X but an order reversal in Y. Tile labels are drawn upright
+    at the tile centres so they stay readable.
     """
     frame_px = max((max(m.shape) for _, _, m, _ in loaded), default=2048)
     fov_mm = frame_px * float(pixel_size_um) / 1000.0
@@ -361,8 +460,10 @@ def _composite_tiles(
         if tile_transform is not None:
             img = tile_transform.apply2d(img)  # per-tile reorientation
         small = _resize(img, tile_px, tile_px)
-        cx = (x_mm - x_min) / mm_per_px
-        cy = (y_mm - y_min) / mm_per_px
+        # Reverse the tile ORDER along an axis (mirror the placement) without
+        # touching the tile pixels — the stage-sign degree of freedom.
+        cx = ((x_max - x_mm) if reverse_x else (x_mm - x_min)) / mm_per_px
+        cy = ((y_max - y_mm) if reverse_y else (y_mm - y_min)) / mm_per_px
         r0 = int(round(cy - small.shape[0] / 2))
         c0 = int(round(cx - small.shape[1] / 2))
         _blit_max(canvas, small, r0, c0)
@@ -389,21 +490,31 @@ def orientation_previews(
     channel: Optional[int] = None,
     z_range: Optional[Tuple[float, float]] = None,
     label_tiles: bool = True,
+    reverse_x: bool = False,
+    reverse_y: bool = False,
 ) -> "Dict[str, np.ndarray]":
-    """Build one mosaic per orientation, applying each PER TILE.
+    """Build one mosaic per per-tile orientation (8), under the given tile order.
 
-    Returns ``{orientation_name: mosaic}`` for all eight. Each mosaic transforms
-    every tile's pixels by that orientation and then re-composites at the stage
-    grid — so the panels differ in how tiles CONNECT, not merely how the whole
-    image is rotated. The user picks the one where the tissue is continuous
-    across the seams. Tiles are read once and re-composited eight times.
+    Returns ``{orientation_name: mosaic}`` for all eight. Each mosaic reorients
+    every tile's pixels by that orientation then re-composites at the stage grid,
+    so the panels differ in how tiles CONNECT. ``reverse_x`` / ``reverse_y``
+    reverse the tile ORDER along that axis for all panels (the separate stage-
+    sign control) — pick the pixel orientation AND the order that together make
+    the tissue continuous across the seams. Tiles are read once, composited
+    eight times.
     """
     loaded, px = _load_tile_mips(acquisition_dir, pixel_size_um, channel, z_range)
     if not loaded:
         return {}
     return {
         name: _composite_tiles(
-            loaded, px, MosaicOrientation(name), target_long_px, label_tiles
+            loaded,
+            px,
+            MosaicOrientation(name),
+            target_long_px,
+            label_tiles,
+            reverse_x=reverse_x,
+            reverse_y=reverse_y,
         )
         for name in MosaicOrientation.NAMES
     }

@@ -345,6 +345,11 @@ class StitchingDialog(PersistentDialog):
         self._queue_index = -1  # Index of currently processing item
         self._batch_running = False
         self._batch_config = None
+
+        # Tile orientation chosen via the Orientation Preview this session (a
+        # TileOrientation, or None to fall back to the saved per-microscope
+        # preset / default). Applied in _build_config.
+        self._session_orientation = None
         self._batch_channels = None
         self._batch_results = []  # List of (path, success, error_msg)
         # Last classified pipeline step; drives step-aware OOM advice on failure.
@@ -1503,12 +1508,33 @@ class StitchingDialog(PersistentDialog):
             )
 
             dlg = OrientationPreviewDialog(acq_path, parent=self)
+            dlg.orientation_chosen.connect(self._on_orientation_chosen)
             dlg.exec_()
         except Exception as e:  # noqa: BLE001 - never let a preview crash the app
             self._logger.exception("Orientation preview failed to open")
             QMessageBox.critical(
                 self, "Orientation preview", f"Could not open preview:\n{e}"
             )
+
+    def _on_orientation_chosen(self, name: str, reverse_x: bool, reverse_y: bool):
+        """Apply the orientation picked in the preview to this session's runs.
+
+        Stored on the dialog and pushed into every StitchingConfig built for a
+        run (see _build_config). It's also saved per-microscope by the preview,
+        so future sessions auto-apply it by acquisition name.
+        """
+        from flamingo_stitcher.orientation import TileOrientation
+
+        self._session_orientation = TileOrientation(
+            name=name, reverse_x=reverse_x, reverse_y=reverse_y
+        )
+        rev = []
+        if reverse_x:
+            rev.append("reverse X")
+        if reverse_y:
+            rev.append("reverse Y")
+        suffix = (" + " + ", ".join(rev)) if rev else ""
+        self._log(f"Tile orientation set to '{name}{suffix}' for this session.")
 
     def _requeue_selected(self):
         """Reset selected finished items (Done / Error / Cancelled) to Pending.
@@ -2552,6 +2578,28 @@ class StitchingDialog(PersistentDialog):
         area. No-op in the base dialog."""
         return
 
+    def _apply_tile_orientation(self, config) -> None:
+        """Set config.tile_orientation / reverse_x/y_tiles for the run.
+
+        Priority: an explicit choice made in the Orientation Preview this
+        session > the saved per-microscope preset for the first queued
+        acquisition > leave the config default (legacy camera_x_inverted).
+        """
+        ori = self._session_orientation
+        if ori is None:
+            try:
+                from flamingo_stitcher.orientation import resolve_tile_orientation
+
+                first = next((it for it in self._queue if it.get("path")), None)
+                if first is not None:
+                    ori = resolve_tile_orientation(first["path"])
+            except Exception:  # noqa: BLE001 - orientation resolve is best-effort
+                ori = None
+        if ori is not None and getattr(ori, "name", ""):
+            config.tile_orientation = ori.name
+            config.reverse_x_tiles = bool(ori.reverse_x)
+            config.reverse_y_tiles = bool(ori.reverse_y)
+
     def _build_config(self):
         """Build a StitchingConfig from YAML defaults + current UI settings."""
         from flamingo_stitcher.pipeline import StitchingConfig
@@ -2598,6 +2646,12 @@ class StitchingDialog(PersistentDialog):
         chunk = self._chunk_size_combo.currentData()
         if chunk:
             config.output_chunksize = dict(chunk)
+
+        # Tile orientation: a "Use for stitching" choice made in the Orientation
+        # Preview this session wins; otherwise auto-apply the saved per-microscope
+        # orientation for the first queued acquisition (by its microscope name).
+        # Left untouched (YAML/camera_x_inverted default) when neither is set.
+        self._apply_tile_orientation(config)
 
         # Background zeroing: only forward thresholds when the master
         # checkbox is on. The pipeline guards on background_zero_enabled
