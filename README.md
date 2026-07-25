@@ -82,6 +82,48 @@ If you hit trouble (out-of-memory, a run that seems stuck, slow stitching), clic
 
 ---
 
+## Getting the tiles to connect (camera orientation)
+
+If your stitched mosaic comes out with the tiles **not lining up** — the same
+broken image no matter which fusion/overlap setting you try — your camera is
+probably oriented differently from the default, so each tile needs to be
+re-oriented before it's placed. Fix it visually, no config editing:
+
+1. Add your acquisition and click **Discover Tiles**.
+2. Click **Orientation Preview…**. It shows the mosaic under all 8 tile
+   orientations (built quickly from the per-tile MIP files) — each panel
+   re-orients *every tile* and re-tiles at the stage grid.
+3. If scattered beads hide the real structure, narrow the **Z projection**
+   (e.g. *Bottom 25%*) — structure often lives in part of the stack.
+4. If the tiles are laid out **backwards** (X3 X2 X1 X0 instead of X0 X1 X2 X3),
+   tick **Reverse X order** / **Reverse Y order** — this is separate from the
+   panel choice (a system can need a flip in X but a reversed order in Y).
+5. Select the panel where the tissue is **continuous across the seams**, then
+   click **Use for stitching**.
+
+Your choice is applied to the run **and remembered for that microscope** (by its
+name in the acquisition metadata), so future data from the same system picks it
+up automatically. Command line:
+`--tile-orientation NAME [--reverse-x-tiles] [--reverse-y-tiles]`.
+
+## Re-running to the same folder
+
+Re-stitching the same data with the same settings would overwrite the previous
+result. The app now **asks first** — *Overwrite*, *New folder* (writes a
+numbered copy, keeping the old one), or *Skip* — with an "apply to all remaining"
+option for batches. Runs with *different* settings already get distinct
+filenames and coexist. Command line: `--if-exists {overwrite,skip,unique}`.
+
+## Corrupt or incomplete tiles
+
+If a tile's metadata or image file can't be read (a flaky USB drive, a truncated
+`.raw`), discovery no longer throws away the whole acquisition — it estimates
+that tile's position from the acquisition grid and keeps going, then shows a
+**"Data-quality warnings"** summary so you know which tiles may be off before you
+trust the result.
+
+---
+
 ## For developers / Python users
 
 ```bash
