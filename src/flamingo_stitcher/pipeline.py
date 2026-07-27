@@ -5997,19 +5997,44 @@ class StitchingPipeline:
 
         # 3) Tile orientation. In auto mode, resolve THIS acquisition's
         #    orientation from its own microscope name (user preset > bundled
-        #    YAML > the camera_x_inverted default), so a batch mixing systems —
-        #    or a stale choice from another scope — can't mis-orient this item.
-        #    Always log the EFFECTIVE choice: it is otherwise invisible and a
-        #    wrong orientation silently produces a broken (non-connecting) stitch.
-        try:
-            if getattr(self.config, "auto_tile_orientation", False):
-                from flamingo_stitcher.orientation import resolve_tile_orientation
+        #    YAML), so a batch mixing systems — or a stale choice from another
+        #    scope — can't mis-orient this item. A microscope with NO chosen
+        #    orientation is refused (no guessed default): OrientationUnknownError
+        #    propagates so the run stops with clear guidance instead of silently
+        #    producing a broken (non-connecting) stitch.
+        if getattr(self.config, "auto_tile_orientation", False):
+            from flamingo_stitcher.orientation import (
+                OrientationUnknownError,
+                has_orientation_preview_data,
+                read_microscope_name,
+                resolve_tile_orientation,
+            )
 
-                ori = resolve_tile_orientation(acquisition_dir)
-                if ori is not None and ori.name:
-                    self.config.tile_orientation = ori.name
-                    self.config.reverse_x_tiles = bool(ori.reverse_x)
-                    self.config.reverse_y_tiles = bool(ori.reverse_y)
+            ori = resolve_tile_orientation(acquisition_dir)
+            if ori is not None and ori.name:
+                self.config.tile_orientation = ori.name
+                self.config.reverse_x_tiles = bool(ori.reverse_x)
+                self.config.reverse_y_tiles = bool(ori.reverse_y)
+            else:
+                scope = read_microscope_name(acquisition_dir) or "(unnamed)"
+                if has_orientation_preview_data(acquisition_dir):
+                    raise OrientationUnknownError(
+                        f"No tile orientation is set for microscope '{scope}'. "
+                        f"Each microscope needs its orientation chosen once: open "
+                        f"the Orientation Preview, pick the panel where tiles "
+                        f"connect, and click 'Use for stitching' (GUI) or pass "
+                        f"--tile-orientation (CLI). Refusing to stitch with a "
+                        f"guessed orientation."
+                    )
+                raise OrientationUnknownError(
+                    f"Tile orientation is unknown for microscope '{scope}', and "
+                    f"this dataset has no MIPs to determine it from. Use a dataset "
+                    f"that includes per-tile MIPs (*_MP.tif) or readable raw "
+                    f"stacks for '{scope}' to choose the orientation, then re-run."
+                )
+
+        # Log the effective orientation (always — otherwise it's invisible).
+        try:
             effective = self.config.tile_orientation or (
                 "flip_h" if self.config.camera_x_inverted else "identity"
             )
@@ -6023,8 +6048,8 @@ class StitchingPipeline:
                 + (f" + {', '.join(revs)}" if revs else "")
                 + (" (auto, per-acquisition)" if self.config.auto_tile_orientation else "")
             )
-        except Exception as e:  # never let orientation resolve/log break a run
-            self.logger.debug(f"Tile-orientation resolve/log skipped: {e}")
+        except Exception as e:  # never let the log line break a run
+            self.logger.debug(f"Tile-orientation log skipped: {e}")
 
         # 3) Partial-capture & multi-angle flags.
         try:

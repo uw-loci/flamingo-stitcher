@@ -2,12 +2,16 @@
 
 When ``auto_tile_orientation`` is on, the pipeline must resolve each
 acquisition's orientation from ITS OWN microscope name — so a batch mixing
-systems (or a stale choice from another scope) can't mis-orient an item.
+systems (or a stale choice from another scope) can't mis-orient an item — and
+REFUSE to guess when a microscope has no chosen orientation.
 """
 
 from pathlib import Path
 
+import pytest
+
 import flamingo_stitcher.orientation as orient
+from flamingo_stitcher.orientation import OrientationUnknownError
 from flamingo_stitcher.pipeline import (
     StitchingConfig,
     StitchingPipeline,
@@ -64,14 +68,32 @@ def test_auto_orientation_prefers_user_preset(tmp_path, monkeypatch):
     assert ry is True
 
 
-def test_unknown_scope_keeps_legacy_default(tmp_path, monkeypatch):
-    # No preset anywhere → leave the config default (empty tile_orientation,
-    # which the pipeline treats as flip_h when camera_x_inverted).
+def test_unknown_scope_blocks_and_points_to_preview(tmp_path, monkeypatch):
+    # No preset anywhere → refuse to guess. The synth acq has raw tiles, so the
+    # preview can build → guidance points to the Orientation Preview.
     monkeypatch.setattr(orient, "_user_presets_path", lambda: tmp_path / "none.json")
     acq = _named_acq(tmp_path / "mystery", "totally-unknown-scope")
-    name, rx, ry = _resolve_orientation(
-        acq, StitchingConfig(auto_tile_orientation=True)
-    )
-    assert name == ""  # untouched; _preprocess derives flip_h from camera_x_inverted
-    assert rx is False
-    assert ry is False
+    with pytest.raises(OrientationUnknownError) as ei:
+        _resolve_orientation(acq, StitchingConfig(auto_tile_orientation=True))
+    assert "totally-unknown-scope" in str(ei.value)
+    assert "Orientation Preview" in str(ei.value)
+
+
+def test_unknown_scope_without_preview_data_warns_about_mips(tmp_path, monkeypatch):
+    monkeypatch.setattr(orient, "_user_presets_path", lambda: tmp_path / "none.json")
+    # Force "no data to preview" so the message tells the user to use a dataset
+    # with MIPs, regardless of what's on disk.
+    monkeypatch.setattr(orient, "has_orientation_preview_data", lambda _p: False)
+    acq = _named_acq(tmp_path / "mystery", "nodata-scope")
+    with pytest.raises(OrientationUnknownError) as ei:
+        _resolve_orientation(acq, StitchingConfig(auto_tile_orientation=True))
+    assert "MIPs" in str(ei.value)
+
+
+def test_has_orientation_preview_data(tmp_path):
+    acq = write_synth_acquisition(tmp_path / "acq", grid=(2, 2))
+    assert orient.has_orientation_preview_data(acq) is True
+    # Remove the raw tiles → nothing to project from.
+    for raw in acq.rglob("*.raw"):
+        raw.unlink()
+    assert orient.has_orientation_preview_data(acq) is False

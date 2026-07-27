@@ -28,6 +28,7 @@ import logging
 import sys
 from pathlib import Path
 
+from .orientation import OrientationUnknownError
 from .pipeline import StitchingConfig, StitchingPipeline, discover_tiles
 
 
@@ -498,26 +499,21 @@ def main():
         ),
     )
 
-    # Tile orientation: an explicit --tile-orientation / --reverse-*-tiles flag
-    # wins; otherwise auto-apply the saved per-microscope preset (by acquisition
-    # name); otherwise the legacy default stays.
+    # Tile orientation: an explicit --tile-orientation flag wins (with any
+    # --reverse-*-tiles). Otherwise resolve per-acquisition from the microscope's
+    # preset AND require a known orientation — the pipeline refuses to guess.
     if args.tile_orientation:
         config.tile_orientation = args.tile_orientation.strip().lower()
         config.reverse_x_tiles = args.reverse_x_tiles
         config.reverse_y_tiles = args.reverse_y_tiles
     else:
-        from .orientation import resolve_tile_orientation
-
-        _ori = resolve_tile_orientation(acq_dir)
-        if _ori is not None and _ori.name:
-            config.tile_orientation = _ori.name
-            config.reverse_x_tiles = _ori.reverse_x
-            config.reverse_y_tiles = _ori.reverse_y
-        # A bare --reverse-*-tiles (without --tile-orientation) still applies.
-        if args.reverse_x_tiles:
-            config.reverse_x_tiles = True
-        if args.reverse_y_tiles:
-            config.reverse_y_tiles = True
+        config.auto_tile_orientation = True
+        if args.reverse_x_tiles or args.reverse_y_tiles:
+            print(
+                "Note: --reverse-x-tiles/--reverse-y-tiles are ignored without "
+                "--tile-orientation; set them with the orientation, or in the "
+                "per-microscope preset."
+            )
 
     # Output path
     output_path = args.output or acq_dir / "stitched"
@@ -548,6 +544,9 @@ def main():
     except ImportError as e:
         print(f"\nMissing dependency: {e}", file=sys.stderr)
         sys.exit(1)
+    except OrientationUnknownError as e:
+        print(f"\nTile orientation not set: {e}", file=sys.stderr)
+        sys.exit(2)
     except FileNotFoundError as e:
         print(f"\nNo data found: {e}", file=sys.stderr)
         sys.exit(1)

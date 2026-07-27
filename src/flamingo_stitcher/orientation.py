@@ -38,6 +38,15 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+class OrientationUnknownError(RuntimeError):
+    """Raised when an acquisition's microscope has no chosen tile orientation.
+
+    A new microscope must have its orientation selected once (via the preview /
+    a preset) — the pipeline refuses to stitch with a guessed orientation, which
+    would silently mis-place tiles.
+    """
+
+
 # --------------------------------------------------------------------------- #
 # The eight whole-mosaic orientations (dihedral group of the square)
 # --------------------------------------------------------------------------- #
@@ -571,6 +580,35 @@ def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
     if not by_illum:
         return None
     return by_illum[sorted(by_illum)[0]]
+
+
+def has_orientation_preview_data(acquisition_dir: Path) -> bool:
+    """True if the orientation preview can build from this acquisition.
+
+    The preview needs at least one tile's max-projection — a per-tile
+    ``*_MP.tif`` companion (fast path) or a readable raw/TIFF stack to project
+    from. Returns False for a metadata-only / unreadable acquisition, where the
+    orientation can't be determined and the user needs a dataset that includes
+    MIPs for that microscope.
+    """
+    try:
+        from flamingo_stitcher.pipeline import discover_flat_tiles, discover_tiles
+
+        tiles = discover_tiles(acquisition_dir)
+        if not tiles:
+            tiles = discover_flat_tiles(acquisition_dir)
+        for t in tiles:
+            raw = _representative_raw(t, None)
+            if raw is None:
+                continue
+            if raw.is_file():
+                return True
+            if raw.with_name(raw.stem + "_MP.tif").is_file():
+                return True
+        return False
+    except Exception as e:  # noqa: BLE001 - best-effort availability probe
+        logger.debug("has_orientation_preview_data failed: %s", e)
+        return False
 
 
 def _plane_bounds(

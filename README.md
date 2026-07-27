@@ -87,10 +87,16 @@ If you hit trouble (out-of-memory, a run that seems stuck, slow stitching), clic
 
 ## Getting the tiles to connect (camera orientation)
 
-If your stitched mosaic comes out with the tiles **not lining up** — the same
-broken image no matter which fusion/overlap setting you try — your camera is
-probably oriented differently from the default, so each tile needs to be
-re-oriented before it's placed. Fix it visually, no config editing:
+**Every microscope must have its tile orientation chosen once.** Different
+Flamingos mount the camera differently, so there is no safe default — the first
+time you stitch data from a microscope the app has not seen, it **stops and asks
+you to pick the orientation** (rather than guess and silently mis-place tiles).
+Once chosen, it's remembered for that microscope and applied automatically. If a
+dataset has no image data to preview from (no per-tile MIPs and no readable raw
+stacks), the app tells you it can't determine the orientation and that you need a
+dataset that includes MIPs for that microscope.
+
+To pick it — fix it visually, no config editing:
 
 1. Add your acquisition and click **Discover Tiles**.
 2. Click **Orientation Preview…**. It shows the mosaic under all 8 tile

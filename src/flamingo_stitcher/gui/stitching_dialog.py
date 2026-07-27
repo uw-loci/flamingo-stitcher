@@ -1506,6 +1506,10 @@ class StitchingDialog(PersistentDialog):
                 self, "Orientation preview", "That queue item has no path."
             )
             return
+        self._open_orientation_preview_for(acq_path)
+
+    def _open_orientation_preview_for(self, acq_path) -> None:
+        """Open the 8-orientation preview for a specific acquisition path."""
         try:
             from flamingo_stitcher.gui.orientation_preview_dialog import (
                 OrientationPreviewDialog,
@@ -2899,6 +2903,80 @@ class StitchingDialog(PersistentDialog):
         except ValueError:
             return None
 
+    def _confirm_orientation_known(self, pending) -> bool:
+        """Force a chosen tile orientation for every pending microscope.
+
+        Returns True to proceed. If any pending acquisition's microscope has no
+        orientation preset, blocks the run and prompts — offering to open the
+        Orientation Preview when the data can build it, or warning that a dataset
+        with MIPs is needed when it can't.
+        """
+        from flamingo_stitcher.orientation import (
+            has_orientation_preview_data,
+            read_microscope_name,
+            resolve_tile_orientation,
+        )
+
+        unknown = []  # (item, scope_name, has_data)
+        for it in pending:
+            p = it.get("path")
+            if not p:
+                continue
+            try:
+                if resolve_tile_orientation(p) is not None:
+                    continue  # this microscope's orientation is known
+            except Exception:  # noqa: BLE001 - resolve is best-effort
+                pass
+            try:
+                scope = read_microscope_name(p)
+            except Exception:  # noqa: BLE001
+                scope = None
+            try:
+                has_data = has_orientation_preview_data(p)
+            except Exception:  # noqa: BLE001
+                has_data = False
+            unknown.append((it, scope or "(unnamed)", has_data))
+
+        if not unknown:
+            return True
+
+        scopes = ", ".join(sorted({u[1] for u in unknown}))
+        any_data = any(u[2] for u in unknown)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Tile orientation not set")
+        msg = (
+            f"No tile orientation has been chosen for: {scopes}.\n\n"
+            "Each microscope needs its orientation chosen once so tiles connect "
+            "— stitching without it would silently mis-place tiles."
+        )
+        if any_data:
+            msg += (
+                "\n\nOpen the Orientation Preview, pick the panel where the "
+                "tissue is continuous across seams, and click 'Use for "
+                "stitching'. Then run again."
+            )
+            box.setText(msg)
+            open_btn = box.addButton(
+                "Open Orientation Preview…", QMessageBox.AcceptRole
+            )
+            box.addButton("Cancel", QMessageBox.RejectRole)
+            box.exec_()
+            if box.clickedButton() is open_btn:
+                target = next((u[0] for u in unknown if u[2]), None)
+                if target is not None:
+                    self._open_orientation_preview_for(target.get("path"))
+        else:
+            msg += (
+                "\n\n⚠ These datasets have no MIPs to determine the orientation "
+                "from. Use a dataset that includes per-tile MIPs (*_MP.tif) or "
+                "readable raw stacks for this microscope to choose it."
+            )
+            box.setText(msg)
+            box.addButton("OK", QMessageBox.RejectRole)
+            box.exec_()
+        return False
+
     def _confirm_pixel_size(self, pending, config) -> bool:
         """Block the run if the XY pixel size badly mismatches the objective.
 
@@ -3004,6 +3082,12 @@ class StitchingDialog(PersistentDialog):
             return
 
         config = self._build_config()
+
+        # Pre-flight: every acquisition's microscope must have a chosen tile
+        # orientation. A new microscope has none — force the selection (via the
+        # preview) instead of stitching with a guessed default.
+        if not self._confirm_orientation_known(pending):
+            return
 
         # Pre-flight: block if the XY pixel size clashes with the objective
         # recorded in ScopeSettings.txt (the #1 cause of gappy/overlapping
