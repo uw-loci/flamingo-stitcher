@@ -459,6 +459,10 @@ def main():
     # Build config
     config = StitchingConfig(
         pixel_size_um=pixel_size_um,
+        # No explicit --pixel-size-um → derive per-acquisition from its own
+        # objective (the value above is only a fallback). An explicit flag is a
+        # manual override applied as-is.
+        auto_pixel_size=(args.pixel_size_um is None),
         z_step_um=args.z_step_um,
         frame_width=args.frame_width,
         frame_height=args.frame_height,

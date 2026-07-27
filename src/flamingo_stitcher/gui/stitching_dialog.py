@@ -2056,7 +2056,16 @@ class StitchingDialog(PersistentDialog):
             suggested_pixel_size_um,
         )
 
-        first_item = next((it for it in self._queue if it.get("tiles")), None)
+        # Only consider PENDING items — an old completed ("Done") run still
+        # parked in the queue must not drive the pixel size for a new run.
+        first_item = next(
+            (
+                it
+                for it in self._queue
+                if it.get("tiles") and it.get("status") == "pending"
+            ),
+            None,
+        )
         if first_item is None:
             return
         acq = Path(first_item["path"])
@@ -2614,6 +2623,11 @@ class StitchingDialog(PersistentDialog):
         # Overlay UI settings
         z_step = self._z_step_spin.value()
         config.pixel_size_um = self._pixel_size_spin.value()
+        # Per-entry pixel size: unless the user deliberately set a value, each
+        # queued acquisition derives its own XY pixel size from its own
+        # objective at run time (so a batch mixing objectives is correct). The
+        # spin value is kept only as a fallback when an objective can't be read.
+        config.auto_pixel_size = not self._pixel_size_user_set
         config.z_step_um = z_step if z_step > 0 else None
         # Frame (AOI) override: None = auto-detect from file size.
         _frame = self._frame_size_combo.currentData()
@@ -2905,6 +2919,16 @@ class StitchingDialog(PersistentDialog):
             read_objective_magnification,
             suggested_pixel_size_um,
         )
+
+        # In auto mode each acquisition derives its own pixel size at run time,
+        # so a single-value-vs-objective prompt doesn't apply — the pipeline
+        # handles per-entry scaling. Just note it and proceed.
+        if getattr(config, "auto_pixel_size", False):
+            self._log(
+                "XY pixel size: each acquisition will use its own "
+                "objective-derived value (per-entry)."
+            )
+            return True
 
         cur = config.pixel_size_um
         suggestions = []  # (pixel_um, magnification)
@@ -3441,10 +3465,17 @@ class StitchingDialog(PersistentDialog):
 
     def _start_item_worker(self, item, output_dir):
         """Launch the stitching worker for *item* (memory gate already passed)."""
+        from dataclasses import replace
+
         from flamingo_stitcher.worker import StitchingWorker
 
+        # Give each item its OWN config copy: in auto mode the pipeline resolves
+        # this acquisition's pixel size into the config, and a fresh copy keeps
+        # one item's derived value from leaking into the next as a fallback.
+        item_config = replace(self._batch_config)
+
         self._worker = StitchingWorker(
-            config=self._batch_config,
+            config=item_config,
             acq_dir=item["path"],
             output_dir=output_dir,
             channels=self._batch_channels,

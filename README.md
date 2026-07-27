@@ -65,7 +65,10 @@ can leave all of them alone.** Everything more specialized lives in the collapse
 
 - **Tell me about your image** — facts about your data: pixel size, Z step, frame
   (camera ROI), and which channels. These are filled in automatically by *Discover
-  Tiles*; change one only if you know a detected value is wrong.
+  Tiles*; change one only if you know a detected value is wrong. Unless you set the
+  XY pixel size by hand, **each queued acquisition uses the pixel size implied by its
+  own objective** (from its `ScopeSettings.txt`), so a batch mixing objectives
+  stitches every item at the right scale. Type a value to override it for all.
 - **What kind of processing should we do?** — the choices that affect the output:
   *Downsample* (make the result smaller/faster), how the two light-sheet sides are
   combined, and how overlapping tiles are blended. The defaults are a good start.

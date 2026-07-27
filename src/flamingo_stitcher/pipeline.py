@@ -622,6 +622,12 @@ class StitchingConfig:
 
     # Voxel size
     pixel_size_um: float = 0.406  # XY pixel size in micrometers
+    # When True, ignore ``pixel_size_um`` as anything but a fallback and derive
+    # the XY pixel size per-acquisition from that acquisition's own recorded
+    # objective (ScopeSettings.txt). Lets a batch that mixes objectives stitch
+    # each item at its own scale instead of one value applied to all. A manual
+    # value (auto_pixel_size=False) is an explicit override applied to every item.
+    auto_pixel_size: bool = False
     # Z step: computed from data if None, otherwise override
     z_step_um: Optional[float] = None
     # Raw frame (camera AOI) override in pixels. None = auto-detect per
@@ -5938,7 +5944,10 @@ class StitchingPipeline:
                     f"{FRAME_WIDTH}×{FRAME_HEIGHT} — cropped/binned acquisition)"
                 )
 
-        # 2) Pixel size sanity-check against the recorded objective.
+        # 2) Pixel size — derive it per-acquisition from this acquisition's own
+        #    objective when in auto mode; otherwise sanity-check the configured
+        #    value against it. Runs before the voxel-size / fusion math below, so
+        #    a batch mixing objectives renders each item at the right scale.
         try:
             mag = read_objective_magnification(acquisition_dir)
             suggested = suggested_pixel_size_um(acquisition_dir)
@@ -5947,6 +5956,25 @@ class StitchingPipeline:
                     f"Objective (ScopeSettings.txt): {mag:.3f}× → effective pixel "
                     f"~{suggested:.3f} µm (sensor {_sensor_pixel_size_um():.2f} µm)"
                 )
+            if getattr(self.config, "auto_pixel_size", False):
+                # Per-entry: this acquisition uses the pixel size implied by ITS
+                # OWN objective, independent of any other queued item.
+                if suggested and suggested > 0:
+                    prev = self.config.pixel_size_um
+                    self.config.pixel_size_um = round(suggested, 4)
+                    self.logger.info(
+                        f"Auto XY pixel size (per-acquisition): "
+                        f"{self.config.pixel_size_um:.4f} µm from objective "
+                        f"{mag:.3f}× (fallback was {prev:.4f} µm)."
+                    )
+                else:
+                    self.logger.warning(
+                        f"Auto XY pixel size requested but no objective was found "
+                        f"in this acquisition's ScopeSettings.txt; falling back to "
+                        f"{self.config.pixel_size_um:.4f} µm. Set the pixel size "
+                        f"manually if that is wrong."
+                    )
+            elif mag and suggested:
                 cur = self.config.pixel_size_um
                 if cur > 0 and abs(cur - suggested) / suggested > 0.15:
                     self.logger.warning(
