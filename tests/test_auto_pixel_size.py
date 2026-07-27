@@ -54,3 +54,30 @@ def test_auto_falls_back_when_objective_missing(tmp_path):
     (acq / "ScopeSettings.txt").unlink()  # no objective to read
     px = _resolve_pixel(acq, StitchingConfig(pixel_size_um=0.406, auto_pixel_size=True))
     assert px == 0.406  # keeps the fallback rather than guessing
+
+
+def test_objective_found_when_scopesettings_is_nested(tmp_path):
+    """A user often selects a name-level folder whose ScopeSettings.txt lives a
+    couple levels down (under a date-stamped subfolder). The objective/pixel
+    read must descend to it just like tile discovery does, not fall back to a
+    wrong default (which renders tiles at the wrong scale -> spaced "dice")."""
+    from flamingo_stitcher.pipeline import (
+        _find_acquisition_file,
+        read_objective_magnification,
+        suggested_pixel_size_um,
+    )
+
+    root = tmp_path / "BrainSingleChannel2"
+    nested = root / "2026-07-27_12-00-00" / "tileset"
+    nested.mkdir(parents=True)
+    (nested / "ScopeSettings.txt").write_text(
+        "Objective lens magnification = 6.205\n"
+    )
+    # A decoy sibling tile folder with no ScopeSettings must not confuse it.
+    (root / "2026-07-27_12-00-00" / "tile_x0_y0").mkdir(parents=True)
+
+    assert _find_acquisition_file(root, "ScopeSettings.txt") is not None
+    assert read_objective_magnification(root) == 6.205
+    # 6.5 µm sensor / 6.205x ~= 1.047 µm, NOT a ~0.2-0.4 default.
+    px = suggested_pixel_size_um(root)
+    assert px is not None and 1.0 < px < 1.1

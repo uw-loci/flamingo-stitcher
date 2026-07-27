@@ -1927,6 +1927,14 @@ class StitchingDialog(PersistentDialog):
         # Auto-fill XY pixel size from the recorded objective (ScopeSettings.txt).
         self._autofill_pixel_size()
 
+        # Always record the effective XY pixel size in the LOG (the GUI spinbox
+        # shows it, but the log is what gets shared for analysis). This is the
+        # value that WILL be used, whatever its source (auto / manual / default).
+        self._log(
+            f"Effective XY pixel size: {self._pixel_size_spin.value():.4f} µm/px "
+            f"(the value stitching will use)"
+        )
+
         # Surface the detected frame (AOI) size, especially when it differs from
         # the hardware-config default (cropped/binned acquisition).
         self._log_detected_frame_size()
@@ -2083,6 +2091,27 @@ class StitchingDialog(PersistentDialog):
             self._logger.debug(f"pixel-size auto-fill skipped: {e}")
             return
         if not suggested:
+            # Objective/pixel size could not be derived. Don't fall back
+            # SILENTLY — an unreported wrong pixel size renders tiles at the
+            # wrong scale (spaced-out "dice") with no clue why. Report the
+            # value that WILL be used and how to fix it.
+            cur = self._pixel_size_spin.value()
+            mag = read_objective_magnification(acq)
+            if mag:
+                self._log(
+                    f"⚠ Read objective {mag:.2f}× from ScopeSettings.txt but "
+                    f"could not derive a pixel size; using {cur:.4f} µm/px. "
+                    f"Verify the scale."
+                )
+            else:
+                self._log(
+                    f"⚠ Could not read objective magnification from "
+                    f"ScopeSettings.txt for '{acq.name}' — using XY pixel size "
+                    f"{cur:.4f} µm/px (default/manual, NOT scope-derived). If "
+                    f"tiles render spaced apart, this is likely the cause: check "
+                    f"the acquisition has a ScopeSettings.txt containing "
+                    f"'Objective lens magnification'."
+                )
             return
         mag = read_objective_magnification(acq)
         mag_str = f"{mag:.2f}×" if mag else "?"

@@ -82,6 +82,15 @@ microscopes:
   #     tile_orientation: transpose
   #     reverse_y: true
 
+  # Liara — high-res system: 23.8x special objective (0.7 NA) into ethyl
+  # cinnamate, 200 mm tube lens (designed for 200, so no extra factor).
+  # Its acquisitions may not record the objective in ScopeSettings.txt, so
+  # this per-microscope objective is the fallback used to derive the XY pixel
+  # size: 6.5 µm / 23.8 ≈ 0.273 µm/px. (No tile_orientation yet — the first
+  # Liara stitch will prompt you to pick one via the Orientation Preview.)
+  liara:
+    objective_magnification: 23.8
+
 # Laser / illumination channels
 # Channel wavelengths used as defaults for per-channel deconvolution.
 # The first matching channel wavelength is used if no explicit override.

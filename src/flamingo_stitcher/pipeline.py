@@ -1515,23 +1515,53 @@ def _sensor_pixel_size_um() -> float:
         return 6.5
 
 
-def _find_acquisition_file(acquisition_dir: Path, name: str) -> Optional[Path]:
+def _find_acquisition_file(
+    acquisition_dir: Path, name: str, max_depth: int = 4
+) -> Optional[Path]:
     """Locate a metadata file (e.g. ScopeSettings.txt / Workflow.txt) near an
-    acquisition, searching the dir, its parent, and one level of children."""
+    acquisition.
+
+    Searches, nearest first: the dir itself, its parent, then DESCENDANTS
+    breadth-first down to ``max_depth`` levels (shallowest match wins). The
+    descent matters because a user often selects a name-level folder
+    (``BrainSingleChannel2/``) whose ScopeSettings.txt actually lives a couple
+    levels down under a date-stamped subfolder — tile discovery recurses and
+    finds the tiles there, so this must reach just as deep or the objective /
+    pixel size silently falls back to a wrong default.
+    """
     acq = Path(acquisition_dir)
-    candidates = [acq / name, acq.parent / name]
-    try:
-        for child in sorted(acq.iterdir()):
-            if child.is_dir():
-                candidates.append(child / name)
-    except OSError:
-        pass
-    for c in candidates:
+    # Nearest-first exact locations.
+    for c in (acq / name, acq.parent / name):
         try:
             if c.is_file():
                 return c
         except OSError:
             continue
+    # Breadth-first descent into subdirectories, shallowest match first.
+    frontier = [acq]
+    depth = 0
+    while frontier and depth < max_depth:
+        next_frontier = []
+        for d in frontier:
+            try:
+                children = sorted(d.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                try:
+                    if not child.is_dir():
+                        continue
+                except OSError:
+                    continue
+                cand = child / name
+                try:
+                    if cand.is_file():
+                        return cand
+                except OSError:
+                    pass
+                next_frontier.append(child)
+        frontier = next_frontier
+        depth += 1
     return None
 
 
@@ -1558,13 +1588,47 @@ def read_objective_magnification(acquisition_dir: Path) -> Optional[float]:
     return None
 
 
-def suggested_pixel_size_um(acquisition_dir: Path) -> Optional[float]:
-    """Effective XY pixel size implied by the acquisition's ScopeSettings.txt.
+def _config_objective_for_microscope(name: Optional[str]) -> Optional[float]:
+    """Per-microscope ``objective_magnification`` from microscope_hardware.yaml.
 
-    pixel = sensor_pixel_size / objective_magnification. Returns None when the
-    file or field is absent.
+    Reads the optional ``microscopes:`` block, keyed by microscope name
+    (case-insensitive). Lets a system whose acquisitions don't record the
+    objective in ScopeSettings.txt (e.g. Liara) still resolve the right pixel
+    size. Never raises.
+    """
+    if not name:
+        return None
+    try:
+        import yaml
+
+        from flamingo_stitcher.config_loader import _CONFIGS_DIR
+
+        yaml_path = _CONFIGS_DIR / "microscope_hardware.yaml"
+        if not yaml_path.is_file():
+            return None
+        raw = yaml.safe_load(yaml_path.read_text()) or {}
+        scopes = (raw.get("microscopes") or {}) if isinstance(raw, dict) else {}
+        entry = scopes.get(str(name).strip().lower()) or {}
+        mag = entry.get("objective_magnification") if isinstance(entry, dict) else None
+        return float(mag) if mag and float(mag) > 0 else None
+    except Exception:  # noqa: BLE001 - config lookup is best-effort
+        return None
+
+
+def suggested_pixel_size_um(acquisition_dir: Path) -> Optional[float]:
+    """Effective XY pixel size for an acquisition.
+
+    pixel = sensor_pixel_size / objective_magnification. Prefers the objective
+    the microscope recorded in ScopeSettings.txt; falls back to a per-microscope
+    ``objective_magnification`` from microscope_hardware.yaml (keyed by
+    "Microscope name") for systems that don't record it. Returns None when
+    neither is available.
     """
     mag = read_objective_magnification(acquisition_dir)
+    if not mag:
+        from flamingo_stitcher.orientation import read_microscope_name
+
+        mag = _config_objective_for_microscope(read_microscope_name(acquisition_dir))
     if not mag:
         return None
     return _sensor_pixel_size_um() / mag

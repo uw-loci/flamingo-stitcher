@@ -64,6 +64,11 @@ except ImportError as _e:
 # voxels.  256*256*64*2 bytes = 8 MB per block uint16.
 DEFAULT_BLOCK_SIZE_XYZ = (256, 256, 64)
 
+# Max seconds to wait for PyImarisWriter.Destroy() after a successful Finish().
+# Some builds block there while closing; the .ims is already complete and usable,
+# so we stop waiting rather than hang the whole run (GUI gif spins forever).
+_DESTROY_TIMEOUT_S = 20.0
+
 
 def is_available() -> bool:
     """Return True if PyImarisWriter is importable on this platform."""
@@ -387,16 +392,50 @@ def write_imaris_streaming(
         # Destroy() crash must NOT fail the write — downgrade it to a warning.
         # If Finish() did not complete, the real error from the try block still
         # propagates (we only swallow Destroy()'s own exception here).
-        try:
-            converter.Destroy()
-        except Exception as de:
-            if finished:
+        # Release the converter. Some PyImarisWriter builds can BLOCK in
+        # Destroy() while flushing/closing (not just raise) — which surfaces as
+        # "the .ims was written but the run never finishes" (the GUI gif spins
+        # forever because pipeline.run() never returns). After a successful
+        # Finish() the .ims is already complete and usable, so when Finish()
+        # succeeded we run Destroy() under a WATCHDOG: if it doesn't return
+        # promptly, log and move on instead of hanging the whole run. When
+        # Finish() did NOT succeed we call Destroy() inline so the real error
+        # from the try block still propagates.
+        logger.info("  Releasing Imaris converter (Destroy)…")
+        if finished:
+            import threading
+
+            _destroy_err: dict = {}
+
+            def _destroy():
+                try:
+                    converter.Destroy()
+                except Exception as de:  # noqa: BLE001
+                    _destroy_err["e"] = de
+
+            _t = threading.Thread(target=_destroy, name="ims-destroy", daemon=True)
+            _t.start()
+            _t.join(timeout=_DESTROY_TIMEOUT_S)
+            if _t.is_alive():
+                logger.warning(
+                    f"  PyImarisWriter Destroy() did not return within "
+                    f"{_DESTROY_TIMEOUT_S:.0f}s after a successful Finish() — the "
+                    f".ims file is complete and usable; continuing without "
+                    f"blocking the run. (A background close thread was left to "
+                    f"finish on its own.)"
+                )
+            elif "e" in _destroy_err:
                 logger.warning(
                     "  PyImarisWriter Destroy() raised after a successful "
                     "Finish() — the .ims file is complete and usable; ignoring "
-                    f"the cleanup error: {de}"
+                    f"the cleanup error: {_destroy_err['e']}"
                 )
             else:
+                logger.info("  Imaris converter released.")
+        else:
+            try:
+                converter.Destroy()
+            except Exception as de:
                 logger.error(f"  PyImarisWriter Destroy() also failed: {de}")
 
     return output_path
