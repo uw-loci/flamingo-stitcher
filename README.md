@@ -69,6 +69,18 @@ can leave all of them alone.** Everything more specialized lives in the collapse
   XY pixel size by hand, **each queued acquisition uses the pixel size implied by its
   own objective** (from its `ScopeSettings.txt`), so a batch mixing objectives
   stitches every item at the right scale. Type a value to override it for all.
+  - **The pixel size is always shown in the log.** Discovery prints
+    `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
+    tiles come out **spaced apart like dice**, this value is almost always wrong —
+    check that line first.
+  - **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
+    you select a parent folder whose acquisitions live in a dated subfolder, the
+    app now searches down into it — but if it still can't find the objective it
+    logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
+  - **Per-microscope fallback.** For systems that don't record the objective in
+    `ScopeSettings.txt`, a per-microscope `objective_magnification` in
+    `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
+    (23.8×) → ~0.273 µm/px.
 - **What kind of processing should we do?** — the choices that affect the output:
   *Downsample* (make the result smaller/faster), how the two light-sheet sides are
   combined, and how overlapping tiles are blended. The defaults are a good start.

@@ -27,12 +27,12 @@ selects streaming when the in-memory estimate exceeds ~60% of system RAM.
 
 | Phase | What it does | Marker lines |
 |---|---|---|
-| **Discover** | Find tiles, read the stage grid, frame size, pixel size, channels | `Step 1: … tiles in ~AxB grid`, `Frame size (AOI)`, `Objective (ScopeSettings.txt)` |
+| **Discover** | Find tiles, read the stage grid, frame size, pixel size, channels | `Step 1: … tiles in ~AxB grid`, `Frame size (AOI)`, `Objective (ScopeSettings.txt)`, `Effective XY pixel size: … µm/px (the value stitching will use)` |
 | **Preprocess / materialize** | Per tile: fuse L/R illumination sides, optional destripe/flat-field/deconv/downsample; in streaming mode each tile is written once to a scratch memmap | `Materializing N tiles for channel … → …\.stitch_tmp\chNN`, `Ch3: fusing 2 illumination sides (max)`, `Preprocessed N tiles in …s` |
 | **Register** | Align tiles. **Often skipped** (stage positions only) | `Step 3: Registering …` **or** `Step 3: Skipping registration — using stage positions only` |
 | **Border QC** (optional) | Diagnostic pass that flags sharp seams; does not change output | `Running tile-border artifact QC …`, `Border QC: N/M seams flagged` |
 | **Fuse** | Combine overlapping tiles into the output volume; in streaming mode fused into an on-disk `fused.dat` memmap in super-block regions | `Step 4: Fusing channel …`, `Auto super-block: fusing in K×K×K-chunk regions`, `Channel …: shape=… — R super-block region(s)` |
-| **Write** | Stream the fused volume into the chosen output format (+ pyramid) | `Step 6: Writing multi-channel output …`, `Writing pyramidal OME-TIFF: …`, `Wrote …\stitch_metadata.json` |
+| **Write** | Stream the fused volume into the chosen output format (+ pyramid) | `Step 6: Writing multi-channel output …`, `Writing pyramidal OME-TIFF: …`, `.ims write complete`, `Releasing Imaris converter (Destroy)…` / `Imaris converter released.`, `Wrote …\stitch_metadata.json` |
 | **Done** | Summary + per-phase time breakdown | `=== Pipeline complete …`, `=== Time breakdown ===` |
 
 ## 3. Reading the configuration echo (top of every run)
@@ -207,6 +207,8 @@ The log rarely contains these; ask before committing to a diagnosis:
 
 | Symptom in the log / image | Most likely cause | Advice |
 |---|---|---|
+| **Tiles render spaced apart like pips on dice** (not a connected mosaic) | Wrong XY pixel size — tiles are placed by stage µm but drawn at the wrong scale | Read the `Effective XY pixel size: …` line. If it's wrong, the objective wasn't read: **select the folder that contains `ScopeSettings.txt`** (or its parent — discovery descends into dated subfolders), or set a per-microscope `objective_magnification`. A ⚠ "could not read objective" line confirms the fallback was used. |
+| **Log ends at `.ims write complete` / `Releasing Imaris converter…` and the run never finishes** (GUI keeps spinning) | PyImarisWriter `Destroy()` blocked while closing the file | The `.ims` is already complete and usable. Fixed in v0.9.1+ (Destroy runs under a 20s watchdog, then the run continues) — update; on older builds, the written `.ims` can be opened despite the hang. |
 | Watchdog fires in **fuse (streaming)**, run **finishes** | Dirty/resident pages of `fused.dat` + tile spill (write-back lag), not allocation | Usually benign; move scratch to fast local NVMe; recent builds flush per region. Not a resolution problem. |
 | Watchdog fires in **in-memory** mode, or run **crashes** with `MemoryError` | Real allocation over RAM | Switch to streaming (or it already is) and/or raise XY/Z downsample; reduce workers; disable content-based. |
 | **Fuse = most of the runtime**, hours | I/O-bound full-res double-write | Fast separate scratch disk; downsample a step; `max` over `blend`; don't add fuse workers. |
