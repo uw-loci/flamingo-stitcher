@@ -803,6 +803,12 @@ class StitchingConfig:
     # translation in _register_tiles.
     reverse_x_tiles: bool = False
     reverse_y_tiles: bool = False
+    # When True, resolve tile_orientation / reverse_x_tiles / reverse_y_tiles
+    # PER acquisition from that acquisition's own microscope name (user preset >
+    # bundled YAML > the camera_x_inverted default), instead of using one choice
+    # for a whole batch. Mirrors auto_pixel_size: a batch mixing systems orients
+    # each correctly, and a stale/other-scope choice can't contaminate a run.
+    auto_tile_orientation: bool = False
 
     # Processing
     flat_field_correction: bool = False  # BaSiCPy flat-field correction
@@ -5988,6 +5994,37 @@ class StitchingPipeline:
                     )
         except Exception as e:  # never let diagnostics break a run
             self.logger.debug(f"Objective/pixel-size check skipped: {e}")
+
+        # 3) Tile orientation. In auto mode, resolve THIS acquisition's
+        #    orientation from its own microscope name (user preset > bundled
+        #    YAML > the camera_x_inverted default), so a batch mixing systems —
+        #    or a stale choice from another scope — can't mis-orient this item.
+        #    Always log the EFFECTIVE choice: it is otherwise invisible and a
+        #    wrong orientation silently produces a broken (non-connecting) stitch.
+        try:
+            if getattr(self.config, "auto_tile_orientation", False):
+                from flamingo_stitcher.orientation import resolve_tile_orientation
+
+                ori = resolve_tile_orientation(acquisition_dir)
+                if ori is not None and ori.name:
+                    self.config.tile_orientation = ori.name
+                    self.config.reverse_x_tiles = bool(ori.reverse_x)
+                    self.config.reverse_y_tiles = bool(ori.reverse_y)
+            effective = self.config.tile_orientation or (
+                "flip_h" if self.config.camera_x_inverted else "identity"
+            )
+            revs = []
+            if self.config.reverse_x_tiles:
+                revs.append("reverse-X order")
+            if self.config.reverse_y_tiles:
+                revs.append("reverse-Y order")
+            self.logger.info(
+                f"Tile orientation: {effective}"
+                + (f" + {', '.join(revs)}" if revs else "")
+                + (" (auto, per-acquisition)" if self.config.auto_tile_orientation else "")
+            )
+        except Exception as e:  # never let orientation resolve/log break a run
+            self.logger.debug(f"Tile-orientation resolve/log skipped: {e}")
 
         # 3) Partial-capture & multi-angle flags.
         try:

@@ -151,40 +151,13 @@ class MosaicOrientation:
 # Microscope-name presets (output_orientation) + name lookup
 # --------------------------------------------------------------------------- #
 def load_orientation_presets() -> Dict[str, str]:
-    """``{microscope_name_lower: output_orientation}`` from the hardware YAML.
+    """``{microscope_name_lower: tile_orientation_name}`` from the hardware YAML.
 
-    Reads the optional ``microscopes:`` block of the bundled
-    ``configs/microscope_hardware.yaml``. Never raises — a missing/broken block
-    yields an empty registry.
+    Name-only view of the bundled ``microscopes:`` presets (drops the reverse
+    flags — see :func:`_load_yaml_preset_objects` for the full form). Never
+    raises — a missing/broken block yields an empty registry.
     """
-    try:
-        import yaml
-
-        from flamingo_stitcher.config_loader import _CONFIGS_DIR
-
-        yaml_path = _CONFIGS_DIR / "microscope_hardware.yaml"
-        if not yaml_path.is_file():
-            return {}
-        with open(yaml_path, "r") as f:
-            raw = yaml.safe_load(f) or {}
-        scopes = (raw.get("microscopes") or {}) if isinstance(raw, dict) else {}
-        out: Dict[str, str] = {}
-        for name, entry in scopes.items():
-            key = None
-            if isinstance(entry, dict):
-                # tile_orientation is the current key; output_orientation is the
-                # deprecated whole-mosaic name kept for backward compatibility.
-                key = entry.get("tile_orientation") or entry.get(
-                    "output_orientation"
-                )
-            if key:
-                ori = str(key).strip().lower()
-                if ori in MosaicOrientation.NAMES:
-                    out[str(name).strip().lower()] = ori
-        return out
-    except Exception as e:  # noqa: BLE001 - presets are best-effort
-        logger.debug("Could not load orientation presets: %s", e)
-        return {}
+    return {k: v.name for k, v in _load_yaml_preset_objects().items()}
 
 
 def preset_for_microscope(name: Optional[str]) -> Optional[str]:
@@ -309,12 +282,52 @@ def save_microscope_orientation(
         logger.warning("Could not save orientation for %s: %s", microscope_name, e)
 
 
+def _load_yaml_preset_objects() -> Dict[str, "TileOrientation"]:
+    """Full per-microscope presets from the bundled hardware YAML.
+
+    Reads the optional ``microscopes:`` block: each entry's ``tile_orientation``
+    (one of the 8 dihedral names; ``output_orientation`` accepted as a
+    deprecated alias) plus optional ``reverse_x`` / ``reverse_y`` tile-order
+    flags. Never raises — a missing/broken block yields an empty registry.
+    """
+    try:
+        import yaml
+
+        from flamingo_stitcher.config_loader import _CONFIGS_DIR
+
+        yaml_path = _CONFIGS_DIR / "microscope_hardware.yaml"
+        if not yaml_path.is_file():
+            return {}
+        with open(yaml_path, "r") as f:
+            raw = yaml.safe_load(f) or {}
+        scopes = (raw.get("microscopes") or {}) if isinstance(raw, dict) else {}
+        out: Dict[str, TileOrientation] = {}
+        for name, entry in scopes.items():
+            if not isinstance(entry, dict):
+                continue
+            key = entry.get("tile_orientation") or entry.get("output_orientation")
+            if not key:
+                continue
+            ori = str(key).strip().lower()
+            if ori not in MosaicOrientation.NAMES:
+                continue
+            out[str(name).strip().lower()] = TileOrientation(
+                name=ori,
+                reverse_x=bool(entry.get("reverse_x", False)),
+                reverse_y=bool(entry.get("reverse_y", False)),
+            )
+        return out
+    except Exception as e:  # noqa: BLE001 - presets are best-effort
+        logger.debug("Could not load orientation presets: %s", e)
+        return {}
+
+
 def resolve_tile_orientation(acquisition_dir: Path) -> Optional["TileOrientation"]:
     """Full orientation for an acquisition, by microscope name.
 
     Precedence: user-saved preset (name + reverse flags) > bundled YAML preset
-    (name only) > None (caller keeps the configured default). None means "no
-    saved choice for this system".
+    (name + reverse flags) > None (caller keeps the configured default). None
+    means "no saved choice for this system".
     """
     name = read_microscope_name(acquisition_dir)
     if not name:
@@ -327,10 +340,7 @@ def resolve_tile_orientation(acquisition_dir: Path) -> Optional["TileOrientation
             reverse_x=bool(user.get("reverse_x", False)),
             reverse_y=bool(user.get("reverse_y", False)),
         )
-    yaml_name = preset_for_microscope(name)
-    if yaml_name:
-        return TileOrientation(name=yaml_name)
-    return None
+    return _load_yaml_preset_objects().get(key)
 
 
 # --------------------------------------------------------------------------- #

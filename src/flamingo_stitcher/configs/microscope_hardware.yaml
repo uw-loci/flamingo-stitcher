@@ -61,16 +61,26 @@ optics:
 #   identity, rot90, rot180, rot270,
 #   flip_h, flip_v, transpose, anti_transpose
 # (flip_h == the legacy camera_x_inverted: true behaviour.)
+#
+# Two OPTIONAL flags per scope place tiles in reversed stage order (e.g. X3 X2
+# X1 X0 instead of X0 X1 X2 X3) WITHOUT flipping tile pixels — a separate degree
+# of freedom from tile_orientation, for a stage axis that runs opposite the
+# camera content direction:
+#   reverse_x: true / reverse_y: true   (default false)
 microscopes:
-  # Standard Flamingo systems: legacy X-flip per tile.
+  # n7 (rig-determined): pixels need no flip, but the X tile ORDER is reversed,
+  # so identity + reverse_x. (Was flip_h; corrected on-rig 2026-07.)
   n7:
-    tile_orientation: flip_h
+    tile_orientation: identity
+    reverse_x: true
 
   # ASLM / TSPIM system (objective on the RIGHT, single illumination). The
-  # camera is oriented differently — find the tile_orientation where tiles
-  # CONNECT using the orientation preview, then set it here.
+  # camera is oriented differently — find the tile_orientation (and any
+  # reverse_x/reverse_y) where tiles CONNECT using the orientation preview,
+  # then set it here.
   #   aslm-25x:
   #     tile_orientation: transpose
+  #     reverse_y: true
 
 # Laser / illumination channels
 # Channel wavelengths used as defaults for per-channel deconvolution.

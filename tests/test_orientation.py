@@ -94,10 +94,27 @@ def test_read_microscope_name_from_scope_settings(tmp_path):
 
 def test_preset_for_bundled_microscope():
     # The bundled microscope_hardware.yaml ships an n7 tile_orientation preset
-    # (flip_h — the legacy per-tile X-flip).
-    assert preset_for_microscope("n7") == "flip_h"
-    assert preset_for_microscope("N7") == "flip_h"  # case-insensitive
+    # (identity + reverse_x — rig-corrected from the old flip_h).
+    assert preset_for_microscope("n7") == "identity"
+    assert preset_for_microscope("N7") == "identity"  # case-insensitive
     assert preset_for_microscope("no-such-scope") is None
+
+
+def test_bundled_preset_carries_reverse_flags(tmp_path, monkeypatch):
+    """A bundled YAML preset's reverse_x/reverse_y flow through resolution."""
+    import flamingo_stitcher.orientation as orient
+
+    # No user preset — force the YAML path.
+    monkeypatch.setattr(orient, "_user_presets_path", lambda: tmp_path / "none.json")
+    acq = tmp_path / "acq"
+    acq.mkdir()
+    (acq / "ScopeSettings.txt").write_text("<Type>\n  Microscope name = n7\n</Type>\n")
+
+    resolved = orient.resolve_tile_orientation(acq)
+    assert resolved is not None
+    assert resolved.name == "identity"
+    assert resolved.reverse_x is True  # from the YAML preset, not name-only
+    assert resolved.reverse_y is False
 
 
 # --------------------------------------------------------------------------- #

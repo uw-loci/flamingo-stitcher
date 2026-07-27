@@ -106,7 +106,10 @@ re-oriented before it's placed. Fix it visually, no config editing:
 
 Your choice is applied to the run **and remembered for that microscope** (by its
 name in the acquisition metadata), so future data from the same system picks it
-up automatically. Command line:
+up automatically. Orientation is resolved **per acquisition** at run time from
+each item's own microscope name, so a batch mixing systems orients each one
+correctly (a choice made for one scope never touches another). The effective
+orientation is printed in the log at the start of every run. Command line:
 `--tile-orientation NAME [--reverse-x-tiles] [--reverse-y-tiles]`.
 
 ## Re-running to the same folder

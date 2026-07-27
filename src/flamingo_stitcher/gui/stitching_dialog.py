@@ -1521,11 +1521,12 @@ class StitchingDialog(PersistentDialog):
             )
 
     def _on_orientation_chosen(self, name: str, reverse_x: bool, reverse_y: bool):
-        """Apply the orientation picked in the preview to this session's runs.
+        """Feedback for an orientation picked in the preview.
 
-        Stored on the dialog and pushed into every StitchingConfig built for a
-        run (see _build_config). It's also saved per-microscope by the preview,
-        so future sessions auto-apply it by acquisition name.
+        The preview persists the choice per-microscope ("Use for stitching"), so
+        it auto-applies to matching acquisitions via per-entry resolution at run
+        time — this handler only logs it. It is deliberately NOT pushed onto the
+        whole batch (that used to mis-orient datasets from other systems).
         """
         from flamingo_stitcher.orientation import TileOrientation
 
@@ -1538,7 +1539,10 @@ class StitchingDialog(PersistentDialog):
         if reverse_y:
             rev.append("reverse Y")
         suffix = (" + " + ", ".join(rev)) if rev else ""
-        self._log(f"Tile orientation set to '{name}{suffix}' for this session.")
+        self._log(
+            f"Tile orientation '{name}{suffix}' saved for this microscope; "
+            f"it will auto-apply to its acquisitions."
+        )
 
     def _requeue_selected(self):
         """Reset selected finished items (Done / Error / Cancelled) to Pending.
@@ -2592,26 +2596,18 @@ class StitchingDialog(PersistentDialog):
         return
 
     def _apply_tile_orientation(self, config) -> None:
-        """Set config.tile_orientation / reverse_x/y_tiles for the run.
+        """Enable PER-ACQUISITION tile-orientation resolution for the run.
 
-        Priority: an explicit choice made in the Orientation Preview this
-        session > the saved per-microscope preset for the first queued
-        acquisition > leave the config default (legacy camera_x_inverted).
+        Orientation is resolved per entry by the pipeline from each
+        acquisition's OWN microscope name (user preset > bundled YAML > the
+        camera_x_inverted default). A choice made in the Orientation Preview is
+        persisted per-microscope by "Use for stitching", so it is picked up here
+        automatically for matching acquisitions — and, crucially, is NOT applied
+        to datasets from other systems. (Previously a single session choice, or
+        the first queued item's preset, was pushed onto the WHOLE batch, which
+        silently mis-oriented unrelated acquisitions such as N7.)
         """
-        ori = self._session_orientation
-        if ori is None:
-            try:
-                from flamingo_stitcher.orientation import resolve_tile_orientation
-
-                first = next((it for it in self._queue if it.get("path")), None)
-                if first is not None:
-                    ori = resolve_tile_orientation(first["path"])
-            except Exception:  # noqa: BLE001 - orientation resolve is best-effort
-                ori = None
-        if ori is not None and getattr(ori, "name", ""):
-            config.tile_orientation = ori.name
-            config.reverse_x_tiles = bool(ori.reverse_x)
-            config.reverse_y_tiles = bool(ori.reverse_y)
+        config.auto_tile_orientation = True
 
     def _build_config(self):
         """Build a StitchingConfig from YAML defaults + current UI settings."""
@@ -2665,10 +2661,8 @@ class StitchingDialog(PersistentDialog):
         if chunk:
             config.output_chunksize = dict(chunk)
 
-        # Tile orientation: a "Use for stitching" choice made in the Orientation
-        # Preview this session wins; otherwise auto-apply the saved per-microscope
-        # orientation for the first queued acquisition (by its microscope name).
-        # Left untouched (YAML/camera_x_inverted default) when neither is set.
+        # Tile orientation is resolved PER acquisition at run time (by each
+        # item's own microscope name), not one choice for the whole batch.
         self._apply_tile_orientation(config)
 
         # Background zeroing: only forward thresholds when the master
