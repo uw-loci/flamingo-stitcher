@@ -1502,6 +1502,85 @@ def _resolve_frame_size(
     return FRAME_WIDTH, FRAME_HEIGHT
 
 
+def _detect_tile_spacing_gaps(
+    tiles: List["RawTileInfo"],
+    frame_width: int,
+    frame_height: int,
+    pixel_size_um: float,
+) -> List[str]:
+    """Flag axes where tiles are stepped farther apart than one frame covers.
+
+    Tiles are placed at their *acquired* stage positions and drawn at
+    ``frame_dim × pixel_size``. If the median step along an axis exceeds that
+    coverage, the mosaic will have BLANK gaps between tiles — missing acquired
+    data, not a stitching error. The classic cause is a non-square AOI whose
+    tile step was computed from a square (width-only) field of view during
+    acquisition, so the short axis is stepped as if it were the long one
+    (produces full-width tiles with regular black bands between rows).
+
+    Returns one human-readable warning string per gapped axis (empty when tiles
+    touch or overlap on both axes). Reads only ``x_mm``/``y_mm`` off each tile
+    (duck-typed) and does no I/O, so it is cheap and unit-testable.
+    """
+    if not tiles or not pixel_size_um or pixel_size_um <= 0:
+        return []
+    cov_mm = {
+        "X": frame_width * pixel_size_um / 1000.0,
+        "Y": frame_height * pixel_size_um / 1000.0,
+    }
+    positions = {
+        "X": [float(t.x_mm) for t in tiles],
+        "Y": [float(t.y_mm) for t in tiles],
+    }
+    warnings: List[str] = []
+    for axis in ("X", "Y"):
+        coverage = cov_mm[axis]
+        if coverage <= 0:
+            continue
+        # Distinct rows/cols along this axis (round to 1 µm to fold float noise).
+        uniq = sorted({round(p, 3) for p in positions[axis]})
+        steps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
+        if not steps:
+            continue
+        steps.sort()
+        median_step = steps[len(steps) // 2]
+        # Overlapping/touching tiles have step <= coverage. Only warn on a clear
+        # gap (>2% of a frame) so float noise / exact-touch don't false-positive.
+        if median_step <= coverage * 1.02:
+            continue
+        gap_mm = median_step - coverage
+        gap_px = gap_mm * 1000.0 / pixel_size_um
+        frame_dim = frame_width if axis == "X" else frame_height
+        other_axis = "Y" if axis == "X" else "X"
+        other_cov = cov_mm[other_axis]
+        msg = (
+            f"{axis} tiles do not overlap: median {axis} step "
+            f"{median_step:.3f} mm exceeds one frame's {axis} coverage "
+            f"{coverage:.3f} mm ({frame_dim} px × {pixel_size_um:.3f} µm). The "
+            f"mosaic will have ~{gap_mm:.3f} mm ({gap_px:.0f} px) blank gaps "
+            f"between {'columns' if axis == 'X' else 'rows'} — this is missing "
+            f"acquired data, not a stitching error."
+        )
+        # Strong hint at the square-FOV cause: the step matches the OTHER axis's
+        # frame coverage, i.e. this axis was stepped as if the frame were square.
+        if (
+            frame_width != frame_height
+            and other_cov > 0
+            and abs(median_step - other_cov) < abs(median_step - coverage)
+        ):
+            other_dim = frame_height if axis == "X" else frame_width
+            msg += (
+                f" The step ≈ the {other_axis}-frame coverage "
+                f"({other_cov:.3f} mm), i.e. {axis} was stepped as if the frame "
+                f"were square ({other_dim} px): a non-square AOI "
+                f"({frame_width}×{frame_height}) whose tile step was computed "
+                f"from a square field of view during acquisition. Re-acquire with "
+                f"a square AOI or explicit per-tile geometry."
+            )
+        warnings.append(msg)
+    return warnings
+
+
 # ---------------------------------------------------------------------------
 # Optics / acquisition-flag parsing (objective, capture mode, angles)
 # ---------------------------------------------------------------------------
@@ -6058,6 +6137,22 @@ class StitchingPipeline:
                     )
         except Exception as e:  # never let diagnostics break a run
             self.logger.debug(f"Objective/pixel-size check skipped: {e}")
+
+        # 2b) Tile-spacing sanity: warn if tiles are stepped farther apart than
+        #     one frame covers (blank gaps = missing acquired data). Runs after
+        #     the pixel size is finalized above so the coverage math is correct.
+        #     Catches the non-square-AOI-stepped-as-square failure the server's
+        #     Tile expansion can produce (full-width tiles, black bands between
+        #     rows). Faithfully rendering that is correct — the gaps are real —
+        #     so the value here is naming the cause instead of a head-scratch.
+        try:
+            gap_fw, gap_fh = _resolve_frame_size(tiles, self.config)
+            for msg in _detect_tile_spacing_gaps(
+                tiles, gap_fw, gap_fh, self.config.pixel_size_um
+            ):
+                self.logger.warning(f"⚠ {msg}")
+        except Exception as e:  # never let diagnostics break a run
+            self.logger.debug(f"Tile-spacing gap check skipped: {e}")
 
         # 3) Tile orientation. In auto mode, resolve THIS acquisition's
         #    orientation from its own microscope name (user preset > bundled
