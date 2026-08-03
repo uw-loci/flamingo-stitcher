@@ -1667,6 +1667,47 @@ def read_objective_magnification(acquisition_dir: Path) -> Optional[float]:
     return None
 
 
+def read_objective_magnification_metadata(
+    acquisition_dir: Path,
+) -> Optional[float]:
+    """Read `Objective lens magnification` from FlamingoMetaData*.txt.
+
+    This is the objective the microscope recorded in the *acquisition* metadata
+    (captured at run time), which is a second, independent source from
+    ScopeSettings.txt. When the two disagree it usually means ScopeSettings.txt
+    holds a stale objective while FlamingoMetaData reflects what was actually
+    used — a mismatch that silently rescales every tile. Returns None when no
+    metadata file / value is found. Never raises.
+    """
+    acq = Path(acquisition_dir)
+    bases = [acq, acq.parent]
+    try:
+        bases.extend(c for c in sorted(acq.iterdir()) if c.is_dir())
+    except OSError:
+        pass
+    for base in bases:
+        try:
+            matches = sorted(base.glob("FlamingoMetaData*.txt"))
+        except OSError:
+            continue
+        for f in matches:
+            try:
+                content = _read_text_resilient(f)
+            except OSError:
+                continue
+            m = re.search(
+                r"Objective lens magnification\s*=\s*([\d.]+)", content
+            )
+            if m:
+                try:
+                    mag = float(m.group(1))
+                    if mag > 0:
+                        return mag
+                except ValueError:
+                    continue
+    return None
+
+
 def _config_objective_for_microscope(name: Optional[str]) -> Optional[float]:
     """Per-microscope ``objective_magnification`` from microscope_hardware.yaml.
 
@@ -6152,6 +6193,25 @@ class StitchingPipeline:
                 self.logger.info(
                     f"Objective (ScopeSettings.txt): {mag:.3f}× → effective pixel "
                     f"~{suggested:.3f} µm (sensor {_sensor_pixel_size_um():.2f} µm)"
+                )
+            # Cross-check: ScopeSettings.txt vs FlamingoMetaData*.txt objective.
+            # These are two independent records of the same objective; when they
+            # disagree, one is stale and every tile is rendered at the wrong
+            # scale — producing mis-registered "ghost" duplicates of the same
+            # feature that grow with distance from each tile centre. Warn loudly
+            # so it is caught at discovery, not after a full stitch.
+            meta_mag = read_objective_magnification_metadata(acquisition_dir)
+            if mag and meta_mag and abs(mag - meta_mag) / max(mag, meta_mag) > 0.02:
+                sensor = _sensor_pixel_size_um()
+                self.logger.warning(
+                    f"⚠ Objective magnification DISAGREES between metadata files: "
+                    f"ScopeSettings.txt = {mag:.3g}× (→ {sensor / mag:.4f} µm/px, "
+                    f"used for stitching) vs FlamingoMetaData = {meta_mag:.3g}× "
+                    f"(→ {sensor / meta_mag:.4f} µm/px). One is stale. If the wrong "
+                    f"one is used, tiles are placed by stage position but rendered "
+                    f"at the wrong scale → duplicated/ghosted objects. Set the "
+                    f"correct objective (or override the XY pixel size) before "
+                    f"trusting this stitch."
                 )
             if getattr(self.config, "auto_pixel_size", False):
                 # Per-entry: this acquisition uses the pixel size implied by ITS
