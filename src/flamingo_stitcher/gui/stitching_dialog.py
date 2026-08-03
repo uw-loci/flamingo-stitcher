@@ -2211,8 +2211,8 @@ class StitchingDialog(PersistentDialog):
             f"  X range: {min(xs):.2f} \u2013 {max(xs):.2f} mm  "
             f"Y range: {min(ys):.2f} \u2013 {max(ys):.2f} mm"
         )
-        self._log(f"  Channels: {all_ch}")
-        self._log(f"  Illumination sides: {all_illum}")
+        self._log(f"  Channel list: {all_ch}")
+        self._log(f"  Illumination side list: {all_illum}")
         self._log(
             f"  Planes per tile: {tiles[0].n_planes} "
             f"(Z: {tiles[0].z_min_mm:.3f} \u2013 {tiles[0].z_max_mm:.3f} mm)"

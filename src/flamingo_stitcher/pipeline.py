@@ -6112,8 +6112,8 @@ class StitchingPipeline:
             f"  X range: {min(xs):.2f} – {max(xs):.2f} mm  "
             f"Y range: {min(ys):.2f} – {max(ys):.2f} mm"
         )
-        self.logger.info(f"  Channels: {all_ch}")
-        self.logger.info(f"  Illumination sides: {all_illum}")
+        self.logger.info(f"  Channel list: {all_ch}")
+        self.logger.info(f"  Illumination side list: {all_illum}")
         self.logger.info(
             f"  Planes per tile: {tiles[0].n_planes} "
             f"(Z range: {tiles[0].z_min_mm:.3f} – {tiles[0].z_max_mm:.3f} mm)"
