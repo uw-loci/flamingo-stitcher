@@ -68,12 +68,18 @@ jobs:
           python -m pip install --upgrade pip
           # GUI + direct-Imaris output. (napari intentionally NOT installed.)
           pip install ".[gui,imaris]"
-          # Destriping backend (installed --no-deps to avoid resolver backtracking).
-          # Essential on the ASLM scope, and destripe_volume() now hard-errors if
-          # it is absent, so a failed install must FAIL the release rather than
-          # silently ship a build that cannot destripe. Its runtime deps
-          # (numpy/scipy/pywt/tifffile) come from the .[gui] install above.
+          # Destriping backend (installed --no-deps to avoid resolver backtracking
+          # from pystripe's ancient exact pins). Essential on the ASLM scope, and
+          # destripe_volume() now hard-errors if it is absent, so a failed install
+          # must FAIL the release rather than silently ship a build that cannot
+          # destripe.
           pip install "pystripe==1.3.1" --no-deps
+          # pystripe.core imports these at module top level, so `import pystripe`
+          # (and thus the GUI's availability probe) fails without them. numpy /
+          # scipy / scikit-image / tifffile / pywt / imageio already come from the
+          # modern stack above; dcimg (Hamamatsu format) and tqdm do NOT — install
+          # them at compatible versions (NOT pystripe's ancient pins).
+          pip install dcimg tqdm
           pip install pyinstaller
 
       - name: Freeze GUI with PyInstaller

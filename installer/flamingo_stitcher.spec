@@ -76,6 +76,16 @@ collect_pkgs = [
     # any destripe run. collect_all guarantees pystripe.core ships. (The CI
     # installs it as a hard requirement so it is present here to collect.)
     "pystripe",
+    # pystripe.core imports these at module top level. Because pystripe is a lazy
+    # import, PyInstaller's static analysis never sees them, so they must be
+    # collected explicitly or `import pystripe` dies in the frozen build with a
+    # ModuleNotFoundError (dcimg/tqdm) — which greys out the Destripe checkbox
+    # ("destripe not active", the v0.9.3 symptom). pywt + imageio ship with
+    # scikit-image but are only *collected* here.
+    "pywt",
+    "imageio",
+    "tqdm",
+    "dcimg",
 ]
 # Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
 # itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.
