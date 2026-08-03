@@ -74,23 +74,27 @@ microscopes:
     tile_orientation: identity
     reverse_x: true
 
-  # ASLM / TSPIM system (objective on the RIGHT, single illumination). The
-  # camera is oriented differently — find the tile_orientation (and any
-  # reverse_x/reverse_y) where tiles CONNECT using the orientation preview,
-  # then set it here.
-  #   aslm-25x:
-  #     tile_orientation: transpose
-  #     reverse_y: true
-
-  # Liara — high-res system (0.7 NA special objective into ethyl cinnamate,
-  # 200 mm tube lens, so no extra factor). System magnification measured on a
-  # calibration standard (subpixel line-profile) = 25.48× → 6.5 µm / 25.48 ≈
-  # 0.2551 µm/px. This supersedes the earlier nominal 23.8× (0.273 µm/px) and
-  # the stale 17× that some ScopeSettings.txt files carry. Used only as a
-  # fallback when the acquisition's ScopeSettings.txt has no objective; set the
-  # server objective to 25.48 so acquisitions record it directly.
+  # Liara — high-res ASLM / TSPIM system (objective on the RIGHT, single
+  # illumination; 0.7 NA special objective into ethyl cinnamate, 200 mm tube
+  # lens, so no extra factor).
+  #
+  # Orientation (rig-confirmed 2026-08-03): the camera is rotated, so tiles need
+  # a pure ROTATION (rot270) plus X tile-ORDER reversal — NOT a reflection. A
+  # reflection (transpose/flip) passed the index-based preview but mis-mapped
+  # each tile's content and produced offset "ghost" duplicates reaching into the
+  # next tile. rot270 + reverse_x stitches cleanly.
+  #
+  # Magnification measured on a calibration standard (subpixel line-profile) =
+  # 25.48× → 6.5 µm / 25.48 ≈ 0.2551 µm/px. Supersedes the earlier nominal 23.8×
+  # (0.273 µm/px) and the stale 17× that some ScopeSettings.txt files carry.
+  # objective_magnification is only a FALLBACK for acquisitions whose
+  # ScopeSettings.txt lacks an objective; set the server objective to 25.48 so
+  # acquisitions record it directly. A user's own Orientation-Preview pick
+  # (~/.flamingo_stitcher/orientation_presets.json) still overrides this default.
   liara:
     objective_magnification: 25.48
+    tile_orientation: rot270
+    reverse_x: true
 
 # Laser / illumination channels
 # Channel wavelengths used as defaults for per-channel deconvolution.

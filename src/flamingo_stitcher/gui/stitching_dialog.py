@@ -1524,7 +1524,9 @@ class StitchingDialog(PersistentDialog):
                 self, "Orientation preview", f"Could not open preview:\n{e}"
             )
 
-    def _on_orientation_chosen(self, name: str, reverse_x: bool, reverse_y: bool):
+    def _on_orientation_chosen(
+        self, name: str, reverse_x: bool, reverse_y: bool, microscope_name: str = ""
+    ):
         """Feedback for an orientation picked in the preview.
 
         The preview persists the choice per-microscope ("Use for stitching"), so
@@ -1543,8 +1545,12 @@ class StitchingDialog(PersistentDialog):
         if reverse_y:
             rev.append("reverse Y")
         suffix = (" + " + ", ".join(rev)) if rev else ""
+        # Name the microscope so the log is unambiguous about what it applies to.
+        scope = (
+            f"microscope '{microscope_name}'" if microscope_name else "this microscope"
+        )
         self._log(
-            f"Tile orientation '{name}{suffix}' saved for this microscope; "
+            f"Tile orientation '{name}{suffix}' saved for {scope}; "
             f"it will auto-apply to its acquisitions."
         )
 

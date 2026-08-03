@@ -100,6 +100,27 @@ def test_preset_for_bundled_microscope():
     assert preset_for_microscope("no-such-scope") is None
 
 
+def test_bundled_liara_orientation_preset(tmp_path, monkeypatch):
+    """Liara ships rot270 + reverse_x (rig-confirmed 2026-08-03; a reflection
+    produced ghost duplicates, a pure rotation + order-reversal stitches clean)."""
+    import flamingo_stitcher.orientation as orient
+
+    assert preset_for_microscope("liara") == "rot270"
+
+    # No user preset → the bundled YAML must carry the reverse_x flag too.
+    monkeypatch.setattr(orient, "_user_presets_path", lambda: tmp_path / "none.json")
+    acq = tmp_path / "acq"
+    acq.mkdir()
+    (acq / "ScopeSettings.txt").write_text(
+        "<Type>\n  Microscope name = liara\n</Type>\n"
+    )
+    resolved = orient.resolve_tile_orientation(acq)
+    assert resolved is not None
+    assert resolved.name == "rot270"
+    assert resolved.reverse_x is True
+    assert resolved.reverse_y is False
+
+
 def test_bundled_preset_carries_reverse_flags(tmp_path, monkeypatch):
     """A bundled YAML preset's reverse_x/reverse_y flow through resolution."""
     import flamingo_stitcher.orientation as orient

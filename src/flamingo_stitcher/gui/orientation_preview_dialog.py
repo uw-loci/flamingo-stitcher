@@ -112,12 +112,13 @@ class _PreviewBuildThread(QThread):
 class OrientationPreviewDialog(QDialog):
     """Preview the 8 per-tile orientations and choose one to stitch with.
 
-    Emits ``orientation_chosen(tile_orientation, reverse_x, reverse_y)`` when the
-    user clicks "Use for stitching", so the main dialog can apply it to the run
-    and remember it for the acquisition's microscope.
+    Emits ``orientation_chosen(tile_orientation, reverse_x, reverse_y,
+    microscope_name)`` when the user clicks "Use for stitching", so the main
+    dialog can apply it to the run and name the microscope it was saved for
+    (empty string when the acquisition metadata has no microscope name).
     """
 
-    orientation_chosen = pyqtSignal(str, bool, bool)
+    orientation_chosen = pyqtSignal(str, bool, bool, str)
 
     def __init__(self, acq_path: Path, parent=None) -> None:
         super().__init__(parent)
@@ -324,7 +325,10 @@ class OrientationPreviewDialog(QDialog):
         except Exception:  # noqa: BLE001 - persistence is best-effort
             pass
         self.orientation_chosen.emit(
-            self._selected_name, self._reverse_x, self._reverse_y
+            self._selected_name,
+            self._reverse_x,
+            self._reverse_y,
+            self._microscope_name or "",
         )
         rev = []
         if self._reverse_x:
