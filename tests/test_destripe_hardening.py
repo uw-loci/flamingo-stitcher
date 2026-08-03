@@ -9,9 +9,9 @@ Locks in three fixes:
 
 from __future__ import annotations
 
-import importlib.util
 import os
 import sys
+import types
 from pathlib import Path
 
 import numpy as np
@@ -29,17 +29,17 @@ from flamingo_stitcher.pipeline import (  # noqa: E402
     destripe_volume,
 )
 
-_HAVE_PYSTRIPE = importlib.util.find_spec("pystripe") is not None
-
 
 # --------------------------------------------------------------------------- #
-# 1. Loud failure when destripe requested but pystripe absent
+# 1. Loud failure when the destripe backend can't load (never a silent no-op)
 # --------------------------------------------------------------------------- #
-@pytest.mark.skipif(_HAVE_PYSTRIPE, reason="pystripe is installed here")
-def test_missing_pystripe_raises_not_silent():
-    vol = np.zeros((2, 4, 4), dtype=np.uint16)
-    with pytest.raises(RuntimeError, match="pystripe"):
-        destripe_volume(vol)
+def test_backend_failure_raises_not_silent(monkeypatch):
+    # Simulate the vendored backend failing to import (e.g. pywt missing in a
+    # broken frozen build) by shadowing it with a module lacking filter_streaks.
+    broken = types.ModuleType("flamingo_stitcher._pystripe_core")
+    monkeypatch.setitem(sys.modules, "flamingo_stitcher._pystripe_core", broken)
+    with pytest.raises(RuntimeError, match="backend"):
+        destripe_volume(np.zeros((2, 4, 4), dtype=np.uint16))
 
 
 # --------------------------------------------------------------------------- #

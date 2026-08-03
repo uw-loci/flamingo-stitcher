@@ -55,6 +55,11 @@ dependencies = [
     # .zgroup) that Fiji cannot open. See forum.image.sc topic 120480 and
     # ngff-zarr PR #480. TODO: relax once ngff-zarr releases the fix.
     "dask[array]>=2024.1.0,!=2025.12.0,!=2026.1.0,!=2026.1.1,!=2026.2.0,!=2026.3.0,<2027",
+    # PyWavelets backs the vendored pystripe stripe filter (_pystripe_core).
+    # Destriping is essential on the ASLM scope (no beam-oscillation shadow
+    # reduction), so pywt is a core dependency, not optional. scikit-image (a
+    # transitive dep) no longer guarantees it.
+    "PyWavelets>=1.4,<2",
 ]
 
 [project.optional-dependencies]
@@ -73,9 +78,11 @@ imaris = ["PyImarisWriter>=0.7.0; sys_platform == 'win32'"]
 # so it is documented in the README rather than declared here.
 deconv = ["RedLionfish"]
 
-# Destriping. pystripe must be installed with --no-deps to avoid resolver
-# backtracking (see README); declared here for discoverability only.
-destripe = ["pystripe==1.3.1"]
+# Destriping uses the VENDORED pystripe stripe filter (_pystripe_core), which
+# needs only pywt on top of the core numpy/scipy/scikit-image stack. (The full
+# pystripe package is no longer a dependency — its dcimg/imageio/tqdm imports
+# would not survive PyInstaller bundling.)
+destripe = ["PyWavelets"]
 
 dev = ["pytest", "pytest-cov", "black", "flake8"]
 

@@ -44,7 +44,7 @@ Permissive (BSD-3-Clause / MIT / Apache-2.0):
   tifffile ........................ BSD-3-Clause   (OME-TIFF writing)
   PyYAML .......................... MIT
   psutil .......................... BSD-3-Clause
-  pystripe ........................ MIT            (optional: destriping)
+  pystripe ........................ MIT            (destriping — see vendored note)
   RedLionfish ..................... Apache-2.0     (optional: GPU deconvolution)
   PyImarisWriter .................. Apache-2.0     (optional: .ims output, Windows)
   napari .......................... BSD-3-Clause   (optional: background-zero preview)
@@ -53,6 +53,21 @@ Permissive (BSD-3-Clause / MIT / Apache-2.0):
 Copyleft:
   PyQt5 ........................... GPL-3.0        (GUI toolkit; see LICENSE /
                                                    the license note below)
+
+--------------------------------------------------------------------------------
+Vendored source (pystripe)
+--------------------------------------------------------------------------------
+src/flamingo_stitcher/_pystripe_core.py contains the stripe-removal core
+(`filter_streaks` and its private helpers) copied verbatim from pystripe 1.3.1
+(https://github.com/chunglabmit/pystripe) so destriping depends only on
+numpy/scipy/pywt/scikit-image and survives PyInstaller bundling. pystripe is:
+
+    MIT License
+    Copyright (c) 2018 Chung Lab
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction ... (full text in the pystripe repo).
 
 --------------------------------------------------------------------------------
 License note (PyQt5 -> GPL-3.0)

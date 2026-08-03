@@ -2579,20 +2579,20 @@ def destripe_volume(
     (pywt, scipy.fftpack, numpy) release the GIL.  Falls back to fewer
     workers on MemoryError, and to sequential processing as a last resort.
 
-    Raises ``RuntimeError`` if pystripe is not installed. Destriping is an
-    explicit, opt-in request (``config.destripe``); on the ASLM scope it is
-    essential (no beam-oscillation shadow reduction), so a missing backend must
-    FAIL LOUDLY rather than silently return un-destriped data — a silent no-op
-    ships a striped output the user believed was corrected.
+    Uses the vendored pystripe stripe filter (``_pystripe_core``), which needs
+    only numpy / scipy / pywt / scikit-image — the stack the app already ships.
+    Raises ``RuntimeError`` if that backend can't load (e.g. pywt missing).
+    Destriping is an explicit, opt-in request (``config.destripe``); on the ASLM
+    scope it is essential (no beam-oscillation shadow reduction), so a broken
+    backend must FAIL LOUDLY rather than silently return un-destriped data.
     """
     try:
-        from pystripe.core import filter_streaks
-    except ImportError as exc:
+        from flamingo_stitcher._pystripe_core import filter_streaks
+    except Exception as exc:
         raise RuntimeError(
-            "Destriping was requested (Destripe is ON) but pystripe is not "
-            "installed, so it cannot run. Install it "
-            "(`pip install pystripe==1.3.1 --no-deps`) or turn Destripe off. "
-            "Refusing to continue and silently write un-destriped tiles."
+            "Destriping was requested (Destripe is ON) but its backend failed to "
+            "load — it needs pywt / scipy / scikit-image. Underlying error: "
+            f"{exc!r}. Refusing to continue and silently write un-destriped tiles."
         ) from exc
 
     from concurrent.futures import ThreadPoolExecutor, as_completed

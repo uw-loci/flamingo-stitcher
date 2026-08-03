@@ -4353,12 +4353,25 @@ class StitchingDialog(PersistentDialog):
                 self._setup_env_btn.setText("Set up flat-field…")
 
         # --- Destriping (pystripe) ---
+        # Capture WHY the import fails (previously swallowed silently), so a
+        # frozen build that can't destripe is self-diagnosing: the exact missing
+        # module lands in the per-launch log AND the checkbox tooltip. pystripe.core
+        # imports dcimg/tqdm/pywt/imageio at module top, so a single missing one
+        # here disables destriping with no other clue.
+        pystripe_err = None
         try:
-            import pystripe  # noqa: F401
+            # Vendored stripe filter — needs only pywt/scipy/scikit-image, which
+            # the app already bundles (unlike the full pystripe package, whose
+            # dcimg/imageio/tqdm imports kept failing to bundle → checkbox greyed).
+            from flamingo_stitcher import _pystripe_core  # noqa: F401
 
             pystripe_ok = True
-        except Exception:
+        except Exception as exc:
             pystripe_ok = False
+            pystripe_err = exc
+            logger.warning(
+                "Destriping unavailable — destripe backend import failed: %r", exc
+            )
 
         if pystripe_ok:
             self._destripe_cb.setEnabled(True)
@@ -4372,7 +4385,10 @@ class StitchingDialog(PersistentDialog):
             self._destripe_fast_cb.setChecked(False)
             self._destripe_fast_cb.setEnabled(False)
             self._destripe_cb.setToolTip(
-                "Destriping requires pystripe.\n" "Install with: pip install pystripe"
+                "Destriping is unavailable — the destripe backend failed to load:\n"
+                f"    {type(pystripe_err).__name__}: {pystripe_err}\n"
+                "(This build should bundle it; the error above names the missing "
+                "piece — likely pywt / scipy / scikit-image.)"
             )
 
         # --- Deconvolution (pycudadecon or RedLionfish) ---
