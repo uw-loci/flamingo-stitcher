@@ -69,7 +69,11 @@ jobs:
           # GUI + direct-Imaris output. (napari intentionally NOT installed.)
           pip install ".[gui,imaris]"
           # Destriping backend (installed --no-deps to avoid resolver backtracking).
-          pip install "pystripe==1.3.1" --no-deps || echo "pystripe install skipped"
+          # Essential on the ASLM scope, and destripe_volume() now hard-errors if
+          # it is absent, so a failed install must FAIL the release rather than
+          # silently ship a build that cannot destripe. Its runtime deps
+          # (numpy/scipy/pywt/tifffile) come from the .[gui] install above.
+          pip install "pystripe==1.3.1" --no-deps
           pip install pyinstaller
 
       - name: Freeze GUI with PyInstaller

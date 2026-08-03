@@ -2538,16 +2538,21 @@ def destripe_volume(
     (pywt, scipy.fftpack, numpy) release the GIL.  Falls back to fewer
     workers on MemoryError, and to sequential processing as a last resort.
 
-    Falls back to identity if pystripe is not installed.
+    Raises ``RuntimeError`` if pystripe is not installed. Destriping is an
+    explicit, opt-in request (``config.destripe``); on the ASLM scope it is
+    essential (no beam-oscillation shadow reduction), so a missing backend must
+    FAIL LOUDLY rather than silently return un-destriped data — a silent no-op
+    ships a striped output the user believed was corrected.
     """
     try:
         from pystripe.core import filter_streaks
-    except ImportError:
-        logger.warning(
-            "pystripe not installed, skipping destriping. "
-            "Install with: pip install pystripe"
-        )
-        return volume
+    except ImportError as exc:
+        raise RuntimeError(
+            "Destriping was requested (Destripe is ON) but pystripe is not "
+            "installed, so it cannot run. Install it "
+            "(`pip install pystripe==1.3.1 --no-deps`) or turn Destripe off. "
+            "Refusing to continue and silently write un-destriped tiles."
+        ) from exc
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -4403,6 +4408,9 @@ class StitchingPipeline:
 
         Returns {channel_id: [(volume_array, tile_info), ...]}.
         """
+        # In-memory preprocessing is sequential (one tile at a time), so a nested
+        # destripe pool may use the full machine budget.
+        self._active_preprocess_workers = 1
         result: Dict[int, List[Tuple[Any, RawTileInfo]]] = {ch: [] for ch in channels}
 
         for i, tile in enumerate(tiles):
@@ -4525,6 +4533,15 @@ class StitchingPipeline:
         if illum_side is not None and illum_side in illum_files:
             illum_files = {illum_side: illum_files[illum_side]}
 
+        # Destripe runs PER ILLUMINATION SIDE, BEFORE fusion (below): stripe
+        # artifacts originate independently in each light-sheet path, so fusing
+        # first and destriping the combined tile mixes two different stripe
+        # patterns. (The "fast" variant is the exception — it destripes the
+        # downsampled, already-fused tile as a speed/quality trade-off; see
+        # below.) Single-side acquisitions (e.g. ASLM) have one entry, so this is
+        # just "destripe the tile".
+        _destripe_per_side = self.config.destripe and not self.config.destripe_fast
+
         illum_volumes = {}
         for illum_side, raw_path in illum_files.items():
             # Dispatch on file type (.raw vs .tif/.tiff/.btf). For raw we pass
@@ -4536,6 +4553,10 @@ class StitchingPipeline:
             vol = load_tile_volume(
                 raw_path, tile.n_planes, tile.frame_width, tile.frame_height
             )
+            if _destripe_per_side:
+                vol = destripe_volume(
+                    vol, max_workers=self._destripe_worker_budget()
+                )
             illum_volumes[illum_side] = vol
 
         if len(illum_volumes) > 1:
@@ -4568,8 +4589,7 @@ class StitchingPipeline:
                 volume, mu=self.config.depth_attenuation_mu, z_step_um=z_step
             )
 
-        if self.config.destripe and not self.config.destripe_fast:
-            volume = destripe_volume(volume, max_workers=self.config.destripe_workers)
+        # (Non-fast destripe already ran per illumination side, before fusion.)
 
         _deconv_fast = bool(getattr(self.config, "deconvolution_fast", False))
         if self.config.deconvolution_enabled and not _deconv_fast:
@@ -4581,7 +4601,9 @@ class StitchingPipeline:
             )
 
         if self.config.destripe and self.config.destripe_fast:
-            volume = destripe_volume(volume, max_workers=self.config.destripe_workers)
+            volume = destripe_volume(
+                volume, max_workers=self._destripe_worker_budget()
+            )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far
         # cheaper (fewer voxels + smaller PSF) but lower quality, since the PSF
@@ -4677,6 +4699,9 @@ class StitchingPipeline:
             native_vox = int(np.prod(expected_shape))
         per_worker_bytes = _preprocess_peak_bytes(self.config, native_vox)
         n_workers = self._pick_preprocess_workers(per_worker_bytes, len(active))
+        # Record concurrency so nested per-plane destripe pools inside
+        # _preprocess_single_tile can size against it (avoid oversubscription).
+        self._active_preprocess_workers = n_workers
         self.logger.info(
             f"  Materializing {len(active)} tiles for channel {ch_id} "
             f"→ {tmp_dir} "
@@ -4773,6 +4798,29 @@ class StitchingPipeline:
         # Return in original tile order so fusion sees tiles in the same
         # spatial sequence regardless of completion order from the pool.
         return [result_by_idx[i] for i in sorted(result_by_idx)]
+
+    def _destripe_worker_budget(self) -> Optional[int]:
+        """Per-tile destripe thread cap that accounts for concurrent preprocess
+        workers, so nested thread pools don't oversubscribe CPU/RAM.
+
+        ``destripe_volume`` spawns its own per-plane ``ThreadPoolExecutor``. When
+        it runs INSIDE the per-tile preprocess pool (streaming mode), the naive
+        product ``preprocess_workers × destripe_workers`` oversubscribes cores and
+        multiplies peak RAM (a documented OOM cause). Divide the machine's thread
+        budget by the number of tiles processed concurrently. An explicit
+        ``config.destripe_workers`` still caps the result; ``None`` = let
+        ``destripe_volume`` auto-size (memory + cores) when there is no nesting.
+        """
+        explicit = self.config.destripe_workers  # None → auto
+        pp = int(getattr(self, "_active_preprocess_workers", 1) or 1)
+        if pp <= 1:
+            return explicit  # sequential preprocess → no nesting to guard against
+        import os
+
+        budget = max(1, (os.cpu_count() or 1) // pp)
+        if explicit:
+            return max(1, min(int(explicit), budget))
+        return budget
 
     def _pick_preprocess_workers(self, per_worker_bytes: int, n_tiles: int) -> int:
         """Choose a safe ThreadPool size for per-tile preprocessing.

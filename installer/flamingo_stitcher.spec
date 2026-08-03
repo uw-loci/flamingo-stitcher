@@ -69,6 +69,13 @@ collect_pkgs = [
     # silently falls back to metadata-only positions. (Same class of bug as the
     # matplotlib/wasmtime entries above.)
     "pandas",
+    # pystripe (destriping) is imported lazily — `from pystripe.core import
+    # filter_streaks` inside destripe_volume — so static analysis misses it.
+    # On the ASLM scope destriping is essential, and destripe_volume now RAISES
+    # if pystripe is absent, so a build that fails to bundle it would hard-error
+    # any destripe run. collect_all guarantees pystripe.core ships. (The CI
+    # installs it as a hard requirement so it is present here to collect.)
+    "pystripe",
 ]
 # Pull in every installed itkwasm* pipeline package (itkwasm-downsample,
 # itkwasm-downsample-wasi, etc.) so their wasm payloads ship too.
