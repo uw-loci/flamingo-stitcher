@@ -134,6 +134,14 @@ def main():
         help="Max parallel destripe threads (default: auto based on available memory)",
     )
     preproc_group.add_argument(
+        "--destripe-direction",
+        choices=["auto", "horizontal", "vertical"],
+        default="auto",
+        help="Stripe orientation to remove (default: auto-detect per tile). The "
+        "filter is axis-fixed and runs before the tile rot/flip, so the wrong "
+        "axis removes nothing; use horizontal/vertical to force it.",
+    )
+    preproc_group.add_argument(
         "--depth-attenuation",
         action="store_true",
         help="Correct exponential Z-intensity falloff (Beer-Lambert model)",
@@ -474,6 +482,7 @@ def main():
         destripe=args.destripe,
         destripe_fast=args.destripe_fast,
         destripe_workers=args.destripe_workers,
+        destripe_direction=args.destripe_direction,
         depth_attenuation=args.depth_attenuation,
         depth_attenuation_mu=args.depth_attenuation_mu,
         reg_channel=args.reg_channel,

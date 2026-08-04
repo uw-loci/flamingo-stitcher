@@ -960,7 +960,8 @@ class StitchingDialog(PersistentDialog):
         self._destripe_cb.setToolTip(
             "\u2731 Processes every Z-plane at full resolution\n"
             "before downsampling.\n\n"
-            "Removes horizontal stripe artifacts from light-sheet data.\n"
+            "Removes stripe/shadow artifacts from light-sheet data\n"
+            "(orientation set by the Dir: control).\n"
             "Uses multiple CPU cores automatically."
         )
         proc_layout.addWidget(self._destripe_cb, 0, 0)
@@ -978,6 +979,26 @@ class StitchingDialog(PersistentDialog):
         # plain toggled→setEnabled link only handled the enabled state.
         self._destripe_cb.toggled.connect(self._on_destripe_toggled)
         proc_layout.addWidget(self._destripe_fast_cb, 0, 1)
+
+        # Stripe orientation. The filter is axis-fixed AND destriping runs in the
+        # raw camera frame (before the per-tile rot/flip), so the wrong axis
+        # removes nothing. "Auto" detects the stripe direction per tile.
+        self._destripe_dir_combo = QComboBox()
+        for _lbl, _val in (
+            ("Dir: Auto", "auto"),
+            ("Dir: Horizontal", "horizontal"),
+            ("Dir: Vertical", "vertical"),
+        ):
+            self._destripe_dir_combo.addItem(_lbl, _val)
+        self._destripe_dir_combo.setToolTip(
+            "Which stripe orientation to remove.\n"
+            "Auto (default): detect per tile.\n"
+            "Horizontal / Vertical: force it if Auto guesses wrong.\n\n"
+            "Note: orientation is judged in the raw CAMERA frame, before the\n"
+            "tile is rotated to stage — so it may look 90° off vs the final image."
+        )
+        self._destripe_dir_combo.setEnabled(False)
+        proc_layout.addWidget(self._destripe_dir_combo, 0, 2)
 
         self._content_fusion_cb = QCheckBox("Content-based blending \u2731")
         self._content_fusion_cb.setToolTip(
@@ -2300,6 +2321,7 @@ class StitchingDialog(PersistentDialog):
         submitted to the pipeline.
         """
         self._destripe_fast_cb.setEnabled(checked)
+        self._destripe_dir_combo.setEnabled(checked)
         if not checked:
             self._destripe_fast_cb.setChecked(False)
 
@@ -2683,6 +2705,7 @@ class StitchingDialog(PersistentDialog):
         config.flat_field_correction = self._flat_field_cb.isChecked()
         config.destripe = self._destripe_cb.isChecked()
         config.destripe_fast = self._destripe_fast_cb.isChecked()
+        config.destripe_direction = self._destripe_dir_combo.currentData()
         config.downsample_xy = self._downsample_xy_combo.currentData()
         config.downsample_z = self._downsample_z_combo.currentData()
         config.deconvolution_enabled = self._deconv_cb.isChecked()
@@ -4390,6 +4413,7 @@ class StitchingDialog(PersistentDialog):
             self._destripe_cb.setEnabled(False)
             self._destripe_fast_cb.setChecked(False)
             self._destripe_fast_cb.setEnabled(False)
+            self._destripe_dir_combo.setEnabled(False)
             self._destripe_cb.setToolTip(
                 "Destriping is unavailable — the destripe backend failed to load:\n"
                 f"    {type(pystripe_err).__name__}: {pystripe_err}\n"
@@ -4763,6 +4787,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
+        s.setValue("destripe_direction", self._destripe_dir_combo.currentData())
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
@@ -4882,6 +4907,10 @@ class StitchingDialog(PersistentDialog):
 
         destripe_fast = s.value("destripe_fast", False, type=bool)
         self._destripe_fast_cb.setChecked(destripe_fast)
+        _dir = s.value("destripe_direction", "auto", type=str)
+        _di = self._destripe_dir_combo.findData(_dir)
+        if _di >= 0:
+            self._destripe_dir_combo.setCurrentIndex(_di)
 
         deconv = s.value("deconvolution", False, type=bool)
         self._deconv_cb.setChecked(deconv)
@@ -5036,6 +5065,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("flat_field", self._flat_field_cb.isChecked())
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
+        s.setValue("destripe_direction", self._destripe_dir_combo.currentData())
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
@@ -5155,6 +5185,10 @@ class NativeStitchingDialog(StitchingDialog):
 
         destripe_fast = s.value("destripe_fast", False, type=bool)
         self._destripe_fast_cb.setChecked(destripe_fast)
+        _dir = s.value("destripe_direction", "auto", type=str)
+        _di = self._destripe_dir_combo.findData(_dir)
+        if _di >= 0:
+            self._destripe_dir_combo.setCurrentIndex(_di)
 
         deconv = s.value("deconvolution", False, type=bool)
         self._deconv_cb.setChecked(deconv)

@@ -815,6 +815,11 @@ class StitchingConfig:
     destripe: bool = False  # Run PyStripe destriping
     destripe_fast: bool = False  # Destripe after downsample (faster, lower quality)
     destripe_workers: Optional[int] = None  # Max parallel threads; None = auto
+    # Stripe orientation to remove: "auto" (detect per tile), "horizontal", or
+    # "vertical". The filter is axis-fixed and destriping runs in the raw camera
+    # frame (before the per-tile rot/flip), so the wrong axis silently removes
+    # nothing. "auto" picks the axis with the stronger stripe signal.
+    destripe_direction: str = "auto"
     # Depth-dependent attenuation correction (Beer-Lambert Z-falloff)
     depth_attenuation: bool = False
     depth_attenuation_mu: Optional[float] = None  # 1/µm; None = auto-fit
@@ -2570,14 +2575,51 @@ def _estimate_destripe_workers(
     return max(1, n)
 
 
+def _detect_stripe_axis(volume: np.ndarray) -> str:
+    """Auto-detect stripe orientation: ``"horizontal"`` or ``"vertical"``.
+
+    Stripes are a coherent, higher-frequency pattern running along one image
+    axis. Averaging *perpendicular* to a stripe reinforces it (constant along the
+    stripe) while averaging real anatomy down, so the mean profiles isolate the
+    stripe: the row-mean profile (mean over X) captures HORIZONTAL stripes, the
+    column-mean profile (mean over Y) captures VERTICAL ones. Whichever profile
+    carries more high-frequency power wins. (pystripe's filter removes horizontal
+    stripes; a vertical result means the caller must transpose before filtering.)
+    """
+    z = volume.shape[0]
+    step = max(1, z // 16)
+    proj = np.asarray(volume[::step]).astype(np.float32).mean(axis=0)  # (Y, X)
+
+    def _hf_power(profile: np.ndarray) -> float:
+        p = profile - profile.mean()
+        f = np.abs(np.fft.rfft(p))
+        lo = max(1, len(f) // 8)  # drop the lowest freqs (broadband illumination)
+        return float((f[lo:] ** 2).sum())
+
+    horiz = _hf_power(proj.mean(axis=1))  # row profile → horizontal stripes
+    vert = _hf_power(proj.mean(axis=0))   # column profile → vertical stripes
+    return "vertical" if vert > horiz else "horizontal"
+
+
 def destripe_volume(
-    volume: np.ndarray, max_workers: Optional[int] = None
+    volume: np.ndarray,
+    max_workers: Optional[int] = None,
+    direction: str = "auto",
 ) -> np.ndarray:
     """Apply PyStripe destriping to each Z-plane using parallel threads.
 
     Uses ThreadPoolExecutor for parallelism — pystripe's C extensions
     (pywt, scipy.fftpack, numpy) release the GIL.  Falls back to fewer
     workers on MemoryError, and to sequential processing as a last resort.
+
+    ``direction`` selects the stripe orientation to remove:
+      * ``"horizontal"`` — pystripe's native axis (removes horizontal stripes),
+      * ``"vertical"`` — transpose each plane so vertical stripes are removed,
+      * ``"auto"`` (default) — detect per volume via :func:`_detect_stripe_axis`.
+    This matters because the underlying filter is axis-fixed AND destriping runs
+    in the raw camera frame, *before* the per-tile rot/flip orientation — a 90°
+    rotation swaps which way the stripes run, so the naive default can silently
+    filter the wrong axis and remove nothing (the v0.9.5 symptom).
 
     Uses the vendored pystripe stripe filter (``_pystripe_core``), which needs
     only numpy / scipy / pywt / scikit-image — the stack the app already ships.
@@ -2597,6 +2639,16 @@ def destripe_volume(
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
+    resolved = (direction or "auto").lower()
+    if resolved == "auto":
+        resolved = _detect_stripe_axis(volume)
+        logger.info(f"Destripe direction: {resolved} stripes (auto-detected)")
+    else:
+        logger.info(f"Destripe direction: {resolved} stripes (configured)")
+    # pystripe removes horizontal stripes; for vertical stripes we filter the
+    # transpose (and transpose the result back).
+    transpose = resolved == "vertical"
+
     n_planes = volume.shape[0]
     result = np.empty_like(volume)
 
@@ -2613,12 +2665,18 @@ def destripe_volume(
         _ds_wavelet = "db2"
 
     def _process_plane(z: int) -> int:
-        result[z] = filter_streaks(
-            volume[z].astype(np.float32),
+        plane = volume[z].astype(np.float32)
+        if transpose:
+            plane = plane.T
+        filtered = filter_streaks(
+            plane,
             sigma=_ds_sigma,
             level=_ds_level,
             wavelet=_ds_wavelet,
-        ).astype(np.uint16)
+        )
+        if transpose:
+            filtered = filtered.T
+        result[z] = filtered.astype(np.uint16)
         return z
 
     n_workers = _estimate_destripe_workers(volume.shape[1:], max_workers)
@@ -4596,7 +4654,9 @@ class StitchingPipeline:
             )
             if _destripe_per_side:
                 vol = destripe_volume(
-                    vol, max_workers=self._destripe_worker_budget()
+                    vol,
+                    max_workers=self._destripe_worker_budget(),
+                    direction=self.config.destripe_direction,
                 )
             illum_volumes[illum_side] = vol
 
@@ -4643,7 +4703,9 @@ class StitchingPipeline:
 
         if self.config.destripe and self.config.destripe_fast:
             volume = destripe_volume(
-                volume, max_workers=self._destripe_worker_budget()
+                volume,
+                max_workers=self._destripe_worker_budget(),
+                direction=self.config.destripe_direction,
             )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far

@@ -42,6 +42,46 @@ def test_runs_and_preserves_shape_dtype():
     assert out.dtype == np.uint16
 
 
+def _striped(orient, seed):
+    rng = np.random.default_rng(seed)
+    base = rng.uniform(600, 1200, size=(5, 160, 160)).astype(np.float32)
+    s = 500 * np.sin(np.arange(160) / 1.5)
+    stripe = s[None, :, None] if orient == "horizontal" else s[None, None, :]
+    return np.clip(base + stripe, 0, 65535).astype(np.uint16)
+
+
+def _stripe_power(vol, orient):
+    proj = np.asarray(vol).astype(float).mean(axis=0)
+    p = proj.mean(axis=1) if orient == "horizontal" else proj.mean(axis=0)
+    return float((np.abs(np.fft.rfft(p - p.mean())) ** 2)[1:].sum())
+
+
+@pytest.mark.parametrize("orient", ["horizontal", "vertical"])
+def test_auto_detect_and_remove_either_orientation(orient):
+    # The v0.9.5 bug: pystripe only removes horizontal stripes, but destriping
+    # runs in the camera frame where these stripes are vertical -> nothing removed.
+    # "auto" must detect the orientation and remove it either way.
+    from flamingo_stitcher.pipeline import _detect_stripe_axis, destripe_volume
+
+    vol = _striped(orient, seed=3)
+    assert _detect_stripe_axis(vol) == orient
+    out = destripe_volume(vol, direction="auto")
+    p_in = _stripe_power(vol, orient)
+    p_out = _stripe_power(out, orient)
+    assert p_out < p_in * 0.4, f"{orient} stripes not removed ({p_out/p_in:.2f})"
+
+
+def test_wrong_direction_removes_nothing():
+    # Forcing the perpendicular axis (the pre-fix behaviour) leaves stripes intact.
+    from flamingo_stitcher.pipeline import destripe_volume
+
+    vol = _striped("vertical", seed=4)
+    out = destripe_volume(vol, direction="horizontal")  # wrong axis
+    p_in = _stripe_power(vol, "vertical")
+    p_out = _stripe_power(out, "vertical")
+    assert p_out > p_in * 0.8, "horizontal filter should not touch vertical stripes"
+
+
 @pytest.mark.skipif(not _HAVE_PYSTRIPE, reason="pystripe not importable here")
 def test_bit_identical_to_upstream_pystripe():
     from pystripe.core import filter_streaks as upstream
