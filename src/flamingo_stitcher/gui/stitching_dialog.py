@@ -7,7 +7,7 @@ Operates on saved acquisition data on disk — no microscope connection required
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from PyQt5.QtCore import QProcess, QSettings, Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QColor
@@ -15,6 +15,7 @@ from PyQt5.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QDoubleSpinBox,
     QFileDialog,
     QGridLayout,
@@ -1001,10 +1002,23 @@ class StitchingDialog(PersistentDialog):
         # Both destripe sub-options share grid cell (0, 1) via an HBox. Row 0's
         # remaining cells (0,2)-(0,3) belong to the content-based-blending
         # checkbox — putting the combo there made the two overlap on screen.
+        # Filter tuning (sigma / level / wavelet / threshold / crossover) lives in
+        # a small dialog rather than cluttering this grid; values persist via
+        # QSettings like every other option.
+        self._destripe_params: Dict[str, Any] = {}
+        self._destripe_settings_btn = QPushButton("Settings…")
+        self._destripe_settings_btn.setToolTip(
+            "Tune the destripe filter: sigma (strength), wavelet level/type,\n"
+            "and the foreground/background split."
+        )
+        self._destripe_settings_btn.setEnabled(False)
+        self._destripe_settings_btn.clicked.connect(self._on_destripe_settings)
+
         _destripe_opts = QHBoxLayout()
         _destripe_opts.setContentsMargins(0, 0, 0, 0)
         _destripe_opts.addWidget(self._destripe_fast_cb)
         _destripe_opts.addWidget(self._destripe_dir_combo)
+        _destripe_opts.addWidget(self._destripe_settings_btn)
         _destripe_opts.addStretch()
         proc_layout.addLayout(_destripe_opts, 0, 1)
 
@@ -2330,8 +2344,20 @@ class StitchingDialog(PersistentDialog):
         """
         self._destripe_fast_cb.setEnabled(checked)
         self._destripe_dir_combo.setEnabled(checked)
+        self._destripe_settings_btn.setEnabled(checked)
         if not checked:
             self._destripe_fast_cb.setChecked(False)
+
+    def _on_destripe_settings(self):
+        """Open the destripe filter-tuning dialog and keep the chosen values."""
+        from flamingo_stitcher.gui.destripe_settings_dialog import (
+            DestripeSettingsDialog,
+        )
+
+        dlg = DestripeSettingsDialog(self._destripe_params, parent=self)
+        if dlg.exec_() == QDialog.Accepted:
+            self._destripe_params = dlg.get_params()
+            self._log(f"Destripe settings updated: {self._destripe_params}")
 
     def _update_voxel_readout(self, *_args):
         """Refresh the Native → Output voxel line below the downsample row."""
@@ -2714,6 +2740,7 @@ class StitchingDialog(PersistentDialog):
         config.destripe = self._destripe_cb.isChecked()
         config.destripe_fast = self._destripe_fast_cb.isChecked()
         config.destripe_direction = self._destripe_dir_combo.currentData()
+        config.destripe_params = dict(self._destripe_params)
         config.downsample_xy = self._downsample_xy_combo.currentData()
         config.downsample_z = self._downsample_z_combo.currentData()
         config.deconvolution_enabled = self._deconv_cb.isChecked()
@@ -4422,6 +4449,7 @@ class StitchingDialog(PersistentDialog):
             self._destripe_fast_cb.setChecked(False)
             self._destripe_fast_cb.setEnabled(False)
             self._destripe_dir_combo.setEnabled(False)
+            self._destripe_settings_btn.setEnabled(False)
             self._destripe_cb.setToolTip(
                 "Destriping is unavailable — the destripe backend failed to load:\n"
                 f"    {type(pystripe_err).__name__}: {pystripe_err}\n"
@@ -4796,6 +4824,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
         s.setValue("destripe_direction", self._destripe_dir_combo.currentData())
+        s.setValue("destripe_params_json", json.dumps(self._destripe_params))
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
@@ -4919,6 +4948,12 @@ class StitchingDialog(PersistentDialog):
         _di = self._destripe_dir_combo.findData(_dir)
         if _di >= 0:
             self._destripe_dir_combo.setCurrentIndex(_di)
+        _dp = s.value("destripe_params_json", "", type=str)
+        if _dp:
+            try:
+                self._destripe_params = json.loads(_dp)
+            except (ValueError, TypeError):
+                self._destripe_params = {}
 
         deconv = s.value("deconvolution", False, type=bool)
         self._deconv_cb.setChecked(deconv)
@@ -5074,6 +5109,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("destripe", self._destripe_cb.isChecked())
         s.setValue("destripe_fast", self._destripe_fast_cb.isChecked())
         s.setValue("destripe_direction", self._destripe_dir_combo.currentData())
+        s.setValue("destripe_params_json", json.dumps(self._destripe_params))
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
@@ -5197,6 +5233,12 @@ class NativeStitchingDialog(StitchingDialog):
         _di = self._destripe_dir_combo.findData(_dir)
         if _di >= 0:
             self._destripe_dir_combo.setCurrentIndex(_di)
+        _dp = s.value("destripe_params_json", "", type=str)
+        if _dp:
+            try:
+                self._destripe_params = json.loads(_dp)
+            except (ValueError, TypeError):
+                self._destripe_params = {}
 
         deconv = s.value("deconvolution", False, type=bool)
         self._deconv_cb.setChecked(deconv)

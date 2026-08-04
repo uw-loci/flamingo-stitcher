@@ -820,6 +820,11 @@ class StitchingConfig:
     # frame (before the per-tile rot/flip), so the wrong axis silently removes
     # nothing. "auto" picks the axis with the stronger stripe signal.
     destripe_direction: str = "auto"
+    # Destripe filter tuning. Empty dict = use the YAML/built-in defaults.
+    # Recognised keys: sigma_foreground, sigma_background (filter bandwidth in px
+    # — the main strength lever), level (wavelet depth), wavelet (mother wavelet),
+    # crossover (fg/bg blend width), threshold (fg/bg split; None = Otsu auto).
+    destripe_params: Dict[str, Any] = field(default_factory=dict)
     # Depth-dependent attenuation correction (Beer-Lambert Z-falloff)
     depth_attenuation: bool = False
     depth_attenuation_mu: Optional[float] = None  # 1/µm; None = auto-fit
@@ -2605,6 +2610,7 @@ def destripe_volume(
     volume: np.ndarray,
     max_workers: Optional[int] = None,
     direction: str = "auto",
+    params: Optional[Dict[str, Any]] = None,
 ) -> np.ndarray:
     """Apply PyStripe destriping to each Z-plane using parallel threads.
 
@@ -2652,17 +2658,37 @@ def destripe_volume(
     n_planes = volume.shape[0]
     result = np.empty_like(volume)
 
-    # Load destripe parameters from YAML config (fallback to built-in defaults)
+    # Resolve filter parameters: explicit `params` (GUI/CLI) wins, else the YAML
+    # config, else the built-in defaults. Missing/None keys fall through, so a
+    # partial override only changes what it names.
+    p = dict(params or {})
     try:
         from flamingo_stitcher.config_loader import get_stitching_value
 
-        _ds_sigma = get_stitching_value("destripe", "sigma", default=[128, 256])
-        _ds_level = get_stitching_value("destripe", "level", default=7)
-        _ds_wavelet = get_stitching_value("destripe", "wavelet", default="db2")
+        _yaml_sigma = get_stitching_value("destripe", "sigma", default=[128, 256])
+        _yaml_level = get_stitching_value("destripe", "level", default=7)
+        _yaml_wavelet = get_stitching_value("destripe", "wavelet", default="db2")
     except Exception:
-        _ds_sigma = [128, 256]
-        _ds_level = 7
-        _ds_wavelet = "db2"
+        _yaml_sigma, _yaml_level, _yaml_wavelet = [128, 256], 7, "db2"
+
+    def _pick(key, fallback):
+        v = p.get(key)
+        return fallback if v is None else v
+
+    _ds_sigma = [
+        float(_pick("sigma_foreground", _yaml_sigma[0])),
+        float(_pick("sigma_background", _yaml_sigma[1])),
+    ]
+    _ds_level = int(_pick("level", _yaml_level))
+    _ds_wavelet = str(_pick("wavelet", _yaml_wavelet))
+    _ds_crossover = float(_pick("crossover", 10.0))
+    # threshold: None/absent → -1, which makes filter_streaks pick it via Otsu.
+    _ds_threshold = float(_pick("threshold", -1.0))
+    logger.info(
+        f"Destripe params: sigma(fg/bg)={_ds_sigma[0]:g}/{_ds_sigma[1]:g} "
+        f"level={_ds_level} wavelet={_ds_wavelet} crossover={_ds_crossover:g} "
+        f"threshold={'Otsu (auto)' if _ds_threshold == -1 else f'{_ds_threshold:g}'}"
+    )
 
     def _process_plane(z: int) -> int:
         plane = volume[z].astype(np.float32)
@@ -2673,6 +2699,8 @@ def destripe_volume(
             sigma=_ds_sigma,
             level=_ds_level,
             wavelet=_ds_wavelet,
+            crossover=_ds_crossover,
+            threshold=_ds_threshold,
         )
         if transpose:
             filtered = filtered.T
@@ -4657,6 +4685,7 @@ class StitchingPipeline:
                     vol,
                     max_workers=self._destripe_worker_budget(),
                     direction=self.config.destripe_direction,
+                    params=self.config.destripe_params,
                 )
             illum_volumes[illum_side] = vol
 
@@ -4706,6 +4735,7 @@ class StitchingPipeline:
                 volume,
                 max_workers=self._destripe_worker_budget(),
                 direction=self.config.destripe_direction,
+                params=self.config.destripe_params,
             )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far

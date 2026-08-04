@@ -71,7 +71,7 @@ def _install_spies(monkeypatch):
     def fake_load(path, n_planes, w, h):
         return np.zeros((3, 8, 8), dtype=np.uint16)
 
-    def fake_destripe(volume, max_workers=None, direction="auto"):
+    def fake_destripe(volume, max_workers=None, direction="auto", params=None):
         # record that destripe saw a SINGLE-side-shaped volume
         calls.append(("destripe", tuple(volume.shape)))
         return volume

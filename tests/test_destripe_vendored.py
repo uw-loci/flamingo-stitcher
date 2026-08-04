@@ -82,6 +82,47 @@ def test_wrong_direction_removes_nothing():
     assert p_out > p_in * 0.8, "horizontal filter should not touch vertical stripes"
 
 
+def test_params_reach_the_filter():
+    """destripe_params must actually change filtering (not be silently ignored)."""
+    from flamingo_stitcher.pipeline import destripe_volume
+
+    vol = _striped("horizontal", seed=9)
+    default = destripe_volume(vol, direction="horizontal")
+    narrow = destripe_volume(
+        vol, direction="horizontal",
+        params={"sigma_foreground": 8, "sigma_background": 8},
+    )
+    assert not np.array_equal(default, narrow), "sigma override had no effect"
+
+    # sigma 0/0 disables the filter entirely (upstream's documented behaviour)
+    off = destripe_volume(
+        vol, direction="horizontal",
+        params={"sigma_foreground": 0, "sigma_background": 0},
+    )
+    assert np.abs(off.astype(int) - vol.astype(int)).max() <= 1
+
+    # a partial dict overrides only what it names
+    assert destripe_volume(
+        vol, direction="horizontal", params={"level": 3}
+    ).shape == vol.shape
+
+
+def test_settings_dialog_defaults_match_pipeline():
+    """The dialog's DEFAULTS must not drift from the pipeline/YAML defaults."""
+    pytest.importorskip("PyQt5", reason="dialog defaults live in a Qt module")
+    from flamingo_stitcher.config_loader import get_stitching_value
+    from flamingo_stitcher.gui.destripe_settings_dialog import DEFAULTS
+
+    sigma = get_stitching_value("destripe", "sigma", default=[128, 256])
+    assert DEFAULTS["sigma_foreground"] == float(sigma[0])
+    assert DEFAULTS["sigma_background"] == float(sigma[1])
+    assert DEFAULTS["level"] == get_stitching_value("destripe", "level", default=7)
+    assert DEFAULTS["wavelet"] == get_stitching_value(
+        "destripe", "wavelet", default="db2"
+    )
+    assert DEFAULTS["threshold"] is None  # Otsu
+
+
 @pytest.mark.skipif(not _HAVE_PYSTRIPE, reason="pystripe not importable here")
 def test_bit_identical_to_upstream_pystripe():
     from pystripe.core import filter_streaks as upstream

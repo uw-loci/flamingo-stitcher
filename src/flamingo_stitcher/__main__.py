@@ -134,6 +134,27 @@ def main():
         help="Max parallel destripe threads (default: auto based on available memory)",
     )
     preproc_group.add_argument(
+        "--destripe-sigma",
+        type=float,
+        nargs=2,
+        metavar=("FOREGROUND", "BACKGROUND"),
+        default=None,
+        help="Destripe filter bandwidth in px for the foreground and background "
+        "bands (default: 128 256). The main strength lever — larger removes "
+        "wider stripes; 0 disables that band.",
+    )
+    preproc_group.add_argument(
+        "--destripe-level",
+        type=int,
+        default=None,
+        help="Destripe wavelet decomposition depth (default: 7; 0 = auto/max)",
+    )
+    preproc_group.add_argument(
+        "--destripe-wavelet",
+        default=None,
+        help="Destripe mother wavelet, any PyWavelets name (default: db2)",
+    )
+    preproc_group.add_argument(
         "--destripe-direction",
         choices=["auto", "horizontal", "vertical"],
         default="auto",
@@ -483,6 +504,20 @@ def main():
         destripe_fast=args.destripe_fast,
         destripe_workers=args.destripe_workers,
         destripe_direction=args.destripe_direction,
+        destripe_params={
+            k: v
+            for k, v in {
+                "sigma_foreground": (
+                    args.destripe_sigma[0] if args.destripe_sigma else None
+                ),
+                "sigma_background": (
+                    args.destripe_sigma[1] if args.destripe_sigma else None
+                ),
+                "level": args.destripe_level,
+                "wavelet": args.destripe_wavelet,
+            }.items()
+            if v is not None
+        },
         depth_attenuation=args.depth_attenuation,
         depth_attenuation_mu=args.depth_attenuation_mu,
         reg_channel=args.reg_channel,
