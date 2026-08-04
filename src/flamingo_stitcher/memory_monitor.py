@@ -18,8 +18,9 @@ a headless or frozen run.
 
 from __future__ import annotations
 
+import os
 import threading
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 try:
     import psutil
@@ -27,6 +28,69 @@ try:
     _HAVE_PSUTIL = True
 except Exception:  # pragma: no cover - psutil is a hard dep, but never crash
     _HAVE_PSUTIL = False
+
+
+def top_memory_consumers(
+    limit: int = 5, min_gb: float = 1.0, exclude_self: bool = True
+) -> List[Tuple[str, float, int]]:
+    """Biggest RAM users on this machine as ``[(name, gb, n_processes), ...]``.
+
+    Aggregated **by process name** and sorted descending, because a browser or
+    Fiji typically spans dozens of PIDs and a per-PID list buries the real
+    culprit. Only entries at or above ``min_gb`` are returned.
+
+    Used to make "waiting for memory" actionable: the user can see that e.g.
+    Fiji is holding 21 GB and close it, instead of watching a stalled run.
+    Best-effort — returns ``[]`` if psutil is unavailable, and silently skips
+    processes that vanish or deny access mid-scan.
+    """
+    if not _HAVE_PSUTIL:
+        return []
+    skip = set()
+    if exclude_self:
+        # Don't tell the user to close the stitcher (or its own helper workers).
+        try:
+            me = psutil.Process()
+            skip = {me.pid} | {c.pid for c in me.children(recursive=True)}
+        except Exception:
+            skip = {os.getpid()}
+
+    totals: Dict[str, List[float]] = {}
+    try:
+        procs = psutil.process_iter(["name", "memory_info"])
+    except Exception:
+        return []
+    for proc in procs:
+        try:
+            if proc.pid in skip:
+                continue
+            info = proc.info
+            mem = info.get("memory_info")
+            if mem is None:
+                continue
+            name = info.get("name") or f"pid {proc.pid}"
+            entry = totals.setdefault(name, [0.0, 0])
+            entry[0] += float(mem.rss)
+            entry[1] += 1
+        except Exception:
+            continue  # process died / access denied — skip it
+
+    out = [
+        (name, rss / (1024**3), int(count))
+        for name, (rss, count) in totals.items()
+        if rss / (1024**3) >= min_gb
+    ]
+    out.sort(key=lambda t: t[1], reverse=True)
+    return out[:limit]
+
+
+def format_memory_consumers(rows: List[Tuple[str, float, int]]) -> str:
+    """One-per-line ``"  name — 21.3 GB (28 processes)"`` rendering."""
+    lines = []
+    for name, gb, count in rows:
+        suffix = f" ({count} processes)" if count > 1 else ""
+        lines.append(f"  {name} — {gb:.1f} GB{suffix}")
+    return "\n".join(lines)
 
 
 class MemoryMonitor:

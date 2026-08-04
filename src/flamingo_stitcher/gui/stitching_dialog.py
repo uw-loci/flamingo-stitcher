@@ -3218,6 +3218,7 @@ class StitchingDialog(PersistentDialog):
 
         # Store batch state
         self._batch_running = True
+        self._mem_wait_popup_shown = False
         self._set_flamingos_marching(True)
         self._batch_config = config
         self._batch_channels = self._parse_channels()
@@ -3525,6 +3526,7 @@ class StitchingDialog(PersistentDialog):
     # ---- Between-item memory-recovery gate -------------------------------
     _MEM_WAIT_TIMEOUT_S = 120.0  # stop waiting and proceed after this long
     _MEM_WAIT_POLL_S = 5.0  # re-check cadence while waiting
+    _MEM_WAIT_LOG_S = 30.0  # re-log cadence (poll is noisier than useful)
 
     def _memory_gate_gb(self, item):
         """(need_gb, avail_gb) for *item*, or (None, None) if unknowable.
@@ -3550,6 +3552,53 @@ class StitchingDialog(PersistentDialog):
         except Exception:
             return None, None
 
+    def _memory_hog_hint(self) -> str:
+        """"  Largest memory users: …" block, or "" when nothing notable."""
+        try:
+            from flamingo_stitcher.memory_monitor import (
+                format_memory_consumers,
+                top_memory_consumers,
+            )
+
+            rows = top_memory_consumers(limit=5, min_gb=1.0)
+        except Exception:
+            return ""
+        if not rows:
+            return ""
+        return (
+            "\n  Largest memory users right now (closing one frees RAM):\n"
+            + format_memory_consumers(rows)
+        )
+
+    def _show_memory_wait_popup(self, need_gb, avail_gb) -> None:
+        """Non-blocking heads-up naming what is holding the RAM.
+
+        Warn-only and never modal: the run continues either way (the gate times
+        out and the resource guard decides), so this must not block the batch.
+        """
+        try:
+            hint = self._memory_hog_hint()
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Information)
+            box.setWindowTitle("Waiting for memory")
+            box.setText(
+                f"Stitching is waiting for RAM to free up.\n\n"
+                f"Free: ~{avail_gb:.0f} GB    Needed: ~{need_gb:.0f} GB\n\n"
+                + (
+                    hint.strip()
+                    if hint
+                    else "No single large memory user stands out."
+                )
+                + f"\n\nClosing one of these now would let the run start sooner. "
+                f"It will proceed anyway after "
+                f"{int(self._MEM_WAIT_TIMEOUT_S)}s regardless."
+            )
+            box.setStandardButtons(QMessageBox.Ok)
+            box.setModal(False)  # never block the batch
+            box.show()
+        except Exception as exc:  # a UI hiccup must never break the run
+            self._logger.debug(f"memory-wait popup failed: {exc}")
+
     def _launch_item_when_memory_ready(self, item, output_dir, elapsed=0.0):
         # The batch may have been cancelled while this timer was pending.
         if not self._batch_running or item.get("status") != "stitching":
@@ -3567,15 +3616,28 @@ class StitchingDialog(PersistentDialog):
                     f"  Proceeding after {int(elapsed)}s — RAM still low "
                     f"({avail_gb:.0f} GB free vs ~{need_gb:.0f} GB projected); "
                     f"the resource guard will make the final call."
+                    + self._memory_hog_hint()
                 )
             self._start_item_worker(item, output_dir)
             return
-        self._log(
-            f"  Waiting for memory to recover before this item: "
-            f"{avail_gb:.0f} GB free, ~{need_gb:.0f} GB projected "
-            f"(re-checking every {int(self._MEM_WAIT_POLL_S)}s, up to "
-            f"{int(self._MEM_WAIT_TIMEOUT_S)}s)…"
-        )
+
+        # Log on the FIRST trip, then only every _MEM_WAIT_LOG_S — the 5 s poll
+        # produced ~24 identical lines per item, which buried the actionable part.
+        first = elapsed <= 0
+        if first or (int(elapsed) % int(self._MEM_WAIT_LOG_S) == 0):
+            self._log(
+                f"  Waiting for memory to recover before this item: "
+                f"{avail_gb:.0f} GB free, ~{need_gb:.0f} GB projected "
+                f"(re-checking every {int(self._MEM_WAIT_POLL_S)}s, up to "
+                f"{int(self._MEM_WAIT_TIMEOUT_S)}s)…"
+                + (self._memory_hog_hint() if first else "")
+            )
+        # Surface it once per batch: the log is easy to miss when a run is
+        # kicked off and left alone, and closing a memory hog is only useful
+        # while we're still waiting.
+        if first and not getattr(self, "_mem_wait_popup_shown", False):
+            self._mem_wait_popup_shown = True
+            self._show_memory_wait_popup(need_gb, avail_gb)
         import gc
 
         gc.collect()
