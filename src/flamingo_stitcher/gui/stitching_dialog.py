@@ -978,7 +978,6 @@ class StitchingDialog(PersistentDialog):
         # the UI state matches what the pipeline will actually run. The
         # plain toggled→setEnabled link only handled the enabled state.
         self._destripe_cb.toggled.connect(self._on_destripe_toggled)
-        proc_layout.addWidget(self._destripe_fast_cb, 0, 1)
 
         # Stripe orientation. The filter is axis-fixed AND destriping runs in the
         # raw camera frame (before the per-tile rot/flip), so the wrong axis
@@ -998,7 +997,16 @@ class StitchingDialog(PersistentDialog):
             "tile is rotated to stage — so it may look 90° off vs the final image."
         )
         self._destripe_dir_combo.setEnabled(False)
-        proc_layout.addWidget(self._destripe_dir_combo, 0, 2)
+
+        # Both destripe sub-options share grid cell (0, 1) via an HBox. Row 0's
+        # remaining cells (0,2)-(0,3) belong to the content-based-blending
+        # checkbox — putting the combo there made the two overlap on screen.
+        _destripe_opts = QHBoxLayout()
+        _destripe_opts.setContentsMargins(0, 0, 0, 0)
+        _destripe_opts.addWidget(self._destripe_fast_cb)
+        _destripe_opts.addWidget(self._destripe_dir_combo)
+        _destripe_opts.addStretch()
+        proc_layout.addLayout(_destripe_opts, 0, 1)
 
         self._content_fusion_cb = QCheckBox("Content-based blending \u2731")
         self._content_fusion_cb.setToolTip(
