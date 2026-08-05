@@ -95,6 +95,16 @@ class StitchingTimingKey:
     # drive letter) and just collapses to one bucket.
     source_drive: str = ""
     dest_drive: str = ""
+    # Per-tile PREPROCESSING steps. These dominate the load+preprocess phase
+    # (61% of a measured 135-tile run), so a destripe-on and a destripe-off run
+    # sharing one cache entry averages two very different costs into a number
+    # that fits neither — the same reasoning that already puts downsample in the
+    # key. `destripe_fast` is separate because it filters the DOWNSAMPLED tile,
+    # which is a different cost class again (4x fewer pixels at xy2).
+    destripe: bool = False
+    destripe_fast: bool = False
+    deconvolution: bool = False
+    flat_field: bool = False
 
     def serialize(self) -> str:
         return (
@@ -108,6 +118,9 @@ class StitchingTimingKey:
             f"pl={_bucket_planes(self.planes_per_tile)}|"
             f"dxy={self.downsample_xy}|"
             f"dz={self.downsample_z}|"
+            f"ds={int(self.destripe)}{int(self.destripe_fast)}|"
+            f"dec={int(self.deconvolution)}|"
+            f"ff={int(self.flat_field)}|"
             f"src={self.source_drive}|"
             f"dst={self.dest_drive}"
         )
@@ -156,14 +169,42 @@ class StitchingTimingCache:
         except Exception as e:
             logger.warning(f"Could not save stitching timing cache: {e}")
 
-    def get_total_s(self, key: StitchingTimingKey) -> Optional[float]:
-        """Cached mean total wall time for this key, if any."""
+    # A cached total is scaled by at most this factor before we stop trusting
+    # the linearity assumption. Well outside a single tile bucket's span.
+    _MAX_TILE_SCALE = 4.0
+
+    def get_total_s(
+        self, key: StitchingTimingKey, n_tiles: Optional[int] = None
+    ) -> Optional[float]:
+        """Cached mean total wall time for this key, scaled to ``n_tiles``.
+
+        Tile counts are BUCKETED in the key, and the widest buckets span 2.5x
+        (100-249). Returning the bucket's mean unscaled meant a 249-tile run's
+        recorded time seeded a 135-tile run: one measured case predicted 204 s
+        for a run that took 115 s — almost exactly the 249/135 ratio. Wall time
+        is close to linear in tile count for a fixed geometry (preprocess is
+        per-tile, and fused area grows with the mosaic), so scale by the ratio
+        of actual to recorded tile count.
+
+        Falls back to the raw mean when the entry predates tile-count tracking
+        or the ratio is implausible.
+        """
         with self._lock:
             entry = self._data.get(key.serialize())
             if not entry:
                 return None
             total = entry.get("total_s", {}).get("mean")
-            return float(total) if total and total > 0 else None
+            if not total or total <= 0:
+                return None
+            total = float(total)
+
+            recorded_tiles = entry.get("n_tiles", {}).get("mean")
+            if not n_tiles or not recorded_tiles or recorded_tiles <= 0:
+                return total
+            scale = float(n_tiles) / float(recorded_tiles)
+            if not (1.0 / self._MAX_TILE_SCALE) <= scale <= self._MAX_TILE_SCALE:
+                return total
+            return total * scale
 
     def get_phase_shares(self, key: StitchingTimingKey) -> Dict[str, float]:
         """Cached mean share-of-total per phase. Empty dict if no data."""
@@ -185,17 +226,30 @@ class StitchingTimingCache:
         phase_durations_s: Dict[str, float],
         *,
         alpha: float = EMA_ALPHA,
+        n_tiles: Optional[int] = None,
     ) -> None:
         """Update the EMA with one completed run.
 
         ``phase_durations_s`` is the absolute wall time spent in each
-        phase; shares are computed here from ``total_s``.
+        phase; shares are computed here from ``total_s``. ``n_tiles`` is
+        recorded alongside so :meth:`get_total_s` can scale the cached total to
+        a different tile count within the same (bucketed) key.
         """
         if total_s <= 0:
             return
         with self._lock:
             k = key.serialize()
             entry = self._data.setdefault(k, {"total_s": {}, "phases": {}})
+
+            # Track the tile count this timing was measured at, so a later run
+            # elsewhere in the same bucket can scale rather than inherit.
+            if n_tiles and n_tiles > 0:
+                tile_block = entry.setdefault("n_tiles", {})
+                prev_tiles = float(tile_block.get("mean", 0.0))
+                if not prev_tiles:
+                    tile_block["mean"] = float(n_tiles)
+                else:
+                    tile_block["mean"] = alpha * n_tiles + (1.0 - alpha) * prev_tiles
 
             # Update total_s EMA
             total_block = entry["total_s"]

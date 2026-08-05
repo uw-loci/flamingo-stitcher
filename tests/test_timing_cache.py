@@ -282,3 +282,112 @@ class TestPhaseOrderInvariants:
     def test_phase_order_has_expected_entries(self):
         for p in ("discover", "register", "preprocess", "fuse", "write"):
             assert p in PHASE_ORDER
+
+
+# --- Tile-count scaling and preprocessing key axes -------------------------
+
+
+def _key(n_tiles, **kw):
+    """A realistic key; overrides let a test vary one axis at a time."""
+    from flamingo_stitcher.timing_cache import StitchingTimingKey
+
+    base = dict(
+        n_tiles=n_tiles,
+        n_channels=1,
+        n_pyramid_levels=-1,
+        n_timepoints=1,
+        output_format="ome-tiff",
+        fusion_method="cosine",
+        skip_registration=True,
+        planes_per_tile=34,
+        downsample_xy=2,
+        downsample_z=1,
+        source_drive="D:",
+        dest_drive="G:",
+    )
+    base.update(kw)
+    return StitchingTimingKey(**base)
+
+
+class TestTileCountScaling:
+    """Tile counts are bucketed, and the widest bucket spans 2.5x.
+
+    Returning a bucket's mean unscaled let a 249-tile run's timing seed a
+    135-tile run: 204 s predicted for a run that took 115 s, almost exactly the
+    249/135 ratio. Wall time is near-linear in tile count for fixed geometry.
+    """
+
+    def test_cached_total_scales_to_the_actual_tile_count(self, tmp_path):
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+        cache = StitchingTimingCache(path=tmp_path / "timing.json")
+        # Both counts live in the same "100-249" bucket.
+        cache.record_run(_key(249), 204.0, {"preprocess": 126.0}, n_tiles=249)
+
+        scaled = cache.get_total_s(_key(135), n_tiles=135)
+
+        assert scaled is not None
+        # 204 * 135/249 = 110.6, against a real measured 115 s.
+        assert 100.0 < scaled < 120.0, scaled
+
+    def test_unscaled_when_the_entry_predates_tile_tracking(self, tmp_path):
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+        cache = StitchingTimingCache(path=tmp_path / "timing.json")
+        cache.record_run(_key(249), 204.0, {"preprocess": 126.0})  # no n_tiles
+
+        assert cache.get_total_s(_key(135), n_tiles=135) == 204.0
+
+    def test_unscaled_when_the_caller_gives_no_tile_count(self, tmp_path):
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+        cache = StitchingTimingCache(path=tmp_path / "timing.json")
+        cache.record_run(_key(249), 204.0, {"preprocess": 126.0}, n_tiles=249)
+
+        assert cache.get_total_s(_key(135)) == 204.0
+
+    def test_implausible_ratio_falls_back_instead_of_extrapolating(self, tmp_path):
+        """The 250+ bucket is unbounded, so guard the linearity assumption."""
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+        cache = StitchingTimingCache(path=tmp_path / "timing.json")
+        cache.record_run(_key(250), 200.0, {"preprocess": 120.0}, n_tiles=250)
+
+        # 2000/250 = 8x, past the 4x trust limit → raw mean, not 1600 s.
+        assert cache.get_total_s(_key(2000), n_tiles=2000) == 200.0
+
+
+class TestPreprocessingKeyAxes:
+    """Destripe/deconv/flat-field dominate preprocess, so they must key apart.
+
+    Otherwise a destripe-on and a destripe-off run average into one number that
+    fits neither — the same reasoning that already puts downsample in the key.
+    """
+
+    def test_destripe_changes_the_key(self):
+        assert _key(135).serialize() != _key(135, destripe=True).serialize()
+
+    def test_fast_destripe_is_its_own_bucket(self):
+        """It filters the DOWNSAMPLED tile — a different cost class."""
+        slow = _key(135, destripe=True).serialize()
+        fast = _key(135, destripe=True, destripe_fast=True).serialize()
+        assert slow != fast
+
+    def test_deconvolution_and_flat_field_change_the_key(self):
+        base = _key(135).serialize()
+        assert _key(135, deconvolution=True).serialize() != base
+        assert _key(135, flat_field=True).serialize() != base
+
+    def test_destripe_runs_do_not_share_a_cache_entry(self, tmp_path):
+        from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+        cache = StitchingTimingCache(path=tmp_path / "timing.json")
+        cache.record_run(_key(135), 70.0, {"preprocess": 30.0}, n_tiles=135)
+
+        on = _key(135, destripe=True, destripe_fast=True)
+        assert cache.get_total_s(on, n_tiles=135) is None  # its own cold start
+
+    def test_defaults_keep_the_key_stable_for_a_plain_run(self):
+        """A run with no preprocessing must serialize the off-state, not vary."""
+        s = _key(135).serialize()
+        assert "ds=00" in s and "dec=0" in s and "ff=0" in s

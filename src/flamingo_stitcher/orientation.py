@@ -176,7 +176,13 @@ def preset_for_microscope(name: Optional[str]) -> Optional[str]:
     return load_orientation_presets().get(name.strip().lower())
 
 
-_NAME_RE = re.compile(r"Microscope name\s*=\s*(.+)")
+# Horizontal whitespace only around "=", and the value must stay on the SAME
+# line. With a plain \s* the newline after an empty "Microscope name =" was
+# consumed and (.+) captured the next line — a blank field resolved to
+# "</Scope Settings>", which then became the preset key. Every scope with a
+# blank name would have shared that one bogus key, for destripe settings AND
+# tile orientation.
+_NAME_RE = re.compile(r"Microscope name[^\S\r\n]*=[^\S\r\n]*([^\r\n]+)")
 
 
 def read_microscope_name(acquisition_dir: Path) -> Optional[str]:

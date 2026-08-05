@@ -93,7 +93,9 @@ class MultiPhaseEstimator:
         self._frac: float = 0.0
         self._smoothed_remaining: Optional[float] = None
 
-        self._cached_total_s = cache.get_total_s(key)
+        # Pass the ACTUAL tile count so a bucketed cache entry is scaled to
+        # this run's size instead of inherited whole (see get_total_s).
+        self._cached_total_s = cache.get_total_s(key, n_tiles=key.n_tiles)
         self._cached_shares = cache.get_phase_shares(key)
         # Cold-start prior: prefer the measured mean for this config; else the
         # caller's rough model. Used until live progress can carry the estimate.
@@ -150,7 +152,12 @@ class MultiPhaseEstimator:
         elapsed = self.elapsed_seconds()
         if elapsed is None or elapsed < 1.0:
             return  # not worth recording (presumably aborted)
-        self._cache.record_run(self._key, elapsed, dict(self._phase_durations))
+        self._cache.record_run(
+            self._key,
+            elapsed,
+            dict(self._phase_durations),
+            n_tiles=self._key.n_tiles,
+        )
         logger.info(
             f"Stitching ETA: recorded run "
             f"(total={elapsed:.0f}s, phases={self._phase_durations})"

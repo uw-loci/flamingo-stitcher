@@ -2370,6 +2370,7 @@ class StitchingDialog(PersistentDialog):
         if dlg.exec_() == QDialog.Accepted:
             self._destripe_params = dlg.get_params()
             self._log(f"Destripe settings updated: {self._destripe_params}")
+            self._save_destripe_preset_for_selection()
 
     def _on_destripe_preview(self):
         """Open the live before/after destripe preview for the chosen queue row.
@@ -2418,6 +2419,7 @@ class StitchingDialog(PersistentDialog):
                 f"Destripe settings from preview: {self._destripe_params} "
                 f"(direction {dlg.get_direction()})"
             )
+            self._save_destripe_preset_for_selection()
 
     def _selected_queue_path(self, title: str):
         """Path of the selected queue row, or the first when none is selected."""
@@ -3797,6 +3799,67 @@ class StitchingDialog(PersistentDialog):
             movie.stop()
             label.setVisible(False)
 
+    def _apply_destripe_preset(self, item_config, acq_path):
+        """Swap in this acquisition's microscope-specific destripe settings.
+
+        An unrecognised scope is not blocked — the run continues with whatever
+        was last used — but it says so loudly, because the failure mode is
+        invisible: threshold and crossover are absolute intensities, so another
+        scope's values can quietly treat the whole image as background (or all
+        foreground) instead of merely being mistuned.
+        """
+        from dataclasses import replace
+
+        from flamingo_stitcher.destripe_presets import (
+            describe_resolution,
+            resolve_for_acquisition,
+        )
+
+        try:
+            scope, preset = resolve_for_acquisition(acq_path)
+        except Exception as e:  # noqa: BLE001 - never block a run on this
+            self._log(f"⚠ Could not resolve destripe settings by microscope: {e}")
+            return item_config
+
+        applied, message = describe_resolution(scope, preset)
+        if applied:
+            item_config = replace(
+                item_config,
+                destripe_params=dict(preset["params"]),
+                destripe_direction=preset["direction"],
+            )
+            self._log(f"{message} ({preset['params']})")
+        else:
+            self._log(f"⚠ {message}")
+        return item_config
+
+    def _save_destripe_preset_for_selection(self) -> None:
+        """Persist the current destripe settings under the selected scope."""
+        if not self._queue:
+            return
+        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
+        row = rows[0] if rows else 0
+        if not (0 <= row < len(self._queue)):
+            return
+        acq_path = self._queue[row].get("path")
+        if not acq_path:
+            return
+
+        from flamingo_stitcher.destripe_presets import (
+            microscope_for_acquisition,
+            save_destripe_preset,
+        )
+
+        scope = microscope_for_acquisition(acq_path)
+        direction = str(self._destripe_dir_combo.currentData() or "auto")
+        if save_destripe_preset(scope, self._destripe_params, direction):
+            self._log(f"Destripe settings saved for microscope '{scope}'.")
+        elif not scope:
+            self._log(
+                "⚠ Destripe settings not saved per microscope — this "
+                "acquisition has no readable microscope name."
+            )
+
     def _start_item_worker(self, item, output_dir):
         """Launch the stitching worker for *item* (memory gate already passed)."""
         from dataclasses import replace
@@ -3807,6 +3870,12 @@ class StitchingDialog(PersistentDialog):
         # this acquisition's pixel size into the config, and a fresh copy keeps
         # one item's derived value from leaking into the next as a fallback.
         item_config = replace(self._batch_config)
+
+        # Destripe settings are per-MICROSCOPE, resolved here (per item) rather
+        # than once for the batch, so a queue mixing instruments gets each one's
+        # own tuning instead of whichever was last touched in the GUI.
+        if item_config.destripe:
+            item_config = self._apply_destripe_preset(item_config, item["path"])
 
         self._worker = StitchingWorker(
             config=item_config,
@@ -4353,7 +4422,15 @@ class StitchingDialog(PersistentDialog):
                 import subprocess
                 import sys
 
-                folder = self._output_dir_edit.text()
+                # Open the acquisition's OWN output folder, not the parent
+                # directory that holds every stitch ever written here. The
+                # per-run path is already resolved above for the Sample View
+                # button; opening the parent left the user hunting for the one
+                # folder they just made. Fall back to the parent only if that
+                # folder somehow isn't there.
+                folder = last_success_path
+                if not Path(folder).is_dir():
+                    folder = self._output_dir_edit.text()
                 if sys.platform == "win32":
                     subprocess.Popen(["explorer", folder])
                 elif sys.platform == "darwin":

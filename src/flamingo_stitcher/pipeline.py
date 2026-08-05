@@ -291,6 +291,12 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
         planes_per_tile=planes,
         downsample_xy=int(getattr(config, "downsample_xy", 1) or 1),
         downsample_z=int(getattr(config, "downsample_z", 1) or 1),
+        # Per-tile preprocessing: these dominate the load+preprocess phase, so
+        # they have to key separately or their costs get averaged together.
+        destripe=bool(getattr(config, "destripe", False)),
+        destripe_fast=bool(getattr(config, "destripe_fast", False)),
+        deconvolution=bool(getattr(config, "deconvolution_enabled", False)),
+        flat_field=bool(getattr(config, "flat_field_correction", False)),
         source_drive=_drive_root(src),
         dest_drive=_drive_root(output_dir),
     )
