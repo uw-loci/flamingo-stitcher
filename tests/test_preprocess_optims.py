@@ -39,16 +39,38 @@ class TestDownsampleIdentical(unittest.TestCase):
             ).astype(np.uint16)
             np.testing.assert_array_equal(got, ref, err_msg=f"xy={fxy}")
 
-    def test_z_downsample_path_unchanged(self):
+    def test_z_downsample_is_a_streamed_block_mean(self):
+        """Z reduction averages consecutive slabs of factor_z planes.
+
+        It used to upcast the WHOLE tile to float32 for a 3-D
+        ``scipy.ndimage.zoom`` — ~27 GB of transient float on an 800-plane
+        2048² tile, which made turning Z downsample UP raise the memory peak
+        instead of lowering it. The slab mean is both the cheaper and the
+        better-anti-aliased reduction; peak is one slab, not one volume.
+        """
         from scipy.ndimage import zoom
 
         rng = np.random.default_rng(1)
         vol = rng.integers(0, 65535, size=(8, 64, 64), dtype=np.uint16)
         got = downsample_volume(vol, factor_xy=2, factor_z=2)
+
+        slabs = vol.reshape(4, 2, 64, 64).astype(np.float32).mean(axis=1)
         ref = np.clip(
-            zoom(vol.astype(np.float32), (0.5, 0.5, 0.5), order=1), 0, 65535
+            np.stack([zoom(s, (0.5, 0.5), order=1) for s in slabs]), 0, 65535
         ).astype(np.uint16)
         np.testing.assert_array_equal(got, ref)
+
+    def test_z_downsample_shape_and_ragged_tail(self):
+        """Plane count follows round(z / factor); a ragged tail is not dropped."""
+        rng = np.random.default_rng(2)
+        vol = rng.integers(0, 65535, size=(9, 16, 16), dtype=np.uint16)
+        out = downsample_volume(vol, factor_xy=1, factor_z=4)
+        assert out.shape == (2, 16, 16)
+
+        # Z-only reduction leaves XY untouched.
+        flat = downsample_volume(np.ones((4, 8, 8), dtype=np.uint16), factor_z=2)
+        assert flat.shape == (2, 8, 8)
+        np.testing.assert_array_equal(flat, np.ones((2, 8, 8), dtype=np.uint16))
 
 
 class TestIllumMeanIdentical(unittest.TestCase):

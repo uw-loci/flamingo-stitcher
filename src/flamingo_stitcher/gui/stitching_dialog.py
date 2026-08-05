@@ -633,15 +633,18 @@ class StitchingDialog(PersistentDialog):
             ("2x", 2),
             ("4x", 4),
             ("8x", 8),
+            ("16x", 16),
+            ("32x", 32),
             ("iso", -1),
         ]:
             self._downsample_xy_combo.addItem(label, value)
         self._downsample_xy_combo.setToolTip(
             "XY downsample factor.\n"
-            "1x/2x/4x/8x reduces tile width and height.\n\n"
+            "1x…32x reduces tile width and height. The heavy factors\n"
+            "(16x/32x) are for fast overviews and test runs.\n\n"
             "iso: auto-pick BOTH XY and Z factors so the output voxel\n"
             "is as close to cubic as possible, using the allowed\n"
-            "factors (XY: 1/2/4/8, Z: 1/2/4). Resolved at run time\n"
+            "factors (XY: 1/2/4/8/16/32, Z: 1/2/4/8/16). Resolved at run time\n"
             "from the acquisition's own Z step, so each item in a\n"
             "batch queue is sized independently. When iso is chosen\n"
             "the Z downsample combo is ignored and greys out.\n\n"
@@ -655,10 +658,20 @@ class StitchingDialog(PersistentDialog):
         ds_layout.addSpacing(16)  # visible gap between the XY group and Z group
         ds_layout.addWidget(QLabel("Z"))
         self._downsample_z_combo = QComboBox()
-        for label, value in [("1x", 1), ("2x", 2), ("4x", 4)]:
+        for label, value in [
+            ("1x", 1),
+            ("2x", 2),
+            ("4x", 4),
+            ("8x", 8),
+            ("16x", 16),
+        ]:
             self._downsample_z_combo.addItem(label, value)
         self._downsample_z_combo.setToolTip(
             "Z downsample factor (independent of XY).\n"
+            "8x/16x are for fast overviews and test runs.\n\n"
+            "Averages each group of N planes (a block mean), streamed one\n"
+            "slab at a time — so it shrinks the output, speeds up fusion,\n"
+            "and lowers the memory peak.\n\n"
             "Greys out when XY is set to 'iso' — iso overrides both."
         )
         ds_layout.addWidget(self._downsample_z_combo)
@@ -2521,11 +2534,28 @@ class StitchingDialog(PersistentDialog):
                     f"  Fusion working set: ~{_fmt_gb(est['fusion_gb'])} "
                     f"(~{est.get('views_per_block', '?')} tiles/block)\n"
                 )
+            if est.get("preprocess_gb") is not None:
+                fusion_note += (
+                    f"  Preprocess working set: ~{_fmt_gb(est['preprocess_gb'])} "
+                    f"({est.get('preprocess_workers', '?')} tiles at NATIVE "
+                    f"resolution)\n"
+                )
+            limit_note = ""
+            if est.get("limited_by") == "preprocess":
+                limit_note = (
+                    "  Peak is pinned by PREPROCESSING, which runs at native\n"
+                    "  resolution before downsampling — raising the downsample\n"
+                    "  factor shrinks the output but not this floor, and both\n"
+                    "  modes report the same number. To lower it: fewer\n"
+                    "  preprocess workers, fewer planes per tile, or turn off\n"
+                    "  destripe / flat-field / deconvolution / Z downsample.\n"
+                )
             self._log(
                 f"Memory estimate{worst_suffix} (system RAM: {sys_ram:.0f} GB):\n"
                 f"  In-memory mode: ~{_fmt_gb(est['in_memory_gb'])} peak\n"
                 f"  Streaming mode: ~{_fmt_gb(est['streaming_gb'])} peak\n"
                 f"{fusion_note}"
+                f"{limit_note}"
                 f"  Output size:    ~{_fmt_gb(est['output_gb'])}\n"
                 f"  Recommendation: {'Streaming (low memory)' if est['auto_streaming'] else 'In-memory (fast)'}"
             )

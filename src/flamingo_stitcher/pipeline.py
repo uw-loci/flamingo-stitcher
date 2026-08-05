@@ -684,6 +684,13 @@ class StitchingConfig:
     output_chunksize: Dict[str, int] = field(
         default_factory=lambda: {"z": 128, "y": 256, "x": 256}
     )
+    # Size the output chunks against the FINAL (post-downsample) grid rather
+    # than using output_chunksize verbatim. A fixed 256-px chunk covers 2x the
+    # sample area at each downsample step, so more tiles overlap every fused
+    # block and the float64 fusion working set climbs even as the output
+    # shrinks — heavy downsample stopped saving memory. See
+    # resolve_output_chunksize. Set False to use output_chunksize as written.
+    auto_output_chunksize: bool = True
     # Fusion super-block batching (item E): fuse the output in spatial regions
     # of this many output-chunks per axis, instead of building ONE dask graph
     # for the whole output. Bounds fusion graph memory to O(region) rather than
@@ -941,7 +948,107 @@ class StitchingConfig:
 ISO_DOWNSAMPLE = -1
 
 
-def _preprocess_peak_bytes(config, native_vox: int) -> int:
+#: Never chunk finer than this (px). Below it, zarr shard/chunk bookkeeping and
+#: per-block dask overhead cost more than the memory saved.
+_MIN_CHUNK_PX = 64
+
+
+def resolve_output_chunksize(
+    config,
+    tiles: Optional[List["RawTileInfo"]] = None,
+    out_shape: Optional[Tuple[int, int, int]] = None,
+) -> Dict[str, int]:
+    """Output chunk size for the FINAL (post-downsample) grid.
+
+    ``output_chunksize`` is expressed in output pixels, so at 8x downsample a
+    256-px chunk spans 8x the sample area it did at 1x. Fusion costs
+    ``views_overlapping_the_block x block_voxels x 8 bytes``, so that growth
+    pulls more tiles into every block and the fusion working set RISES with
+    downsample even though the output shrinks — the "heavy downsample stops
+    helping" effect.
+
+    Two adjustments, both bounded by ``_MIN_CHUNK_PX``:
+
+    * **XY** is capped near one tile PITCH in output pixels, keeping roughly a
+      2x2 neighbourhood per block at any downsample factor.
+    * **Every axis** is clamped to the output extent, so a small output never
+      declares chunks larger than itself.
+
+    Returns the configured chunks unchanged when ``auto_output_chunksize`` is
+    off, or when there is nothing to size against.
+    """
+    base = dict(getattr(config, "output_chunksize", None) or {})
+    chunks = {
+        "z": max(1, int(base.get("z", 128))),
+        "y": max(1, int(base.get("y", 256))),
+        "x": max(1, int(base.get("x", 256))),
+    }
+    if not getattr(config, "auto_output_chunksize", True):
+        return chunks
+
+    ds_xy = int(getattr(config, "downsample_xy", 1) or 1)
+    if ds_xy == ISO_DOWNSAMPLE:
+        z_step = getattr(config, "z_step_um", 0) or 0
+        ds_xy = (
+            compute_iso_downsample(config.pixel_size_um, z_step)[0] if z_step else 1
+        )
+    ds_xy = max(1, ds_xy)
+
+    # Cap XY at ~one tile pitch in OUTPUT pixels.
+    pitch_mm = _min_tile_pitch_mm(tiles) if tiles else None
+    pixel_um = float(getattr(config, "pixel_size_um", 0) or 0)
+    if pitch_mm and pixel_um > 0:
+        pitch_px = int(pitch_mm * 1000.0 / (pixel_um * ds_xy))
+        cap = max(_MIN_CHUNK_PX, pitch_px)
+        chunks["y"] = min(chunks["y"], cap)
+        chunks["x"] = min(chunks["x"], cap)
+
+    # Never chunk larger than the output itself.
+    if out_shape is not None and len(out_shape) == 3:
+        for axis, extent in zip(("z", "y", "x"), out_shape):
+            if extent and extent > 0:
+                chunks[axis] = max(1, min(chunks[axis], int(extent)))
+
+    return chunks
+
+
+def _min_tile_pitch_mm(tiles: List["RawTileInfo"]) -> Optional[float]:
+    """Smallest spacing between adjacent tile centres in X or Y (mm).
+
+    The densest spacing is the conservative choice: it's where the most tiles
+    land in one block.
+    """
+    best = None
+    for values in (
+        [t.x_mm for t in tiles or []],
+        [t.y_mm for t in tiles or []],
+    ):
+        uniq = sorted({round(v, 4) for v in values})
+        gaps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
+        if gaps:
+            gap = min(gaps)
+            best = gap if best is None else min(best, gap)
+    return best
+
+
+def _avail_worker_cap(per_worker_bytes: int) -> int:
+    """How many preprocess workers currently-available RAM allows.
+
+    Mirrors ``StitchingPipeline._pick_preprocess_workers``' RAM cap (keep total
+    preprocessing RAM under ~50% of available) so the pre-run estimate and the
+    run itself can't disagree about how many native-resolution tiles are held
+    at once.
+    """
+    try:
+        import psutil
+
+        avail_bytes = psutil.virtual_memory().available
+    except Exception:
+        avail_bytes = 8 * 1024**3  # conservative 8 GB fallback
+    return max(1, int(avail_bytes // (max(1, int(per_worker_bytes)) * 2)))
+
+
+def _preprocess_peak_bytes(config, native_vox: int, plane_vox: int = 0) -> int:
     """Peak RAM one preprocess worker holds for a single tile, at NATIVE
     resolution.
 
@@ -966,9 +1073,14 @@ def _preprocess_peak_bytes(config, native_vox: int) -> int:
         peak += 4 * native_vox * 4
     if getattr(config, "illumination_fusion", "max") == "leonardo":
         peak += 2 * native_vox * 4  # two float32 illumination sides
-    if int(getattr(config, "downsample_z", 1) or 1) > 1:
-        # Z downsample couples planes → whole-volume float32 zoom (in + out).
-        peak += 2 * native_vox * 4
+    ds_z = int(getattr(config, "downsample_z", 1) or 1)
+    if ds_z > 1:
+        # Z downsample averages consecutive slabs of ds_z planes, so it holds
+        # one float32 slab (+ its reduced plane), NOT a float32 copy of the
+        # whole tile. Without a plane size, fall back to a conservative slab
+        # guess of 1/8 the tile so this can never under-count.
+        slab_vox = (plane_vox * ds_z) if plane_vox > 0 else (native_vox // 8)
+        peak += 2 * max(1, int(slab_vox)) * 4
     # Non-fast destripe and flat-field each allocate a second whole-volume buffer
     # (uint16) while the input volume is still live — add one native uint16.
     if getattr(config, "destripe", False) and not getattr(
@@ -983,8 +1095,8 @@ def _preprocess_peak_bytes(config, native_vox: int) -> int:
 def compute_iso_downsample(
     xy_pixel_um: float,
     z_step_um: float,
-    xy_choices: Sequence[int] = (1, 2, 4, 8),
-    z_choices: Sequence[int] = (1, 2, 4),
+    xy_choices: Sequence[int] = (1, 2, 4, 8, 16, 32),
+    z_choices: Sequence[int] = (1, 2, 4, 8, 16),
 ) -> Tuple[int, int]:
     """Pick (downsample_xy, downsample_z) that make output voxels closest to cubic.
 
@@ -1215,9 +1327,14 @@ def estimate_memory_usage(
     #   coexist × (views overlapping the block) × (block voxels incl. halo) × 8
     # The dask thread pool runs several blocks at once. This term — NOT the sum
     # of tile sizes — is what made an 8× job estimated at ~10 GB peak ~190 GB.
-    chunk_z = min(int(config.output_chunksize.get("z", 128)), max(out_z_px, 1))
-    chunk_y = min(int(config.output_chunksize.get("y", 256)), max(out_y_px, 1))
-    chunk_x = min(int(config.output_chunksize.get("x", 256)), max(out_x_px, 1))
+    # Same chunk resolution the run will use, so the estimate can't disagree
+    # with what fusion actually allocates.
+    _chunks = resolve_output_chunksize(
+        config, tiles, out_shape=(max(out_z_px, 1), max(out_y_px, 1), max(out_x_px, 1))
+    )
+    chunk_z = _chunks["z"]
+    chunk_y = _chunks["y"]
+    chunk_x = _chunks["x"]
 
     # Content-based blending expands each block by a halo of 2×sigma_2 pixels
     # (multiview_stitcher.weights.calculate_required_overlap); plain blend/max
@@ -1283,25 +1400,37 @@ def estimate_memory_usage(
     # Sized at NATIVE resolution (preprocessing runs before downsample) via the
     # shared _preprocess_peak_bytes, so this can't diverge from the worker-picker.
     native_vox = int(n_planes) * int(frame_w) * int(frame_h)
-    per_worker_pp = _preprocess_peak_bytes(config, native_vox)
+    per_worker_pp = _preprocess_peak_bytes(
+        config, native_vox, plane_vox=int(frame_w) * int(frame_h)
+    )
     # Model the SAME worker count _pick_preprocess_workers will use: honor a
     # preprocess_workers override up to 8, else the auto ceiling of 4. Modelling
     # a flat 4 while the executor runs up to 8 under-counts the preprocess peak
     # by up to 2x (the "safe-then-OOM" bug this whole path exists to prevent —
     # already fixed for fuse_workers/D4, mirrored here).
     _req_pp = int(getattr(config, "preprocess_workers", 0) or 0)
-    pp_workers = min(_req_pp, 8) if _req_pp > 0 else 4
-    pp_workers = min(pp_workers, max(1, n_tiles))
+    if _req_pp > 0:
+        pp_workers = min(_req_pp, 8)
+    else:
+        # Auto mode: _pick_preprocess_workers also caps by AVAILABLE RAM
+        # (avail // (per_worker * 2)), so on a box that can't hold 4 native
+        # tiles the run uses fewer. Modelling a flat 4 here reported a
+        # preprocess floor the run would never reach — and because that floor
+        # then clamped BOTH peaks via the max() below, the displayed estimate
+        # stopped responding to downsample and in-memory/streaming showed the
+        # same number. Mirror the picker exactly so the two can't diverge.
+        pp_workers = min(4, _avail_worker_cap(per_worker_pp))
+    pp_workers = max(1, min(pp_workers, max(1, n_tiles)))
     materialize_gb = pp_workers * per_worker_pp / (1024**3)
 
     # --- In-memory peak ---
     # All channels' preprocessed tiles stay resident, plus the fusion working
     # set, plus the stacked output array and pyramid overhead during write.
     held_tiles_gb = (n_tiles * n_channels * ds_tile_vox * bpv) / (1024**3)
-    in_memory_gb = (
+    in_memory_resident_gb = (
         held_tiles_gb + fusion_gb + output_gb + max(pyramid_overhead_gb, per_channel_gb)
     )
-    in_memory_gb = max(in_memory_gb, materialize_gb)
+    in_memory_gb = max(in_memory_resident_gb, materialize_gb)
 
     # --- Streaming peak ---
     # Tiles spill to an on-disk memmap and the fused output goes to an on-disk
@@ -1311,6 +1440,20 @@ def estimate_memory_usage(
     # during the zarr/TIFF write.
     chunk_buffer_gb = _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
     streaming_gb = max(materialize_gb, fusion_gb + chunk_buffer_gb)
+
+    # Which term the peak is pinned to. Preprocessing runs at NATIVE resolution
+    # (before downsample), so once it dominates, turning downsample up stops
+    # moving the estimate and both modes report the same number -- surfacing
+    # that here is what makes an unresponsive figure explainable instead of
+    # looking broken.
+    if materialize_gb >= in_memory_resident_gb:
+        limited_by = "preprocess"
+    elif fusion_gb >= max(output_gb, held_tiles_gb):
+        limited_by = "fusion"
+    elif output_gb >= held_tiles_gb:
+        limited_by = "output"
+    else:
+        limited_by = "tiles"
 
     # Auto-detect: stream if in-memory estimate exceeds available RAM
     try:
@@ -1338,6 +1481,9 @@ def estimate_memory_usage(
         "auto_streaming": auto_streaming,
         "fusion_gb": round(fusion_gb, 1),
         "views_per_block": int(views_per_block),
+        "preprocess_gb": round(materialize_gb, 1),
+        "preprocess_workers": int(pp_workers),
+        "limited_by": limited_by,
     }
 
 
@@ -2780,13 +2926,22 @@ def downsample_volume(
 ) -> np.ndarray:
     """Downsample a volume with separate Z and XY factors.
 
-    Uses scipy.ndimage.zoom (order=1) for quality downsampling,
-    same approach as sample_view.py:_downsample_for_storage.
+    Both axes are streamed, so the working set is a plane (XY) or a slab of
+    ``factor_z`` planes (Z) — never the whole volume:
+
+    * **XY** uses ``scipy.ndimage.zoom`` (order=1) per plane. Planes don't
+      couple under an XY-only zoom, so this is bit-identical to zooming the
+      whole volume at once.
+    * **Z** averages each consecutive group of ``factor_z`` planes (a block
+      mean — the "average a small stack" reduction). This is a proper
+      anti-aliased reduction AND costs one slab of float32 instead of upcasting
+      the entire tile, which is what a whole-volume ``zoom`` used to do:
+      2 x native float32 (~27 GB on an 800-plane 2048² tile) just to shrink it.
 
     Args:
         volume: (Z, Y, X) array
-        factor_xy: XY downsample factor (1, 2, 4, 8)
-        factor_z: Z downsample factor (1, 2, 4)
+        factor_xy: XY downsample factor
+        factor_z: Z downsample factor
 
     Returns:
         Downsampled volume
@@ -2817,10 +2972,28 @@ def downsample_volume(
             out[zi] = np.clip(plane, 0, 65535).astype(np.uint16)
         return out
 
-    # Z is downsampled too: planes couple, so fall back to whole-volume zoom.
-    zoom_factors = (1.0 / factor_z, 1.0 / factor_xy, 1.0 / factor_xy)
-    result = zoom(volume.astype(np.float32), zoom_factors, order=1)
-    return np.clip(result, 0, 65535).astype(np.uint16)
+    # Z is downsampled too. Reduce Z slab-by-slab (block mean over factor_z
+    # planes) and XY-zoom each reduced plane immediately, so the peak working
+    # set is one slab + one plane rather than a float32 copy of the whole tile.
+    z_in = volume.shape[0]
+    z_out = max(1, int(round(z_in / factor_z)))
+    xy_zoom = (1.0 / factor_xy, 1.0 / factor_xy) if factor_xy > 1 else None
+
+    def _reduced_plane(zi: int) -> np.ndarray:
+        lo = min(zi * factor_z, max(0, z_in - 1))
+        hi = min(z_in, lo + factor_z)
+        # float32 only for the slab being averaged (factor_z planes).
+        plane = volume[lo:hi].astype(np.float32).mean(axis=0)
+        if xy_zoom is not None:
+            plane = zoom(plane, xy_zoom, order=1)
+        return np.clip(plane, 0, 65535).astype(np.uint16)
+
+    first = _reduced_plane(0)
+    out = np.empty((z_out, *first.shape), dtype=np.uint16)
+    out[0] = first
+    for zi in range(1, z_out):
+        out[zi] = _reduced_plane(zi)
+    return out
 
 
 def _lazy_stack_channels(channel_arrays: list) -> "dask.array.Array":
@@ -4823,14 +4996,14 @@ class StitchingPipeline:
         # at native resolution before downsample (see _preprocess_peak_bytes).
         _geo_tile = active[0][1] if active else (tiles[0] if tiles else None)
         if _geo_tile is not None:
-            native_vox = (
-                int(_geo_tile.n_planes)
-                * int(_geo_tile.frame_width)
-                * int(_geo_tile.frame_height)
-            )
+            plane_vox = int(_geo_tile.frame_width) * int(_geo_tile.frame_height)
+            native_vox = int(_geo_tile.n_planes) * plane_vox
         else:
             native_vox = int(np.prod(expected_shape))
-        per_worker_bytes = _preprocess_peak_bytes(self.config, native_vox)
+            plane_vox = int(np.prod(expected_shape[1:])) if len(expected_shape) > 1 else 0
+        per_worker_bytes = _preprocess_peak_bytes(
+            self.config, native_vox, plane_vox=plane_vox
+        )
         n_workers = self._pick_preprocess_workers(per_worker_bytes, len(active))
         # Record concurrency so nested per-plane destripe pools inside
         # _preprocess_single_tile can size against it (avoid oversubscription).
@@ -5295,6 +5468,24 @@ class StitchingPipeline:
         )
         return clamped
 
+    def _fuse_chunksize(self, tile_data) -> Dict[str, int]:
+        """Output chunks for this fuse, sized against the final grid.
+
+        Logs when auto-sizing changed the configured value, so a run's chunking
+        is never a silent surprise.
+        """
+        tile_infos = [ti for _, ti in tile_data] if tile_data else []
+        chunks = resolve_output_chunksize(self.config, tile_infos)
+        configured = self.config.output_chunksize or {}
+        if chunks != {k: int(configured.get(k, v)) for k, v in chunks.items()}:
+            self.logger.info(
+                f"  Output chunks auto-sized to the final grid: "
+                f"z={chunks['z']} y={chunks['y']} x={chunks['x']} "
+                f"(configured {configured}) — keeps the fused block near one "
+                f"tile pitch so heavy downsample keeps saving memory"
+            )
+        return chunks
+
     def _fuse_with_fallback(self, fuse_fn, sims, fuse_kwargs):
         """Call multiview_stitcher.fusion.fuse, retrying without
         ``weights_func`` if the content-based path raises.
@@ -5405,7 +5596,7 @@ class StitchingPipeline:
 
         fuse_kwargs: Dict[str, Any] = dict(
             transform_key=transform_key,
-            output_chunksize=self.config.output_chunksize,
+            output_chunksize=self._fuse_chunksize(tile_data),
             blending_widths=self.config.blending_widths,
         )
 
@@ -5945,7 +6136,7 @@ class StitchingPipeline:
 
         fuse_kwargs: Dict[str, Any] = dict(
             transform_key=fuse_transform_key,
-            output_chunksize=self.config.output_chunksize,
+            output_chunksize=self._fuse_chunksize(tile_data),
             blending_widths=self.config.blending_widths,
         )
 

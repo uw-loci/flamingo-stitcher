@@ -558,15 +558,31 @@ def _tile_mip(
     if raw is None:
         return None
     if _is_full_range(z_range):
-        mp = raw.with_name(raw.stem + "_MP.tif")
-        if mp.is_file():
-            try:
-                import tifffile
+        mip = _read_mip_companion(raw)
+        if mip is not None:
+            return mip
+    projected = _mip_from_stack(raw, tile, z_range)
+    if projected is not None:
+        return projected
+    # A Z sub-range was asked for but the stack is missing/unreadable. The
+    # whole-stack companion is the wrong range, but it beats dropping the tile
+    # out of the mosaic entirely (which reads as a hole in the preview).
+    return _read_mip_companion(raw)
 
-                return np.asarray(tifffile.imread(str(mp)))
-            except Exception as e:  # noqa: BLE001
-                logger.debug("Could not read MIP %s: %s", mp.name, e)
-    return _mip_from_stack(raw, tile, z_range)
+
+def _read_mip_companion(raw: Path) -> Optional[np.ndarray]:
+    """Read the tile's pre-computed ``*_MP.tif``, or None if absent/unreadable."""
+    for suffix in ("_MP.tif", "_MP.tiff"):
+        mp = raw.with_name(raw.stem + suffix)
+        if not mp.is_file():
+            continue
+        try:
+            import tifffile
+
+            return np.asarray(tifffile.imread(str(mp)))
+        except Exception as e:  # noqa: BLE001
+            logger.debug("Could not read MIP %s: %s", mp.name, e)
+    return None
 
 
 def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
