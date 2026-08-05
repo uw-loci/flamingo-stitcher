@@ -331,6 +331,43 @@ def _load_yaml_preset_objects() -> Dict[str, "TileOrientation"]:
         return {}
 
 
+# The four orientations that swap the image axes. A stripe running one way in
+# the camera frame comes out running the other way in the stitched output.
+_AXIS_SWAPPING = frozenset({"rot90", "rot270", "transpose", "anti_transpose"})
+
+
+def stripe_axis_in_camera_frame(
+    orientation_name: str, output_axis: str = "horizontal"
+) -> str:
+    """Stripe axis in the RAW CAMERA FRAME, given the axis in the OUTPUT frame.
+
+    Stripe direction is not a property of the image content — it is set by the
+    light-sheet propagation direction, and the stitched output is stage-aligned,
+    so the axis in the OUTPUT frame is a known constant per microscope
+    (horizontal for the Flamingo). Destriping, however, runs in the raw camera
+    frame, before the per-tile rotation/flip. This maps the known output-frame
+    axis back through that transform.
+
+    Deriving it beats detecting it from pixels: a detector has to guess from
+    mean-profile spectra, which is unreliable on background-dominated tiles and
+    meaningless on the blank tiles a blind acquisition can easily produce.
+
+    Verified empirically against ``MosaicOrientation.apply2d`` for all eight
+    orientations: only the axis-swapping four flip the answer.
+    """
+    axis = (output_axis or "horizontal").strip().lower()
+    if axis not in ("horizontal", "vertical"):
+        raise ValueError(
+            f"output_axis must be 'horizontal' or 'vertical', got {output_axis!r}"
+        )
+    name = (orientation_name or "identity").strip().lower()
+    if name not in MosaicOrientation.NAMES:
+        name = "identity"
+    if name in _AXIS_SWAPPING:
+        return "vertical" if axis == "horizontal" else "horizontal"
+    return axis
+
+
 def resolve_tile_orientation(acquisition_dir: Path) -> Optional["TileOrientation"]:
     """Full orientation for an acquisition, by microscope name.
 

@@ -158,13 +158,39 @@ class TestPreviewReadout:
         assert right > 80.0, f"correct axis only removed {right:.0f}%"
         assert wrong < 20.0, f"wrong axis removed {wrong:.0f}%"
 
-    def test_auto_direction_is_reported_with_confidence(self, qapp, tmp_path):
+    def test_auto_direction_is_reported_as_derived(self, qapp, tmp_path):
+        """Auto derives from the orientation; it must SAY so, not imply a guess.
+
+        The synthetic acquisition has no orientation preset, so it resolves to
+        identity -> horizontal in the camera frame. That is the correct derived
+        answer even though this phantom's stripes happen to run the other way:
+        the axis comes from the geometry, not from these pixels.
+        """
         acq = _striped_acquisition(tmp_path)
         dlg = _render(qapp, acq, {"level": 5}, "auto")
 
         text = dlg._status.text()
-        assert "vertical" in text
-        assert "auto" in text and "confidence" in text
+        assert "derived from orientation" in text
+        assert "confidence" not in text
+        assert dlg._effective_direction() == "horizontal"
+
+    def test_auto_follows_the_tile_orientation(self, qapp, tmp_path, monkeypatch):
+        """An axis-swapping orientation must flip the derived camera-frame axis."""
+        from flamingo_stitcher import orientation as orient_mod
+
+        acq = _striped_acquisition(tmp_path)
+        # The dialog imports the resolver inside the method, so patching the
+        # module attribute is what it will actually look up.
+        monkeypatch.setattr(
+            orient_mod,
+            "resolve_tile_orientation",
+            lambda _p: orient_mod.TileOrientation(name="rot270"),
+        )
+
+        dlg = _render(qapp, acq, {"level": 5}, "auto")
+
+        assert dlg._orientation_name() == "rot270"
+        assert dlg._effective_direction() == "vertical"
 
     def test_forced_direction_is_labelled_forced(self, qapp, tmp_path):
         acq = _striped_acquisition(tmp_path)

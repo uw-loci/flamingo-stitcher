@@ -153,58 +153,101 @@ def _axis_tile(size=128, planes=4, orient="vertical", content=0.0, seed=0):
 
 
 class TestAcquisitionWideStripeAxis:
-    """Stripe orientation is set by the beam/camera frame, so it is ONE
-    property of the acquisition -- not something to re-guess per tile."""
+    """The stripe axis is DERIVED, not detected.
 
-    def _pipeline(self, direction="auto"):
+    The sheet propagates in a fixed direction and the stitched output is
+    stage-aligned, so the output-frame axis is a known constant (horizontal on
+    the Flamingo). The camera-frame axis -- where the filter runs, before the
+    per-tile rot/flip -- is that constant mapped back through the tile
+    orientation. Detecting from pixels was wrong twice over: the axis cannot
+    vary per tile, and a detector has nothing to measure on the blank tiles a
+    blind acquisition routinely produces.
+    """
+
+    def _pipeline(self, **kwargs):
         from flamingo_stitcher.pipeline import StitchingConfig, StitchingPipeline
 
-        return StitchingPipeline(config=StitchingConfig(destripe_direction=direction))
+        return StitchingPipeline(config=StitchingConfig(**kwargs))
 
-    def test_direction_is_locked_after_enough_votes(self):
-        pipe = self._pipeline()
+    @pytest.mark.parametrize(
+        "orientation,expected",
+        [
+            ("identity", "horizontal"),
+            ("rot180", "horizontal"),
+            ("flip_h", "horizontal"),
+            ("flip_v", "horizontal"),
+            # Only the axis-swapping orientations flip the answer.
+            ("rot90", "vertical"),
+            ("rot270", "vertical"),
+            ("transpose", "vertical"),
+            ("anti_transpose", "vertical"),
+        ],
+    )
+    def test_derived_from_tile_orientation(self, orientation, expected):
+        pipe = self._pipeline(tile_orientation=orientation)
         vol = _axis_tile(orient="vertical")
 
-        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
-            assert pipe._resolve_destripe_direction(vol) == "vertical"
+        assert pipe._resolve_destripe_direction(vol) == expected
 
-        assert pipe._destripe_axis_locked == "vertical"
+    def test_works_on_a_blank_tile(self):
+        """A blind acquisition can hand us featureless tiles first."""
+        pipe = self._pipeline(tile_orientation="rot270")
+        blank = np.zeros((4, 64, 64), dtype=np.uint16)
 
-    def test_locked_axis_survives_a_tile_that_votes_the_other_way(self):
-        """The whole point: one odd tile can no longer get the wrong filter."""
-        pipe = self._pipeline()
-        vertical = _axis_tile(orient="vertical")
-        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
-            pipe._resolve_destripe_direction(vertical)
+        assert pipe._resolve_destripe_direction(blank) == "vertical"
 
-        horizontal = _axis_tile(orient="horizontal")
-        assert pipe._resolve_destripe_direction(horizontal) == "vertical"
+    def test_same_answer_for_every_tile_whatever_the_content(self):
+        pipe = self._pipeline(tile_orientation="rot270")
+        tiles = [
+            np.zeros((4, 64, 64), dtype=np.uint16),
+            _axis_tile(size=64, orient="horizontal"),
+            _axis_tile(size=64, orient="vertical"),
+            _axis_tile(size=64, orient="horizontal", content=800.0),
+        ]
 
-    def test_explicit_direction_bypasses_voting_entirely(self):
-        pipe = self._pipeline(direction="horizontal")
+        answers = {pipe._resolve_destripe_direction(t) for t in tiles}
+        assert answers == {"vertical"}
+
+    def test_output_axis_is_configurable(self):
+        """Not every scope has to stripe horizontally in the output."""
+        pipe = self._pipeline(
+            tile_orientation="rot270", destripe_output_axis="vertical"
+        )
+
+        assert pipe._resolve_destripe_direction(_axis_tile()) == "horizontal"
+
+    def test_explicit_direction_wins(self):
+        pipe = self._pipeline(
+            tile_orientation="rot270", destripe_direction="horizontal"
+        )
         vol = _axis_tile(orient="vertical")
 
         assert pipe._resolve_destripe_direction(vol) == "horizontal"
-        assert pipe._destripe_axis_locked is None  # never voted
-
-    def test_low_confidence_tiles_barely_count(self):
-        from flamingo_stitcher.pipeline import _stripe_axis_vote
-
-        _, strong = _stripe_axis_vote(_axis_tile(orient="vertical"))
-        _, weak = _stripe_axis_vote(
-            np.full((4, 128, 128), 100, dtype=np.uint16)  # featureless
-        )
-        assert strong > weak
+        assert pipe._destripe_axis_locked is None  # never resolved/locked
 
     def test_reset_clears_the_lock_for_a_new_run(self):
-        pipe = self._pipeline()
-        vol = _axis_tile(orient="vertical")
-        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
-            pipe._resolve_destripe_direction(vol)
+        pipe = self._pipeline(tile_orientation="rot270")
+        pipe._resolve_destripe_direction(_axis_tile())
         assert pipe._destripe_axis_locked is not None
 
         pipe._reset_destripe_axis()
         assert pipe._destripe_axis_locked is None
+
+    def test_content_fallback_still_exists_and_weights_confidence(self):
+        """Kept only for when the orientation is genuinely underivable."""
+        from flamingo_stitcher.pipeline import _stripe_axis_vote
+
+        _, strong = _stripe_axis_vote(_axis_tile(orient="vertical"))
+        _, weak = _stripe_axis_vote(np.full((4, 128, 128), 100, dtype=np.uint16))
+        assert strong > weak
+
+    def test_content_fallback_locks_after_enough_votes(self):
+        pipe = self._pipeline(tile_orientation="rot270")
+        vol = _axis_tile(orient="vertical")
+        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
+            pipe._detect_destripe_direction_from_content(vol)
+
+        assert pipe._destripe_axis_locked == "vertical"
 
 
 class TestLevelClampedToFrameSize:
@@ -261,3 +304,61 @@ class TestLevelClampedToFrameSize:
             vol, direction="vertical", max_workers=1, params={"level": 7}
         )
         assert power(out) < power(vol) * 0.5
+
+
+class TestStripeAxisDerivation:
+    """The geometry mapping itself, independent of any pipeline plumbing."""
+
+    def test_only_axis_swapping_orientations_flip_the_answer(self):
+        from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+        same = ["identity", "rot180", "flip_h", "flip_v"]
+        swapped = ["rot90", "rot270", "transpose", "anti_transpose"]
+
+        assert all(stripe_axis_in_camera_frame(n) == "horizontal" for n in same)
+        assert all(stripe_axis_in_camera_frame(n) == "vertical" for n in swapped)
+
+    def test_matches_what_apply2d_actually_does(self):
+        """Ground-truth the mapping against the real transform, not its name."""
+        from flamingo_stitcher.orientation import (
+            MosaicOrientation,
+            stripe_axis_in_camera_frame,
+        )
+
+        size = 64
+        yy, xx = np.mgrid[0:size, 0:size]
+        raw = {
+            "horizontal": np.sin(yy / 2.0).astype(np.float32),
+            "vertical": np.sin(xx / 2.0).astype(np.float32),
+        }
+
+        def axis_of(img):
+            return (
+                "horizontal"
+                if np.var(img.mean(axis=1)) > np.var(img.mean(axis=0))
+                else "vertical"
+            )
+
+        for name in MosaicOrientation.NAMES:
+            ori = MosaicOrientation(name)
+            predicted = stripe_axis_in_camera_frame(name, "horizontal")
+            # Feeding the predicted raw axis through the transform must yield
+            # horizontal stripes in the output frame.
+            assert axis_of(ori.apply2d(raw[predicted])) == "horizontal", name
+
+    def test_round_trips_for_a_vertical_output_axis(self):
+        from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+        assert stripe_axis_in_camera_frame("identity", "vertical") == "vertical"
+        assert stripe_axis_in_camera_frame("rot270", "vertical") == "horizontal"
+
+    def test_unknown_orientation_falls_back_to_identity(self):
+        from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+        assert stripe_axis_in_camera_frame("nonsense") == "horizontal"
+
+    def test_rejects_a_bad_output_axis(self):
+        from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+        with pytest.raises(ValueError):
+            stripe_axis_in_camera_frame("identity", "diagonal")

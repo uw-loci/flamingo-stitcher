@@ -823,11 +823,17 @@ class StitchingConfig:
     destripe: bool = False  # Run PyStripe destriping
     destripe_fast: bool = False  # Destripe after downsample (faster, lower quality)
     destripe_workers: Optional[int] = None  # Max parallel threads; None = auto
-    # Stripe orientation to remove: "auto" (detect per tile), "horizontal", or
-    # "vertical". The filter is axis-fixed and destriping runs in the raw camera
-    # frame (before the per-tile rot/flip), so the wrong axis silently removes
-    # nothing. "auto" picks the axis with the stronger stripe signal.
+    # Stripe orientation to remove, in the RAW CAMERA FRAME: "auto",
+    # "horizontal", or "vertical". The filter is axis-fixed and destriping runs
+    # in the raw camera frame (before the per-tile rot/flip), so the wrong axis
+    # silently removes nothing. "auto" DERIVES the axis from
+    # `destripe_output_axis` + the tile orientation — it does not inspect pixels.
     destripe_direction: str = "auto"
+    # Stripe orientation in the STITCHED OUTPUT frame. The output is
+    # stage-aligned and the light sheet propagates in a fixed direction, so this
+    # is a known constant per microscope rather than something to measure —
+    # horizontal on the Flamingo. Everything else is derived from it.
+    destripe_output_axis: str = "horizontal"
     # Destripe filter tuning. Empty dict = use the YAML/built-in defaults.
     # Recognised keys: sigma_foreground, sigma_background (filter bandwidth in px
     # — the main strength lever), level (wavelet depth), wavelet (mother wavelet),
@@ -5175,27 +5181,74 @@ class StitchingPipeline:
     # How many tiles vote before the stripe axis is locked for the whole run.
     _DESTRIPE_AXIS_VOTES = 8
 
+    def _effective_tile_orientation_name(self) -> str:
+        """The orientation actually applied to tiles (mirrors _preprocess)."""
+        return self.config.tile_orientation or (
+            "flip_h" if self.config.camera_x_inverted else "identity"
+        )
+
     def _resolve_destripe_direction(self, volume: np.ndarray) -> str:
-        """Decide the stripe axis ONCE per acquisition, not once per tile.
+        """Decide the stripe axis ONCE per acquisition, by DERIVING it.
 
-        Stripe orientation is a property of the optics and the camera frame, so
-        it is identical for every tile in a run. Passing ``"auto"`` straight
-        through to :func:`destripe_volume` re-decided it per tile, and the
-        detector is only comparing mean-profile spectra — background-dominated
-        tiles, or tiles whose anatomy happens to band along one axis, flip the
-        answer. Those tiles then get the perpendicular filter, which provably
-        removes nothing, which is exactly the reported "destriping worked on
-        some tiles but not others".
+        Stripe direction is set by the light-sheet propagation direction, and
+        the stitched output is stage-aligned, so the axis in the OUTPUT frame is
+        a known constant per microscope (``config.destripe_output_axis``,
+        horizontal for the Flamingo). Destriping runs in the raw camera frame,
+        before the per-tile rotation/flip, so the answer is just that constant
+        mapped back through the tile orientation — no image content involved.
 
-        Votes from the first :attr:`_DESTRIPE_AXIS_VOTES` tiles are accumulated
-        weighted by confidence (so a near-featureless tile barely counts), then
-        the winner is locked and reused. An explicit ``destripe_direction`` skips
-        all of this — it is the escape hatch when the detector gets it wrong.
+        This replaced a per-tile detector. Detecting was wrong twice over: the
+        axis cannot vary per tile (it is fixed by the optics), and a detector
+        comparing mean-profile spectra has nothing to work with on a
+        background-dominated tile — or on the outright blank tiles a blind
+        acquisition routinely produces, where the "measurement" is pure noise.
+
+        Order of authority: an explicit ``destripe_direction`` wins; otherwise
+        derive from the orientation; only if the orientation is genuinely
+        unknown do we fall back to content detection, and say so loudly.
         """
         configured = (self.config.destripe_direction or "auto").lower()
         if configured != "auto":
             return configured
 
+        with self._destripe_axis_lock:
+            if self._destripe_axis_locked is not None:
+                return self._destripe_axis_locked
+
+            ori_name = self._effective_tile_orientation_name()
+            try:
+                from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+                derived = stripe_axis_in_camera_frame(
+                    ori_name, self.config.destripe_output_axis
+                )
+            except Exception as exc:  # noqa: BLE001 - fall through to detection
+                self.logger.debug(f"Could not derive stripe axis: {exc!r}")
+                derived = None
+
+            if derived is not None:
+                self._destripe_axis_locked = derived
+                self.logger.info(
+                    f"  Destripe direction: {derived} stripes in the camera frame "
+                    f"— derived from tile orientation '{ori_name}' and a "
+                    f"{self.config.destripe_output_axis} stripe axis in the "
+                    "stitched output. Not detected from image content."
+                )
+                return derived
+
+        self.logger.warning(
+            "  Destripe direction could not be derived from the tile "
+            "orientation; falling back to detecting it from image content, "
+            "which is unreliable on dim or blank tiles. Set Dir: explicitly."
+        )
+        return self._detect_destripe_direction_from_content(volume)
+
+    def _detect_destripe_direction_from_content(self, volume: np.ndarray) -> str:
+        """Last-resort content-based axis guess, when derivation is impossible.
+
+        Confidence-weighted votes across the first tiles, so a near-featureless
+        tile barely counts. Still a guess — prefer the derivation above.
+        """
         with self._destripe_axis_lock:
             if self._destripe_axis_locked is not None:
                 return self._destripe_axis_locked
@@ -5225,7 +5278,7 @@ class StitchingPipeline:
             return winner
 
     def _reset_destripe_axis(self) -> None:
-        """Clear the locked stripe axis so a new run re-votes from scratch."""
+        """Clear the locked stripe axis so a new run re-resolves it."""
         self._destripe_axis_lock = threading.Lock()
         self._destripe_axis_votes = {"horizontal": 0.0, "vertical": 0.0}
         self._destripe_axis_n = 0

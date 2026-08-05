@@ -234,7 +234,8 @@ class DestripePreviewDialog(PersistentDialog):
         self._dir_combo.currentIndexChanged.connect(self._request_render)
         self._dir_combo.setToolTip(
             "Which stripe orientation to remove, in the RAW CAMERA FRAME.\n"
-            "Auto detects it; a run locks one axis for the whole acquisition."
+            "Auto derives it from the tile orientation and the known\n"
+            "output-frame stripe axis — it does not inspect image content."
         )
         drow.addWidget(self._dir_combo)
 
@@ -363,7 +364,7 @@ class DestripePreviewDialog(PersistentDialog):
             int(tile.frame_width),
             int(tile.frame_height),
             int(self._z_slider.value()),
-            str(self._dir_combo.currentData()),
+            self._effective_direction(),
             self._form.get_params(),
             parent=self,
         )
@@ -398,6 +399,38 @@ class DestripePreviewDialog(PersistentDialog):
         self._before_label.setPixmap(_to_qpixmap(before_disp))
         self._after_label.setPixmap(_to_qpixmap(after_disp))
 
+    def _orientation_name(self) -> str:
+        """This acquisition's tile orientation name, or "identity"."""
+        try:
+            from flamingo_stitcher.orientation import resolve_tile_orientation
+
+            ori = resolve_tile_orientation(self._acq_path)
+            if ori is not None and ori.name:
+                return ori.name
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"No tile orientation for preview: {e!r}")
+        return "identity"
+
+    def _effective_direction(self) -> str:
+        """The axis the filter will actually use, matching the pipeline.
+
+        "Auto" DERIVES it: the stitched output is stage-aligned and the sheet
+        propagates in a fixed direction, so the output-frame axis is a known
+        constant and the camera-frame axis is that constant mapped back through
+        the tile orientation. Detecting from pixels would be a guess, and on a
+        blank tile -- routine in a blind acquisition -- a meaningless one.
+        """
+        chosen = str(self._dir_combo.currentData() or "auto")
+        if chosen != "auto":
+            return chosen
+        try:
+            from flamingo_stitcher.orientation import stripe_axis_in_camera_frame
+
+            return stripe_axis_in_camera_frame(self._orientation_name(), "horizontal")
+        except Exception as e:  # noqa: BLE001
+            logger.debug(f"Could not derive stripe axis for preview: {e!r}")
+            return "auto"
+
     def _tile_orientation(self):
         try:
             from flamingo_stitcher.orientation import (
@@ -419,13 +452,10 @@ class DestripePreviewDialog(PersistentDialog):
 
         setting = str(self._dir_combo.currentData())
         if setting == "auto":
-            try:
-                from flamingo_stitcher.pipeline import _stripe_axis_vote
-
-                axis, conf = _stripe_axis_vote(before[None, ...])
-                parts.append(f"Direction: {axis} (auto, confidence {conf:.2f})")
-            except Exception:  # noqa: BLE001
-                parts.append("Direction: auto")
+            parts.append(
+                f"Direction: {self._effective_direction()} "
+                f"(derived from orientation '{self._orientation_name()}')"
+            )
         else:
             parts.append(f"Direction: {setting} (forced)")
 
