@@ -11,6 +11,7 @@ Usage:
 import json
 import logging
 import re
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2726,30 +2727,62 @@ def _estimate_destripe_workers(
     return max(1, n)
 
 
-def _detect_stripe_axis(volume: np.ndarray) -> str:
-    """Auto-detect stripe orientation: ``"horizontal"`` or ``"vertical"``.
+def _stripe_axis_scores(volume: np.ndarray) -> Tuple[float, float]:
+    """Return (horizontal_score, vertical_score) "stripiness" for one tile.
 
     Stripes are a coherent, higher-frequency pattern running along one image
     axis. Averaging *perpendicular* to a stripe reinforces it (constant along the
     stripe) while averaging real anatomy down, so the mean profiles isolate the
     stripe: the row-mean profile (mean over X) captures HORIZONTAL stripes, the
-    column-mean profile (mean over Y) captures VERTICAL ones. Whichever profile
-    carries more high-frequency power wins. (pystripe's filter removes horizontal
-    stripes; a vertical result means the caller must transpose before filtering.)
+    column-mean profile (mean over Y) captures VERTICAL ones.
+
+    Each score is the FRACTION of that profile's power sitting above the lowest
+    frequencies, not its absolute power. That normalization matters: the two
+    profiles have different lengths (Y vs X) and different variances, so
+    comparing raw power sums let the merely *brighter* axis win instead of the
+    stripier one — anatomy with strong banding along one axis could outvote the
+    actual stripes. A fraction is scale-free, so the comparison is like-for-like.
     """
     z = volume.shape[0]
     step = max(1, z // 16)
     proj = np.asarray(volume[::step]).astype(np.float32).mean(axis=0)  # (Y, X)
 
-    def _hf_power(profile: np.ndarray) -> float:
+    def _hf_fraction(profile: np.ndarray) -> float:
         p = profile - profile.mean()
-        f = np.abs(np.fft.rfft(p))
+        f = np.abs(np.fft.rfft(p)) ** 2
+        total = float(f.sum())
+        if not np.isfinite(total) or total <= 0.0:
+            return 0.0
         lo = max(1, len(f) // 8)  # drop the lowest freqs (broadband illumination)
-        return float((f[lo:] ** 2).sum())
+        return float(f[lo:].sum() / total)
 
-    horiz = _hf_power(proj.mean(axis=1))  # row profile → horizontal stripes
-    vert = _hf_power(proj.mean(axis=0))   # column profile → vertical stripes
+    horiz = _hf_fraction(proj.mean(axis=1))  # row profile → horizontal stripes
+    vert = _hf_fraction(proj.mean(axis=0))   # column profile → vertical stripes
+    return horiz, vert
+
+
+def _detect_stripe_axis(volume: np.ndarray) -> str:
+    """Auto-detect stripe orientation: ``"horizontal"`` or ``"vertical"``.
+
+    (pystripe's filter removes horizontal stripes; a vertical result means the
+    caller must transpose before filtering.)
+    """
+    horiz, vert = _stripe_axis_scores(volume)
     return "vertical" if vert > horiz else "horizontal"
+
+
+def _stripe_axis_vote(volume: np.ndarray) -> Tuple[str, float]:
+    """Detected axis plus a 0..1 confidence for weighting across tiles.
+
+    Confidence is the normalized margin between the two scores, so a tile whose
+    profiles look equally stripy in both directions — background-dominated
+    tiles, or tiles where anatomy mimics a stripe pattern — contributes almost
+    nothing to the acquisition-wide decision instead of casting a full vote.
+    """
+    horiz, vert = _stripe_axis_scores(volume)
+    total = horiz + vert
+    confidence = abs(vert - horiz) / total if total > 0 else 0.0
+    return ("vertical" if vert > horiz else "horizontal"), confidence
 
 
 def destripe_volume(
@@ -2830,6 +2863,33 @@ def destripe_volume(
     _ds_crossover = float(_pick("crossover", 10.0))
     # threshold: None/absent → -1, which makes filter_streaks pick it via Otsu.
     _ds_threshold = float(_pick("threshold", -1.0))
+
+    # Clamp the wavelet depth to what this frame size can actually support.
+    # `level` is a fixed config value (default 7) but the usable depth is set by
+    # the image: pywt warns "Level value of N is too high: all coefficients will
+    # experience boundary effects" and the filter then barely works. Measured on
+    # a synthetic stripe pattern with db2/level=7: 91% of the stripe removed at
+    # 2048 px, but only 10.8% at 256 px -- rising back to 57% once clamped to
+    # that frame's max level of 6. Low-resolution frames (small sensor AOI, or
+    # the "fast" variant which destripes AFTER downsample) are exactly where
+    # this bites, and it degraded silently apart from a pywt warning.
+    _plane_min_dim = int(min(volume.shape[1], volume.shape[2]))
+    if _ds_level > 0:
+        try:
+            from flamingo_stitcher._pystripe_core import max_level as _max_level
+
+            _usable = int(_max_level(_plane_min_dim, _ds_wavelet))
+            if _usable >= 1 and _ds_level > _usable:
+                logger.warning(
+                    f"Destripe level {_ds_level} exceeds what a "
+                    f"{_plane_min_dim}px frame supports for wavelet "
+                    f"{_ds_wavelet}; clamping to {_usable}. Deeper levels are "
+                    "all boundary effects and remove far less striping."
+                )
+                _ds_level = _usable
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug(f"Could not clamp destripe level: {exc!r}")
+
     logger.info(
         f"Destripe params: sigma(fg/bg)={_ds_sigma[0]:g}/{_ds_sigma[1]:g} "
         f"level={_ds_level} wavelet={_ds_wavelet} crossover={_ds_crossover:g} "
@@ -3058,6 +3118,10 @@ class StitchingPipeline:
         # _preprocess_single_tile. Empty in the in-memory path (which applies
         # flat-field via its own estimate/apply step), so no double-application.
         self._flatfield_models: Dict[int, Any] = {}
+
+        # Stripe axis is a property of the camera frame, so it is decided once
+        # per run and reused for every tile (see _resolve_destripe_direction).
+        self._reset_destripe_axis()
 
         # Wrap caller's progress_fn so we (a) classify the phase from
         # the status message and update the estimator's phase clock,
@@ -3545,6 +3609,9 @@ class StitchingPipeline:
             Path to the stitched output
         """
         t0 = time.time()
+        # A reused pipeline object must re-vote: a different acquisition can
+        # have a different camera orientation.
+        self._reset_destripe_axis()
         self.logger.info(f"=== Stitching Pipeline Start ===")
         for _line in environment_summary():
             self.logger.info(_line)
@@ -4857,7 +4924,7 @@ class StitchingPipeline:
                 vol = destripe_volume(
                     vol,
                     max_workers=self._destripe_worker_budget(),
-                    direction=self.config.destripe_direction,
+                    direction=self._resolve_destripe_direction(vol),
                     params=self.config.destripe_params,
                 )
             illum_volumes[illum_side] = vol
@@ -4907,7 +4974,7 @@ class StitchingPipeline:
             volume = destripe_volume(
                 volume,
                 max_workers=self._destripe_worker_budget(),
-                direction=self.config.destripe_direction,
+                direction=self._resolve_destripe_direction(volume),
                 params=self.config.destripe_params,
             )
 
@@ -5104,6 +5171,65 @@ class StitchingPipeline:
         # Return in original tile order so fusion sees tiles in the same
         # spatial sequence regardless of completion order from the pool.
         return [result_by_idx[i] for i in sorted(result_by_idx)]
+
+    # How many tiles vote before the stripe axis is locked for the whole run.
+    _DESTRIPE_AXIS_VOTES = 8
+
+    def _resolve_destripe_direction(self, volume: np.ndarray) -> str:
+        """Decide the stripe axis ONCE per acquisition, not once per tile.
+
+        Stripe orientation is a property of the optics and the camera frame, so
+        it is identical for every tile in a run. Passing ``"auto"`` straight
+        through to :func:`destripe_volume` re-decided it per tile, and the
+        detector is only comparing mean-profile spectra — background-dominated
+        tiles, or tiles whose anatomy happens to band along one axis, flip the
+        answer. Those tiles then get the perpendicular filter, which provably
+        removes nothing, which is exactly the reported "destriping worked on
+        some tiles but not others".
+
+        Votes from the first :attr:`_DESTRIPE_AXIS_VOTES` tiles are accumulated
+        weighted by confidence (so a near-featureless tile barely counts), then
+        the winner is locked and reused. An explicit ``destripe_direction`` skips
+        all of this — it is the escape hatch when the detector gets it wrong.
+        """
+        configured = (self.config.destripe_direction or "auto").lower()
+        if configured != "auto":
+            return configured
+
+        with self._destripe_axis_lock:
+            if self._destripe_axis_locked is not None:
+                return self._destripe_axis_locked
+
+            axis, confidence = _stripe_axis_vote(volume)
+            self._destripe_axis_votes[axis] += confidence
+            self._destripe_axis_n += 1
+
+            horiz = self._destripe_axis_votes["horizontal"]
+            vert = self._destripe_axis_votes["vertical"]
+            winner = "vertical" if vert > horiz else "horizontal"
+
+            if self._destripe_axis_n >= self._DESTRIPE_AXIS_VOTES:
+                self._destripe_axis_locked = winner
+                self.logger.info(
+                    f"  Destripe direction LOCKED to {winner} stripes for the "
+                    f"rest of this run (votes from {self._destripe_axis_n} "
+                    f"tiles: horizontal={horiz:.2f}, vertical={vert:.2f}). "
+                    "Set Dir: explicitly in Destripe settings to override."
+                )
+            else:
+                self.logger.info(
+                    f"  Destripe direction vote {self._destripe_axis_n}/"
+                    f"{self._DESTRIPE_AXIS_VOTES}: this tile says {axis} "
+                    f"(confidence {confidence:.2f}); using {winner} so far"
+                )
+            return winner
+
+    def _reset_destripe_axis(self) -> None:
+        """Clear the locked stripe axis so a new run re-votes from scratch."""
+        self._destripe_axis_lock = threading.Lock()
+        self._destripe_axis_votes = {"horizontal": 0.0, "vertical": 0.0}
+        self._destripe_axis_n = 0
+        self._destripe_axis_locked: Optional[str] = None
 
     def _destripe_worker_budget(self) -> Optional[int]:
         """Per-tile destripe thread cap that accounts for concurrent preprocess

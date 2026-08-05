@@ -133,3 +133,131 @@ def test_bit_identical_to_upstream_pystripe():
         a = np.asarray(upstream(img, sigma=sig, level=lvl, wavelet=wv))
         b = np.asarray(vendored(img, sigma=sig, level=lvl, wavelet=wv))
         np.testing.assert_array_equal(a, b, err_msg=f"{shp} sig={sig} lvl={lvl} {wv}")
+
+
+# --- Acquisition-wide stripe axis + frame-size-aware wavelet depth ---------
+
+
+def _axis_tile(size=128, planes=4, orient="vertical", content=0.0, seed=0):
+    """Tile with stripes along one axis, plus optional anatomical content."""
+    rng = np.random.default_rng(seed)
+    yy, xx = np.mgrid[0:size, 0:size]
+    base = np.zeros((size, size), np.float32) + 50.0
+    if content:
+        # Banding that runs PERPENDICULAR to the real stripes, i.e. the kind of
+        # anatomy that can outvote them in a per-tile detector.
+        base = base + content * np.sin(yy / 5.0) * (xx > size * 0.6)
+    stripes = 300 * np.sin((xx if orient == "vertical" else yy) / 2.0)
+    plane = np.clip(base + stripes + rng.normal(0, 15, (size, size)), 0, 65535)
+    return np.repeat(plane[None].astype(np.uint16), planes, axis=0)
+
+
+class TestAcquisitionWideStripeAxis:
+    """Stripe orientation is set by the beam/camera frame, so it is ONE
+    property of the acquisition -- not something to re-guess per tile."""
+
+    def _pipeline(self, direction="auto"):
+        from flamingo_stitcher.pipeline import StitchingConfig, StitchingPipeline
+
+        return StitchingPipeline(config=StitchingConfig(destripe_direction=direction))
+
+    def test_direction_is_locked_after_enough_votes(self):
+        pipe = self._pipeline()
+        vol = _axis_tile(orient="vertical")
+
+        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
+            assert pipe._resolve_destripe_direction(vol) == "vertical"
+
+        assert pipe._destripe_axis_locked == "vertical"
+
+    def test_locked_axis_survives_a_tile_that_votes_the_other_way(self):
+        """The whole point: one odd tile can no longer get the wrong filter."""
+        pipe = self._pipeline()
+        vertical = _axis_tile(orient="vertical")
+        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
+            pipe._resolve_destripe_direction(vertical)
+
+        horizontal = _axis_tile(orient="horizontal")
+        assert pipe._resolve_destripe_direction(horizontal) == "vertical"
+
+    def test_explicit_direction_bypasses_voting_entirely(self):
+        pipe = self._pipeline(direction="horizontal")
+        vol = _axis_tile(orient="vertical")
+
+        assert pipe._resolve_destripe_direction(vol) == "horizontal"
+        assert pipe._destripe_axis_locked is None  # never voted
+
+    def test_low_confidence_tiles_barely_count(self):
+        from flamingo_stitcher.pipeline import _stripe_axis_vote
+
+        _, strong = _stripe_axis_vote(_axis_tile(orient="vertical"))
+        _, weak = _stripe_axis_vote(
+            np.full((4, 128, 128), 100, dtype=np.uint16)  # featureless
+        )
+        assert strong > weak
+
+    def test_reset_clears_the_lock_for_a_new_run(self):
+        pipe = self._pipeline()
+        vol = _axis_tile(orient="vertical")
+        for _ in range(pipe._DESTRIPE_AXIS_VOTES):
+            pipe._resolve_destripe_direction(vol)
+        assert pipe._destripe_axis_locked is not None
+
+        pipe._reset_destripe_axis()
+        assert pipe._destripe_axis_locked is None
+
+
+class TestLevelClampedToFrameSize:
+    """`level` is a fixed config value (default 7) but the usable wavelet depth
+    is set by the frame. Past it, pywt warns that "all coefficients will
+    experience boundary effects" and the filter's behaviour becomes erratic:
+    measured on a 256px frame with content, level=7 removed 14.7% of the stripe
+    power where the frame's max level of 6 removed 59.0%. Clamping keeps the
+    transform in the regime where coefficients are meaningful. It is a GUARD,
+    not a guaranteed quality win -- on a 128px frame the deeper level happened
+    to score better -- so these tests lock the clamping behaviour, not a
+    universal improvement.
+    """
+
+    def test_clamps_and_says_so_when_the_frame_is_too_small(self, caplog):
+        from flamingo_stitcher.pipeline import destripe_volume
+        from flamingo_stitcher._pystripe_core import max_level
+
+        vol = _axis_tile(size=128, planes=2, orient="vertical")
+        usable = max_level(128, "db2")
+        assert usable < 7, "test premise: 7 must be too deep for a 128px frame"
+
+        with caplog.at_level("INFO"):
+            destripe_volume(
+                vol, direction="vertical", max_workers=1, params={"level": 7}
+            )
+
+        assert "clamping" in caplog.text
+        assert f"level={usable}" in caplog.text
+
+    def test_leaves_the_requested_level_alone_when_it_fits(self, caplog):
+        from flamingo_stitcher.pipeline import destripe_volume
+
+        vol = _axis_tile(size=1024, planes=2, orient="vertical")
+        with caplog.at_level("INFO"):
+            destripe_volume(
+                vol, direction="vertical", max_workers=1, params={"level": 5}
+            )
+
+        assert "level=5" in caplog.text
+        assert "clamping" not in caplog.text
+
+    def test_clamped_run_still_removes_stripes(self):
+        from flamingo_stitcher.pipeline import destripe_volume
+
+        vol = _axis_tile(size=128, planes=2, orient="vertical")
+
+        def power(v):
+            p = np.asarray(v).astype(np.float32).mean(axis=(0, 1))
+            f = np.abs(np.fft.rfft(p - p.mean())) ** 2
+            return float(f[max(1, len(f) // 8):].sum())
+
+        out = destripe_volume(
+            vol, direction="vertical", max_workers=1, params={"level": 7}
+        )
+        assert power(out) < power(vol) * 0.5
