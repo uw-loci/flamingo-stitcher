@@ -1027,11 +1027,24 @@ class StitchingDialog(PersistentDialog):
         self._destripe_settings_btn.setEnabled(False)
         self._destripe_settings_btn.clicked.connect(self._on_destripe_settings)
 
+        # Live preview: tuning by re-running a whole stitch is far too slow a
+        # loop, and the things that go wrong (which axis is filtered, a wavelet
+        # level deeper than the frame supports, how much the per-plane Otsu
+        # split shifts the result between tiles) are invisible in the mosaic.
+        self._destripe_preview_btn = QPushButton("Preview…")
+        self._destripe_preview_btn.setToolTip(
+            "See the filter applied to one tile plane, before and after,\n"
+            "updating live as you change the settings. Pick a tile, scrub Z."
+        )
+        self._destripe_preview_btn.setEnabled(False)
+        self._destripe_preview_btn.clicked.connect(self._on_destripe_preview)
+
         _destripe_opts = QHBoxLayout()
         _destripe_opts.setContentsMargins(0, 0, 0, 0)
         _destripe_opts.addWidget(self._destripe_fast_cb)
         _destripe_opts.addWidget(self._destripe_dir_combo)
         _destripe_opts.addWidget(self._destripe_settings_btn)
+        _destripe_opts.addWidget(self._destripe_preview_btn)
         _destripe_opts.addStretch()
         proc_layout.addLayout(_destripe_opts, 0, 1)
 
@@ -1544,23 +1557,8 @@ class StitchingDialog(PersistentDialog):
         is selected. Builds an 8-orientation MIP-mosaic preview so the user can
         pick the orientation that frames the sample correctly.
         """
-        if not self._queue:
-            QMessageBox.information(
-                self,
-                "Orientation preview",
-                "Add an acquisition to the queue first, then select it and "
-                "click Orientation Preview.",
-            )
-            return
-        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
-        row = rows[0] if rows else 0
-        if not (0 <= row < len(self._queue)):
-            row = 0
-        acq_path = self._queue[row].get("path")
-        if not acq_path:
-            QMessageBox.warning(
-                self, "Orientation preview", "That queue item has no path."
-            )
+        acq_path = self._selected_queue_path("Orientation preview")
+        if acq_path is None:
             return
         self._open_orientation_preview_for(acq_path)
 
@@ -2358,6 +2356,7 @@ class StitchingDialog(PersistentDialog):
         self._destripe_fast_cb.setEnabled(checked)
         self._destripe_dir_combo.setEnabled(checked)
         self._destripe_settings_btn.setEnabled(checked)
+        self._destripe_preview_btn.setEnabled(checked)
         if not checked:
             self._destripe_fast_cb.setChecked(False)
 
@@ -2371,6 +2370,56 @@ class StitchingDialog(PersistentDialog):
         if dlg.exec_() == QDialog.Accepted:
             self._destripe_params = dlg.get_params()
             self._log(f"Destripe settings updated: {self._destripe_params}")
+
+    def _on_destripe_preview(self):
+        """Open the live before/after destripe preview for the chosen queue row.
+
+        Accepting the preview adopts BOTH the tuned parameters and the stripe
+        direction, so a setting that was proven on a real plane is the one the
+        run uses -- otherwise the preview would just be a nice picture.
+        """
+        acq_path = self._selected_queue_path("Destripe preview")
+        if acq_path is None:
+            return
+
+        from flamingo_stitcher.gui.destripe_preview_dialog import (
+            DestripePreviewDialog,
+        )
+
+        dlg = DestripePreviewDialog(
+            acq_path,
+            self._destripe_params,
+            direction=str(self._destripe_dir_combo.currentData() or "auto"),
+            parent=self,
+        )
+        if dlg.exec_() == QDialog.Accepted:
+            self._destripe_params = dlg.get_params()
+            idx = self._destripe_dir_combo.findData(dlg.get_direction())
+            if idx >= 0:
+                self._destripe_dir_combo.setCurrentIndex(idx)
+            self._log(
+                f"Destripe settings from preview: {self._destripe_params} "
+                f"(direction {dlg.get_direction()})"
+            )
+
+    def _selected_queue_path(self, title: str):
+        """Path of the selected queue row, or the first when none is selected."""
+        if not self._queue:
+            QMessageBox.information(
+                self,
+                title,
+                "Add an acquisition to the queue first, then select it.",
+            )
+            return None
+        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
+        row = rows[0] if rows else 0
+        if not (0 <= row < len(self._queue)):
+            row = 0
+        acq_path = self._queue[row].get("path")
+        if not acq_path:
+            QMessageBox.warning(self, title, "That queue item has no path.")
+            return None
+        return acq_path
 
     def _update_voxel_readout(self, *_args):
         """Refresh the Native → Output voxel line below the downsample row."""
@@ -4542,6 +4591,7 @@ class StitchingDialog(PersistentDialog):
             self._destripe_fast_cb.setEnabled(False)
             self._destripe_dir_combo.setEnabled(False)
             self._destripe_settings_btn.setEnabled(False)
+            self._destripe_preview_btn.setEnabled(False)
             self._destripe_cb.setToolTip(
                 "Destriping is unavailable — the destripe backend failed to load:\n"
                 f"    {type(pystripe_err).__name__}: {pystripe_err}\n"

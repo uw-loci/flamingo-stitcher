@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
+from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import (
     QComboBox,
     QDialogButtonBox,
@@ -32,6 +33,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QSpinBox,
     QVBoxLayout,
+    QWidget,
 )
 
 from flamingo_stitcher.gui._compat import PersistentDialog
@@ -75,25 +77,22 @@ class _NoScrollCombo(QComboBox):
             event.ignore()
 
 
-class DestripeSettingsDialog(PersistentDialog):
-    """Small modal dialog for the destripe filter parameters."""
+class DestripeParamsForm(QWidget):
+    """The destripe parameter widgets, without any dialog chrome.
+
+    Extracted so the settings dialog and the live preview drive the SAME
+    widgets: duplicating the form would let the two drift apart, and the
+    preview is only trustworthy if it is tuning exactly what the run will use.
+    Emits :attr:`changed` on every edit so a preview can re-render live.
+    """
+
+    changed = pyqtSignal()
 
     def __init__(self, params: Dict[str, Any] | None = None, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("Destripe Settings")
-        self.setModal(True)
 
-        layout = QVBoxLayout(self)
-        intro = QLabel(
-            "Tuning for the wavelet stripe filter. Sigma is the main strength "
-            "lever — raise it to remove broader stripes, lower it if real "
-            "structure is being smeared."
-        )
-        intro.setWordWrap(True)
-        intro.setStyleSheet("color:#555; font-size:11px;")
-        layout.addWidget(intro)
-
-        form = QFormLayout()
+        form = QFormLayout(self)
+        form.setContentsMargins(0, 0, 0, 0)
 
         self._sigma_fg = _NoScrollDoubleSpin()
         self._sigma_fg.setRange(0.0, 4096.0)
@@ -119,7 +118,8 @@ class DestripeSettingsDialog(PersistentDialog):
         self._level.setToolTip(
             "Wavelet decomposition depth. Higher reaches broader, lower-frequency\n"
             "stripes but costs time and can affect large-scale structure.\n"
-            "0 = auto (maximum supported by the image size)."
+            "0 = auto (maximum supported by the image size).\n"
+            "Values deeper than the frame supports are clamped at run time."
         )
         form.addRow("Wavelet level:", self._level)
 
@@ -139,7 +139,9 @@ class DestripeSettingsDialog(PersistentDialog):
         self._threshold.setToolTip(
             "Intensity separating foreground from background.\n"
             "Auto (-1) computes Otsu's threshold per plane — the right default\n"
-            "for nearly all data. Set a value only to override it."
+            "for nearly all data. Set a value only to override it.\n"
+            "Because Otsu is per-plane, it is also why removal strength can\n"
+            "vary between a dim edge tile and a bright interior one."
         )
         form.addRow("Threshold:", self._threshold)
 
@@ -152,23 +154,15 @@ class DestripeSettingsDialog(PersistentDialog):
         )
         form.addRow("Crossover:", self._crossover)
 
-        layout.addLayout(form)
-
-        buttons = QDialogButtonBox(
-            QDialogButtonBox.Ok
-            | QDialogButtonBox.Cancel
-            | QDialogButtonBox.RestoreDefaults
-        )
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(
-            lambda: self.set_params(DEFAULTS)
-        )
-        layout.addWidget(buttons)
-
         self.set_params(params or {})
 
-    # -- values ----------------------------------------------------------
+        # Connect AFTER the initial population so set_params() doesn't fire a
+        # storm of changed() during construction.
+        for w in (self._sigma_fg, self._sigma_bg, self._threshold, self._crossover):
+            w.valueChanged.connect(self.changed)
+        self._level.valueChanged.connect(self.changed)
+        self._wavelet.currentTextChanged.connect(self.changed)
+
     def set_params(self, params: Dict[str, Any]) -> None:
         """Populate the widgets; missing/None keys fall back to DEFAULTS."""
 
@@ -201,3 +195,44 @@ class DestripeSettingsDialog(PersistentDialog):
             "threshold": None if thr < 0 else thr,
             "crossover": self._crossover.value(),
         }
+
+
+class DestripeSettingsDialog(PersistentDialog):
+    """Small modal dialog for the destripe filter parameters."""
+
+    def __init__(self, params: Dict[str, Any] | None = None, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Destripe Settings")
+        self.setModal(True)
+
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            "Tuning for the wavelet stripe filter. Sigma is the main strength "
+            "lever — raise it to remove broader stripes, lower it if real "
+            "structure is being smeared."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color:#555; font-size:11px;")
+        layout.addWidget(intro)
+
+        self._form = DestripeParamsForm(params)
+        layout.addWidget(self._form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok
+            | QDialogButtonBox.Cancel
+            | QDialogButtonBox.RestoreDefaults
+        )
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(
+            lambda: self._form.set_params(DEFAULTS)
+        )
+        layout.addWidget(buttons)
+
+    # -- values ----------------------------------------------------------
+    def set_params(self, params: Dict[str, Any]) -> None:
+        self._form.set_params(params)
+
+    def get_params(self) -> Dict[str, Any]:
+        return self._form.get_params()
