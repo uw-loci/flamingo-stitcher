@@ -2378,18 +2378,35 @@ class StitchingDialog(PersistentDialog):
         direction, so a setting that was proven on a real plane is the one the
         run uses -- otherwise the preview would just be a nice picture.
         """
-        acq_path = self._selected_queue_path("Destripe preview")
-        if acq_path is None:
+        item = self._selected_queue_item("Destripe preview")
+        if item is None:
             return
+        acq_path = item["path"]
 
         from flamingo_stitcher.gui.destripe_preview_dialog import (
             DestripePreviewDialog,
         )
 
+        # Hand over the tiles the queue already discovered. Each dialog
+        # subclass discovers its own LAYOUT (_discover_tiles_for_path: the
+        # subfolder-per-tile scanner here, discover_flat_tiles for the C++
+        # server's flat X000_Y000 files), so letting the preview re-scan with
+        # one hardcoded scanner reported "no tiles" on the Single Workflow tab.
+        # Reusing the queue's result is both correct by construction and skips
+        # a redundant scan of every tile.
+        tiles = item.get("tiles")
+        if not tiles:
+            try:
+                tiles = self._discover_tiles_for_path(acq_path)
+            except Exception as e:  # noqa: BLE001 - preview falls back itself
+                self._logger.debug(f"Preview tile discovery failed: {e!r}")
+                tiles = None
+
         dlg = DestripePreviewDialog(
             acq_path,
             self._destripe_params,
             direction=str(self._destripe_dir_combo.currentData() or "auto"),
+            tiles=tiles,
             parent=self,
         )
         if dlg.exec_() == QDialog.Accepted:
@@ -2404,6 +2421,11 @@ class StitchingDialog(PersistentDialog):
 
     def _selected_queue_path(self, title: str):
         """Path of the selected queue row, or the first when none is selected."""
+        item = self._selected_queue_item(title)
+        return None if item is None else item["path"]
+
+    def _selected_queue_item(self, title: str):
+        """The selected queue row (or the first), validated to have a path."""
         if not self._queue:
             QMessageBox.information(
                 self,
@@ -2415,11 +2437,11 @@ class StitchingDialog(PersistentDialog):
         row = rows[0] if rows else 0
         if not (0 <= row < len(self._queue)):
             row = 0
-        acq_path = self._queue[row].get("path")
-        if not acq_path:
+        item = self._queue[row]
+        if not item.get("path"):
             QMessageBox.warning(self, title, "That queue item has no path.")
             return None
-        return acq_path
+        return item
 
     def _update_voxel_readout(self, *_args):
         """Refresh the Native → Output voxel line below the downsample row."""

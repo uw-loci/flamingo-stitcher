@@ -240,3 +240,91 @@ class TestPreviewResults:
         assert hasattr(DestripeParamsForm, "get_params")
         assert hasattr(DestripeParamsForm, "changed")
 
+
+
+_FLAT_PLANES = 4
+_FLAT_AOI = 64
+_FLAT_WORKFLOW = """<Workflow Settings>
+  <Experiment Settings>
+    Plane spacing (um) = 2.5
+    Save image drive = D:
+  </Experiment Settings>
+  <Camera Settings>
+    AOI width = 64
+    AOI height = 64
+  </Camera Settings>
+  <Start Position>
+    X (mm) = 1.0
+    Y (mm) = 2.0
+    Z (mm) = 3.0
+    Angle (degrees) = 0.0
+  </Start Position>
+</Workflow Settings>
+"""
+
+
+def _flat_acquisition(tmp_path: Path) -> Path:
+    """C++ server native layout: flat .raw files with integer X000_Y000 indices.
+
+    This is what the "Tile Stitching (Single Workflow)" tab consumes. It has NO
+    per-tile subfolders, so the subfolder-per-tile scanner finds nothing in it.
+    """
+    acq = tmp_path / "20260805_105529_Section_Redo"
+    acq.mkdir()
+    (acq / "Workflow.txt").write_text(_FLAT_WORKFLOW)
+
+    payload = np.zeros(
+        (_FLAT_PLANES, _FLAT_AOI, _FLAT_AOI), dtype=np.uint16
+    ).tobytes()
+    for x_idx in (0, 1):
+        name = (
+            f"S000_t000000_V000_R0000_X{x_idx:03d}_Y000"
+            f"_C02_I0_D1_P{_FLAT_PLANES:05d}.raw"
+        )
+        (acq / name).write_bytes(payload)
+    return acq
+
+
+class TestFlatLayoutDiscovery:
+    """Regression: the preview reported "no tiles" for flat acquisitions.
+
+    Each stitching dialog discovers its own layout via _discover_tiles_for_path
+    (NativeStitchingDialog uses discover_flat_tiles). The preview hardcoded the
+    subfolder-per-tile scanner, so on the Single Workflow tab it found nothing
+    in a perfectly good acquisition.
+    """
+
+    def test_the_wrong_scanner_really_does_find_nothing(self, tmp_path):
+        """Pins the premise, so this test can't silently stop testing."""
+        from flamingo_stitcher.pipeline import discover_flat_tiles, discover_tiles
+
+        acq = _flat_acquisition(tmp_path)
+
+        assert discover_tiles(acq) == []          # the scanner the preview used
+        assert len(discover_flat_tiles(acq)) == 2  # the one this layout needs
+
+    def test_preview_finds_flat_tiles_without_being_told(self, qapp, tmp_path):
+        from flamingo_stitcher.gui.destripe_preview_dialog import (
+            DestripePreviewDialog,
+        )
+
+        acq = _flat_acquisition(tmp_path)
+        dlg = DestripePreviewDialog(acq, {}, direction="auto")
+
+        assert dlg._tile_combo.count() == 2
+
+    def test_caller_supplied_tiles_are_used_verbatim(self, qapp, tmp_path):
+        """The queue already knows the layout; don't re-scan and risk differing."""
+        from flamingo_stitcher.gui.destripe_preview_dialog import (
+            DestripePreviewDialog,
+        )
+        from flamingo_stitcher.pipeline import discover_flat_tiles
+
+        acq = _flat_acquisition(tmp_path)
+        tiles = discover_flat_tiles(acq)
+
+        dlg = DestripePreviewDialog(acq, {}, direction="auto", tiles=tiles)
+
+        assert dlg._tile_combo.count() == len(tiles)
+        assert dlg._tiles is not tiles  # copied, so the queue's list can't be mutated
+        assert [t.folder for t in dlg._tiles] == [t.folder for t in tiles]

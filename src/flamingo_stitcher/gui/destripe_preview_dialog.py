@@ -127,9 +127,17 @@ class DestripePreviewDialog(PersistentDialog):
     """Pick a tile, scrub Z, and see the destripe filter applied live."""
 
     def __init__(self, acq_path: Path, params: Dict[str, Any] | None = None,
-                 direction: str = "auto", parent=None) -> None:
+                 direction: str = "auto", tiles: Optional[List[Any]] = None,
+                 parent=None) -> None:
         super().__init__(parent)
         self._acq_path = Path(acq_path)
+        # Tiles the caller already discovered. Strongly preferred: the queue
+        # knows which LAYOUT this acquisition uses (subfolder-per-tile vs the
+        # C++ server's flat X000_Y000 files) because each dialog overrides
+        # _discover_tiles_for_path. Re-scanning here with one hardcoded scanner
+        # found nothing for flat acquisitions, and it also repeats a scan the
+        # queue already paid for.
+        self._preset_tiles = list(tiles) if tiles else None
         self._direction_setting = (direction or "auto").lower()
         self.setWindowTitle(f"Destripe preview — {self._acq_path.name}")
         self.setMinimumWidth(980)
@@ -265,22 +273,25 @@ class DestripePreviewDialog(PersistentDialog):
 
     # -- data ------------------------------------------------------------
     def _load_tiles(self) -> None:
-        try:
-            from flamingo_stitcher.pipeline import discover_tiles
-
-            self._tiles = discover_tiles(self._acq_path)
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(
-                self, "Destripe preview", f"Could not read that acquisition:\n{e}"
-            )
-            self._tiles = []
-            return
+        if self._preset_tiles:
+            self._tiles = self._preset_tiles
+        else:
+            try:
+                self._tiles = self._discover_any_layout()
+            except Exception as e:  # noqa: BLE001
+                QMessageBox.warning(
+                    self, "Destripe preview", f"Could not read that acquisition:\n{e}"
+                )
+                self._tiles = []
+                return
 
         if not self._tiles:
             QMessageBox.information(
                 self,
                 "Destripe preview",
-                f"No tiles found in:\n{self._acq_path}",
+                f"No tiles found in:\n{self._acq_path}\n\n"
+                "Run 'Discover Tiles' first — the preview then reuses exactly "
+                "the tiles the queue found, including this tab's layout.",
             )
             return
 
@@ -293,6 +304,28 @@ class DestripePreviewDialog(PersistentDialog):
             self._tile_combo.addItem(f"{i + 1}: {label}", i)
         self._tile_combo.blockSignals(False)
         self._on_tile_changed(0)
+
+    def _discover_any_layout(self) -> List[Any]:
+        """Fallback discovery when the caller passed no tiles.
+
+        Tries BOTH layouts rather than assuming the subfolder-per-tile one:
+        the C++ server writes flat X000_Y000 .raw files in a single directory,
+        and assuming wrong reports "no tiles" for a perfectly good acquisition.
+        """
+        from flamingo_stitcher.pipeline import discover_flat_tiles, discover_tiles
+
+        for scan in (discover_tiles, discover_flat_tiles):
+            try:
+                found = scan(self._acq_path)
+            except Exception as e:  # noqa: BLE001 - try the other layout
+                logger.debug(f"{scan.__name__} failed: {e!r}")
+                continue
+            if found:
+                logger.info(
+                    f"Destripe preview: {len(found)} tiles via {scan.__name__}"
+                )
+                return found
+        return []
 
     def _current_tile(self):
         i = self._tile_combo.currentData()
