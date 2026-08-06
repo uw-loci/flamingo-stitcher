@@ -54,6 +54,7 @@ class _NoScrollDoubleSpinBox(QDoubleSpinBox):
             super().wheelEvent(event)
         else:
             event.ignore()
+from flamingo_stitcher.gui._wheel_guard import install_wheel_guard
 
 
 # QSettings keys
@@ -370,6 +371,8 @@ class StitchingDialog(PersistentDialog):
         self.setAttribute(Qt.WA_DeleteOnClose, False)
 
         self._setup_ui()
+        # Stray wheel scrolls must not rewrite settings on the way past.
+        install_wheel_guard(self)
         # Accept folders dropped anywhere on the dialog → add them to the queue.
         self.setAcceptDrops(True)
         self._restore_settings()
@@ -1878,6 +1881,35 @@ class StitchingDialog(PersistentDialog):
 
     # --- Tile discovery ---
 
+
+    def _describe_discovered(self, tiles) -> str:
+        """One line naming the channels and illumination sides discovered.
+
+        Channel numbers are zero-based HARDWARE indices — the 4th laser is
+        channel 3 — so a bare "3" reads as three channels. Leads with the
+        count and names the laser.
+        """
+        channels = sorted({ch for t in tiles for ch in getattr(t, "channels", [])})
+        try:
+            from flamingo_stitcher.pipeline import describe_channel_set
+
+            ch_text = describe_channel_set(channels)
+        except Exception:  # noqa: BLE001 - never break discovery over a label
+            ch_text = ", ".join(str(c) for c in channels) or "none"
+
+        sides = sorted(
+            {s for t in tiles for m in getattr(t, "raw_files", {}).values() for s in m}
+        )
+        if len(sides) > 1:
+            side_text = (
+                f"{len(sides)} illumination sides ({', '.join(f'I{s}' for s in sides)})"
+            )
+        elif sides:
+            side_text = f"1 illumination side (I{sides[0]})"
+        else:
+            side_text = "illumination sides unknown"
+        return f"Channels: {ch_text} · {side_text}"
+
     def _on_discover(self):
         """Discover tiles for all pending items in the queue."""
         pending = [item for item in self._queue if item["status"] == "pending"]
@@ -1901,6 +1933,11 @@ class StitchingDialog(PersistentDialog):
                 if tiles:
                     item["tiles"] = tiles
                     self._log(f"  Found {len(tiles)} tiles")
+                    # Say what is IN them. The channel set decides what gets
+                    # written and how long the run takes, and until now
+                    # discovery never showed it — the user found out at run
+                    # time, or from the stitched result.
+                    self._log(f"  {self._describe_discovered(tiles)}")
                     # Surface per-tile data-quality warnings (corrupt / unreadable
                     # metadata used a grid-estimated position; truncated image
                     # files) prominently — a run can continue but the user must
@@ -2094,7 +2131,13 @@ class StitchingDialog(PersistentDialog):
             frame_str = "auto"
 
         channels = sorted({ch for t in all_tiles for ch in t.channels})
-        ch_str = ", ".join(str(c) for c in channels) if channels else "?"
+        # "channel(s) 3" reads as three channels when it means the 4th laser.
+        try:
+            from flamingo_stitcher.pipeline import describe_channel_set
+
+            ch_str = describe_channel_set(channels) if channels else "?"
+        except Exception:  # noqa: BLE001 - a hint must never break the dialog
+            ch_str = ", ".join(str(c) for c in channels) if channels else "?"
         px = self._pixel_size_spin.value()
         z = self._z_step_spin.value()
         z_str = f"{z:.3f} µm" if z > 0 else "auto"
@@ -2103,7 +2146,7 @@ class StitchingDialog(PersistentDialog):
         self._image_hint.setText(
             f"<b>Detected:</b> frame/ROI <b>{frame_str}</b> · "
             f"pixel <b>{px:.3f} µm</b> · Z step <b>{z_str}</b> · "
-            f"channel(s) <b>{ch_str}</b> · <b>{len(all_tiles)}</b> tiles. "
+            f"channels <b>{ch_str}</b> · <b>{len(all_tiles)}</b> tiles. "
             "Filled in from the acquisition — change only if you know a value is wrong."
         )
 

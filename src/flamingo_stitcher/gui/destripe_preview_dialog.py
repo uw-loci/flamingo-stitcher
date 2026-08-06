@@ -32,6 +32,8 @@ from typing import Any, Dict, List, Optional
 import numpy as np
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap
+
+from flamingo_stitcher.gui._wheel_guard import install_wheel_guard
 from PyQt5.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -153,6 +155,7 @@ class DestripePreviewDialog(PersistentDialog):
         self._debounce.timeout.connect(self._render)
 
         self._build_ui(params or {})
+        install_wheel_guard(self)
         self._load_tiles()
 
     # -- construction ----------------------------------------------------
@@ -167,6 +170,27 @@ class DestripePreviewDialog(PersistentDialog):
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#555; font-size:11px;")
         layout.addWidget(intro)
+
+        # Tuning destriping on a blank tile tells you nothing — the filter has
+        # no texture to preserve or damage, and every setting looks equally
+        # fine. A blind acquisition can be mostly background, so "tile 1" is a
+        # bad default to trust. Until this dialog can rank tiles by content,
+        # point at the tool that already shows the whole mosaic at a glance.
+        pick = QLabel(
+            "<b>Pick a tile with texture.</b> Destripe settings can only be "
+            "judged where there is structure to preserve — on a blank or "
+            "background-only tile every setting looks the same. To find one, "
+            "open this acquisition in <b>MIP Overview</b> in Flamingo_Control, "
+            "read off the grid position of a tile with visible detail, and "
+            "select that tile below."
+        )
+        pick.setWordWrap(True)
+        pick.setTextFormat(Qt.RichText)
+        pick.setStyleSheet(
+            "color:#664d03; background:#fff3cd; border:1px solid #ffe69c;"
+            "border-radius:4px; padding:6px; font-size:11px;"
+        )
+        layout.addWidget(pick)
 
         # --- source selectors ---
         sel = QHBoxLayout()
@@ -297,10 +321,14 @@ class DestripePreviewDialog(PersistentDialog):
 
         self._tile_combo.blockSignals(True)
         for i, t in enumerate(self._tiles):
-            if getattr(t, "tile_index", None):
-                label = f"X{t.tile_index[0]:03d}_Y{t.tile_index[1]:03d}"
+            # Show BOTH the grid index and the stage position: MIP Overview
+            # identifies tiles by grid index, the folder names by mm, and a
+            # user matching one tool against the other needs both.
+            idx = getattr(t, "tile_index", None)
+            if idx:
+                label = f"X{idx[0]:03d}_Y{idx[1]:03d}  (X{t.x_mm:.2f}_Y{t.y_mm:.2f} mm)"
             else:
-                label = f"X{t.x_mm:.2f}_Y{t.y_mm:.2f}"
+                label = f"X{t.x_mm:.2f}_Y{t.y_mm:.2f} mm"
             self._tile_combo.addItem(f"{i + 1}: {label}", i)
         self._tile_combo.blockSignals(False)
         self._on_tile_changed(0)
