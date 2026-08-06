@@ -71,9 +71,13 @@ def _install_spies(monkeypatch):
     def fake_load(path, n_planes, w, h):
         return np.zeros((3, 8, 8), dtype=np.uint16)
 
-    def fake_destripe(volume, max_workers=None, direction="auto", params=None):
-        # record that destripe saw a SINGLE-side-shaped volume
-        calls.append(("destripe", tuple(volume.shape)))
+    def fake_destripe(
+        volume, max_workers=None, direction="auto", params=None, in_place=False
+    ):
+        # record that destripe saw a SINGLE-side-shaped volume, and that the
+        # caller asked for in-place filtering (a tile is ~3.35 GB, so the
+        # second full-volume array doubled peak RAM per in-flight tile)
+        calls.append(("destripe", tuple(volume.shape), in_place))
         return volume
 
     def fake_fuse(volumes, method="max"):
@@ -107,6 +111,8 @@ def test_destripe_per_side_before_fusion_dual(monkeypatch):
     assert kinds == ["destripe", "destripe", "fuse"], calls
     # each destripe saw a single-side volume (3,8,8), not a fused/stacked one
     assert calls[0][1] == (3, 8, 8) and calls[1][1] == (3, 8, 8)
+    # and filtered in place — the caller owns the freshly loaded volume
+    assert calls[0][2] is True and calls[1][2] is True
 
 
 def test_destripe_single_side_no_fusion(monkeypatch):
@@ -118,3 +124,4 @@ def test_destripe_single_side_no_fusion(monkeypatch):
 
     # One side (ASLM): destripe once, no fusion at all.
     assert [c[0] for c in calls] == ["destripe"], calls
+    assert calls[0][2] is True

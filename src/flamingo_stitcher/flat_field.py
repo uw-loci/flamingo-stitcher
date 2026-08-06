@@ -22,6 +22,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+def _describe(ch_id: int) -> str:
+    """Channel index with its laser, so "channel 3" can't read as a count."""
+    try:
+        from flamingo_stitcher.pipeline import describe_channel
+
+        return describe_channel(ch_id)
+    except Exception:  # noqa: BLE001 - labelling must never break a run
+        return f"channel {ch_id}"
+
+
 BASICPY_AVAILABLE = False
 try:
     from basicpy import BaSiC
@@ -94,7 +104,7 @@ def estimate_flat_fields(
 
         stack = np.stack(sample_planes)  # (N_tiles, H, W)
         msg = (
-            f"Fitting flat-field for channel {ch_id} "
+            f"Fitting flat-field for {_describe(ch_id)} "
             f"({i + 1}/{len(ch_ids)}, {len(sample_planes)} tiles)..."
         )
         logger.info(f"  {msg}")
@@ -106,11 +116,11 @@ def estimate_flat_fields(
             basic.fit(stack)
             models[ch_id] = basic
             logger.info(
-                f"  Channel {ch_id}: flat-field estimated "
+                f"  {_describe(ch_id).capitalize()}: flat-field estimated "
                 f"(range {basic.flatfield.min():.3f} – {basic.flatfield.max():.3f})"
             )
         except Exception as e:
-            logger.error(f"  Channel {ch_id}: flat-field estimation failed: {e}")
+            logger.error(f"  {_describe(ch_id).capitalize()}: flat-field estimation failed: {e}")
 
     return models
 
@@ -206,7 +216,7 @@ def apply_flat_field(
                 corrected[z] = np.clip(plane, 0, 65535).astype(np.uint16)
             tile_list[tile_idx] = (corrected, tile_info)
 
-        msg = f"Channel {ch_id}: corrected {n_tiles} tiles"
+        msg = f"{_describe(ch_id).capitalize()}: corrected {n_tiles} tiles"
         logger.info(f"  {msg}")
         if progress_fn:
             progress_fn(msg)

@@ -134,6 +134,16 @@ def main():
         help="Max parallel destripe threads (default: auto based on available memory)",
     )
     preproc_group.add_argument(
+        "--preprocess-workers",
+        type=int,
+        default=None,
+        help=(
+            "Tiles preprocessed concurrently (default: auto — 1 when destriping "
+            "is on, since concurrent tiles measured 3x slower at ~4x peak RAM; "
+            "otherwise up to 4). Raise only if preprocessing is I/O-starved."
+        ),
+    )
+    preproc_group.add_argument(
         "--destripe-sigma",
         type=float,
         nargs=2,
@@ -503,6 +513,9 @@ def main():
         destripe=args.destripe,
         destripe_fast=args.destripe_fast,
         destripe_workers=args.destripe_workers,
+        preprocess_workers=(
+            0 if args.preprocess_workers is None else int(args.preprocess_workers)
+        ),
         destripe_direction=args.destripe_direction,
         destripe_params={
             k: v

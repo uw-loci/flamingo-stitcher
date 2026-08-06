@@ -30,6 +30,16 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+def _describe(ch_id: int) -> str:
+    """Channel index with its laser, so "channel 3" can't read as a count."""
+    try:
+        from flamingo_stitcher.pipeline import describe_channel
+
+        return describe_channel(ch_id)
+    except Exception:  # noqa: BLE001 - labelling must never break a run
+        return f"channel {ch_id}"
+
+
 
 def _no_window_kwargs() -> dict:
     """subprocess kwargs that prevent a console window flashing on Windows.
@@ -336,7 +346,7 @@ class IsolatedPreprocessingService:
         models = {}
         for ch_id, stack in sample_planes_per_channel.items():
             logger.info(
-                f"  Estimating flat-field for channel {ch_id} "
+                f"  Estimating flat-field for {_describe(ch_id)} "
                 f"({stack.shape[0]} tiles) via isolated env..."
             )
             shm_in = SharedArray.from_array(stack)
@@ -351,11 +361,11 @@ class IsolatedPreprocessingService:
                 darkfield = self._collect_output(result, "darkfield")
                 models[ch_id] = (flatfield, darkfield)
                 logger.info(
-                    f"  Channel {ch_id}: flat-field estimated "
+                    f"  {_describe(ch_id).capitalize()}: flat-field estimated "
                     f"(range {flatfield.min():.3f} – {flatfield.max():.3f})"
                 )
             except Exception as e:
-                logger.error(f"  Channel {ch_id}: flat-field estimation failed: {e}")
+                logger.error(f"  {_describe(ch_id).capitalize()}: flat-field estimation failed: {e}")
             finally:
                 shm_in.close(unlink=True)
 

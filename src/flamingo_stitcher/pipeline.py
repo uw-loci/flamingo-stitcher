@@ -907,7 +907,9 @@ class StitchingConfig:
     streaming_mode: Optional[bool] = None
 
     # Per-tile preprocess parallelism in streaming mode.
-    # 0 = auto (picked from available RAM vs tile size, clamped to [1, 4]);
+    # 0 = auto: 1 when destriping is on (it saturates the machine by itself and
+    #     concurrent tiles measured 3x SLOWER at ~4x the peak RAM), otherwise
+    #     picked from available RAM vs tile size, clamped to [1, 4];
     # otherwise the requested worker count, clamped to [1, 8].
     preprocess_workers: int = 0
 
@@ -1424,6 +1426,12 @@ def estimate_memory_usage(
     _req_pp = int(getattr(config, "preprocess_workers", 0) or 0)
     if _req_pp > 0:
         pp_workers = min(_req_pp, 8)
+    elif getattr(config, "destripe", False):
+        # Destripe forces sequential preprocessing (see
+        # _pick_preprocess_workers). Modelling 4 here would over-state the
+        # preprocess floor ~4x and push the run into streaming mode — and
+        # inflate the ETA — for memory it will never use.
+        pp_workers = 1
     else:
         # Auto mode: _pick_preprocess_workers also caps by AVAILABLE RAM
         # (avail // (per_worker * 2)), so on a box that can't hold 4 native
@@ -2797,17 +2805,125 @@ def _stripe_axis_vote(volume: np.ndarray) -> Tuple[str, float]:
     return ("vertical" if vert > horiz else "horizontal"), confidence
 
 
+def channel_wavelength_nm(ch_id: int) -> Optional[float]:
+    """Laser wavelength for a channel index, or None if unknown."""
+    try:
+        from flamingo_stitcher.config_loader import get_hardware_config
+
+        return get_hardware_config().channel_wavelengths_nm.get(int(ch_id))
+    except Exception:  # noqa: BLE001 - labelling must never break a run
+        return None
+
+
+def describe_channel(ch_id: int) -> str:
+    """A channel index rendered so it cannot be misread as a count.
+
+    Channel numbers here are zero-based HARDWARE indices — the 4th laser is
+    channel 3. Logging a bare "channel 3" for a single-channel acquisition
+    reads as "three channels" or "the third one of several", when in fact only
+    one was acquired. Naming the laser removes the ambiguity.
+    """
+    nm = channel_wavelength_nm(ch_id)
+    return f"channel {ch_id} ({nm:g} nm)" if nm else f"channel {ch_id}"
+
+
+def describe_channel_set(
+    selected: List[int], available: Optional[List[int]] = None
+) -> str:
+    """Count first, identity second — e.g. ``1 (channel 3, 640 nm)``.
+
+    The count leads because that is what a reader checks at a glance; the
+    index follows so it is still possible to tell WHICH laser was used.
+    """
+    if not selected:
+        return "0 (none)"
+    label = f"{len(selected)} — {', '.join(describe_channel(c) for c in selected)}"
+    if available and len(available) > len(selected):
+        label += f", of {len(available)} acquired"
+    return label
+
+
+class _DestripeMeter:
+    """Machine-wide destripe throughput, so concurrency costs are visible.
+
+    Each ``destripe_volume`` call reports its own planes/s, which looks
+    healthy in isolation. When several tiles destripe at once, what matters is
+    the SUM across them — and that is where the damage showed: a run logging a
+    plausible-looking 2.2 planes/s per tile was doing 8.4 planes/s in total
+    against a 25.6 planes/s single-tile ceiling measured earlier in the very
+    same run. Per-tile rates hid a 3x regression for twelve hours.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._active = 0
+        self._peak_concurrent = 0
+        self._planes = 0
+        self._t0: Optional[float] = None
+
+    def start(self) -> int:
+        with self._lock:
+            if self._active == 0:
+                self._t0 = time.time()
+                self._planes = 0
+                self._peak_concurrent = 0
+            self._active += 1
+            self._peak_concurrent = max(self._peak_concurrent, self._active)
+            return self._active
+
+    def add_planes(self, n: int) -> None:
+        with self._lock:
+            self._planes += n
+
+    def finish(self) -> Optional[Tuple[float, int, int]]:
+        """On the last concurrent call, ``(aggregate_rate, planes, peak)``."""
+        with self._lock:
+            self._active -= 1
+            if self._active > 0 or self._t0 is None:
+                return None
+            elapsed = time.time() - self._t0
+            rate = self._planes / elapsed if elapsed > 0 else 0.0
+            return rate, self._planes, self._peak_concurrent
+
+
+_destripe_meter = _DestripeMeter()
+
+
 def destripe_volume(
     volume: np.ndarray,
     max_workers: Optional[int] = None,
     direction: str = "auto",
     params: Optional[Dict[str, Any]] = None,
+    in_place: bool = False,
 ) -> np.ndarray:
     """Apply PyStripe destriping to each Z-plane using parallel threads.
 
-    Uses ThreadPoolExecutor for parallelism — pystripe's C extensions
-    (pywt, scipy.fftpack, numpy) release the GIL.  Falls back to fewer
-    workers on MemoryError, and to sequential processing as a last resort.
+    Uses ThreadPoolExecutor for parallelism. Note that this scales POORLY —
+    measured ~1.5x on 1024x1024 planes and flat beyond two workers, with
+    processes no better than threads, so the ceiling is not the GIL but the
+    filter's allocation/memory traffic. (``pywt`` does hold the GIL for roughly
+    half the runtime, contrary to what this docstring used to claim, but
+    removing that would not lift the ceiling.) The practical consequence:
+    throwing more workers at destriping does not help, and running several
+    tiles through it CONCURRENTLY actively hurts — see :class:`_DestripeMeter`
+    and ``_pick_preprocess_workers``.
+
+    ``in_place=True`` writes filtered planes back into ``volume`` instead of
+    allocating a second full-volume array, saving one tile-sized allocation.
+    Each plane is read into a float32 working copy before its slot is
+    overwritten and planes are independent, so this is safe wherever the
+    caller owns ``volume``.
+
+    It is IGNORED for a read-only array, which is the common case on the
+    per-illumination-side path: ``.raw`` tiles are memory-mapped read-only, so
+    the output array is not a duplicate of resident memory at all — the memmap
+    costs page cache, not anonymous RAM, and the result array is the only
+    tile-sized thing actually in RAM. The saving is real only where the input
+    is already a writable in-memory array, e.g. the ``destripe_fast`` path,
+    which filters the downsampled tile this method produced.
+
+    Falls back to fewer workers on MemoryError, and to sequential processing
+    as a last resort.
 
     ``direction`` selects the stripe orientation to remove:
       * ``"horizontal"`` — pystripe's native axis (removes horizontal stripes),
@@ -2847,7 +2963,12 @@ def destripe_volume(
     transpose = resolved == "vertical"
 
     n_planes = volume.shape[0]
-    result = np.empty_like(volume)
+    # A read-only input (memory-mapped .raw) can't be written back into, so
+    # in_place silently degrades rather than dying mid-tile.
+    writable = bool(getattr(volume, "flags", None) and volume.flags.writeable)
+    if in_place and not writable:
+        logger.debug("Destripe in_place requested but input is read-only; copying")
+    result = volume if (in_place and writable) else np.empty_like(volume)
 
     # Resolve filter parameters: explicit `params` (GUI/CLI) wins, else the YAML
     # config, else the built-in defaults. Missing/None keys fall through, so a
@@ -2926,9 +3047,12 @@ def destripe_volume(
         return z
 
     n_workers = _estimate_destripe_workers(volume.shape[1:], max_workers)
+    concurrent = _destripe_meter.start()
     logger.info(
         f"Destriping {n_planes} planes ({volume.shape[1]}x{volume.shape[2]}) "
-        f"with {n_workers} threads..."
+        f"with {n_workers} threads"
+        + (f" ({concurrent} tiles destriping concurrently)" if concurrent > 1 else "")
+        + "..."
     )
 
     remaining = set(range(n_planes))
@@ -2990,6 +3114,16 @@ def destripe_volume(
         f"Destripe complete: {n_planes} planes in {elapsed:.1f}s "
         f"({rate:.1f} planes/s)"
     )
+    _destripe_meter.add_planes(n_planes)
+    summary = _destripe_meter.finish()
+    if summary is not None and summary[2] > 1:
+        agg_rate, agg_planes, peak = summary
+        logger.info(
+            f"Destripe THROUGHPUT (all tiles): {agg_planes} planes at "
+            f"{agg_rate:.1f} planes/s with up to {peak} tiles at once. "
+            "Per-tile rates above are each a fraction of this — compare the "
+            "aggregate, not the per-tile figure, when judging speed."
+        )
     return result
 
 
@@ -3665,7 +3799,9 @@ class StitchingPipeline:
             process_channels = [ch for ch in channels if ch in all_channels]
         else:
             process_channels = all_channels
-        self.logger.info(f"Processing channels: {process_channels}")
+        self.logger.info(
+            f"Channels: {describe_channel_set(process_channels, all_channels)}"
+        )
 
         # Determine Z step
         z_step_um = self.config.z_step_um
@@ -3907,21 +4043,24 @@ class StitchingPipeline:
 
             tile_data = channel_tile_data.get(ch_id, [])
             if not tile_data:
-                self.logger.warning(f"No data for channel {ch_id}, skipping")
+                self.logger.warning(f"No data for {describe_channel(ch_id)}, skipping")
                 continue
 
             fuse_pct = 55 + int(15 * ch_idx / max(len(process_channels), 1))
             self._progress_fn(
-                fuse_pct, f"Fusing channel {ch_id} ({len(tile_data)} tiles)..."
+                fuse_pct, f"Fusing {describe_channel(ch_id)} ({len(tile_data)} tiles)..."
             )
             self.logger.info(
-                f"Step 4: Fusing channel {ch_id} ({len(tile_data)} tiles)..."
+                f"Step 4: Fusing {describe_channel(ch_id)} ({len(tile_data)} tiles)..."
             )
             fused_sim, origin_um = self._fuse_channel(
                 tile_data, voxel_size_um, reg_params, transform_key
             )
 
-            self._progress_fn(fuse_pct + 5, f"Computing channel {ch_id} into memory...")
+            self._progress_fn(
+                fuse_pct + 5,
+                f"Computing {describe_channel(ch_id)} into memory...",
+            )
             # Bound the dask scheduler the same way the streaming path does.
             # multiview-stitcher fuses block-by-block, stacking every source
             # tile that overlaps a block as a float64 array at the block's
@@ -3937,7 +4076,7 @@ class StitchingPipeline:
                 scheduler_cfg = {"scheduler": "threads", "num_workers": fuse_workers}
                 scheduler_name = f"threads×{fuse_workers}"
             self.logger.info(
-                f"  Computing channel {ch_id} into memory "
+                f"  Computing {describe_channel(ch_id)} into memory "
                 f"(scheduler={scheduler_name})..."
             )
             with dask.config.set(**scheduler_cfg):
@@ -3974,7 +4113,7 @@ class StitchingPipeline:
             fused_channel_ids.append(ch_id)
 
             self.logger.info(
-                f"  Channel {ch_id}: shape={stacked.shape[-3:] if stacked.ndim == 4 else stacked.shape}, "
+                f"  {describe_channel(ch_id).capitalize()}: shape={stacked.shape[-3:] if stacked.ndim == 4 else stacked.shape}, "
                 f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
                 f"X={origin_um['x']:.1f} µm"
             )
@@ -4146,7 +4285,7 @@ class StitchingPipeline:
                 )
                 if not tile_data:
                     self.logger.warning(
-                        f"Preview: no data for channel {ch_id}, skipping"
+                        f"Preview: no data for {describe_channel(ch_id)}, skipping"
                     )
                     shutil.rmtree(ch_tmp_dir, ignore_errors=True)
                     continue
@@ -4171,7 +4310,7 @@ class StitchingPipeline:
                     arr = darr.compute()
                 preview[ch_id] = np.asarray(arr, dtype=np.uint16)
                 self.logger.info(
-                    f"  Preview channel {ch_id}: shape={preview[ch_id].shape} "
+                    f"  Preview {describe_channel(ch_id)}: shape={preview[ch_id].shape} "
                     f"min={preview[ch_id].min()} max={preview[ch_id].max()}"
                 )
 
@@ -4387,7 +4526,7 @@ class StitchingPipeline:
                     f"[materializing tiles]...",
                 )
                 self.logger.info(
-                    f"Step 4: Fusing channel {ch_id} ({len(tiles)} tiles) "
+                    f"Step 4: Fusing {describe_channel(ch_id)} ({len(tiles)} tiles) "
                     f"[streaming, one-shot tile preprocess → memmap]..."
                 )
 
@@ -4406,7 +4545,7 @@ class StitchingPipeline:
                     tile_data = reg_reuse_data
                     reg_reuse_data = None  # consumed
                     self.logger.info(
-                        f"  Reusing pre-registered spill for channel {ch_id} "
+                        f"  Reusing pre-registered spill for {describe_channel(ch_id)} "
                         f"(skipping re-materialize)"
                     )
                 else:
@@ -4416,7 +4555,7 @@ class StitchingPipeline:
                         illum_side=side,
                     )
                 if not tile_data:
-                    self.logger.warning(f"No data for channel {ch_id}, skipping")
+                    self.logger.warning(f"No data for {describe_channel(ch_id)}, skipping")
                     if ch_tmp_dir.exists():
                         shutil.rmtree(ch_tmp_dir, ignore_errors=True)
                     continue
@@ -4539,7 +4678,7 @@ class StitchingPipeline:
                         self._iter_superblock_regions(full_props, superblock)
                     )
                     self.logger.info(
-                        f"  Channel {ch_id}: shape={full_shape} "
+                        f"  {describe_channel(ch_id).capitalize()}: shape={full_shape} "
                         f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
                         f"X={origin_um['x']:.1f} um -- {len(regions)} "
                         f"super-block region(s) of {superblock} chunks/axis"
@@ -4601,7 +4740,7 @@ class StitchingPipeline:
                     )
                     darr = _finalize(fused_sim.data)
                     self.logger.info(
-                        f"  Channel {ch_id}: shape={darr.shape} "
+                        f"  {describe_channel(ch_id).capitalize()}: shape={darr.shape} "
                         f"origin Z={origin_um['z']:.1f} Y={origin_um['y']:.1f} "
                         f"X={origin_um['x']:.1f} um"
                     )
@@ -4938,6 +5077,12 @@ class StitchingPipeline:
                     max_workers=self._destripe_worker_budget(),
                     direction=self._resolve_destripe_direction(vol),
                     params=self.config.destripe_params,
+                    # Honoured only if `vol` is writable. It usually is NOT —
+                    # .raw tiles are read-only memmaps — in which case the
+                    # output array is the only tile-sized RAM allocation
+                    # anyway, not a duplicate. Kept for the TIFF path, whose
+                    # loader returns a real in-memory array.
+                    in_place=True,
                 )
             illum_volumes[illum_side] = vol
 
@@ -4988,6 +5133,9 @@ class StitchingPipeline:
                 max_workers=self._destripe_worker_budget(),
                 direction=self._resolve_destripe_direction(volume),
                 params=self.config.destripe_params,
+                # `volume` is this method's own downsampled array — writable,
+                # so this genuinely avoids an allocation.
+                in_place=True,
             )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far
@@ -5285,6 +5433,8 @@ class StitchingPipeline:
 
     def _reset_destripe_axis(self) -> None:
         """Clear the locked stripe axis so a new run re-resolves it."""
+        global _destripe_meter
+        _destripe_meter = _DestripeMeter()
         self._destripe_axis_lock = threading.Lock()
         self._destripe_axis_votes = {"horizontal": 0.0, "vertical": 0.0}
         self._destripe_axis_n = 0
@@ -5341,10 +5491,27 @@ class StitchingPipeline:
         ram_cap = max(1, avail_bytes // (per_worker * 2))
 
         if requested > 0:
-            chosen = min(requested, 8, n_tiles or 1)
-        else:
-            chosen = min(4, int(ram_cap), n_tiles or 1)
-        return max(1, chosen)
+            return max(1, min(requested, 8, n_tiles or 1))
+
+        # Destriping saturates the machine on its own and does NOT benefit from
+        # being run on several tiles at once — it benefits from NOT being. On a
+        # 98-tile 24-core run, one tile at 24 threads did 25.6 planes/s, while
+        # four tiles at 6 threads each did ~2.1 planes/s apiece — 8.4 in total,
+        # a 3x LOSS. Each concurrent tile also holds a full ~3.35 GB volume, so
+        # four in flight is ~27 GB of buffers and the whole chain starts
+        # thrashing: destripe alone slowed 11.6x, which no thread arithmetic
+        # explains. Per-plane parallelism inside destripe_volume tops out at
+        # ~1.5x anyway (measured, threads and processes alike), so splitting
+        # the machine across tiles buys nothing and costs a great deal.
+        if getattr(self.config, "destripe", False):
+            self.logger.info(
+                "Preprocess workers: 1 (destriping is on — it already uses "
+                "every core and running tiles concurrently measured 3x slower "
+                "and ~4x the peak RAM). Override with preprocess_workers > 0."
+            )
+            return 1
+
+        return max(1, min(4, int(ram_cap), n_tiles or 1))
 
     def _pick_fuse_workers(self, darr) -> int:
         """Choose a safe dask thread-pool size for the fused-memmap store.
@@ -6580,7 +6747,7 @@ class StitchingPipeline:
             f"  X range: {min(xs):.2f} – {max(xs):.2f} mm  "
             f"Y range: {min(ys):.2f} – {max(ys):.2f} mm"
         )
-        self.logger.info(f"  Channel list: {all_ch}")
+        self.logger.info(f"  Channels: {describe_channel_set(sorted(all_ch))}")
         self.logger.info(f"  Illumination side list: {all_illum}")
         self.logger.info(
             f"  Planes per tile: {tiles[0].n_planes} "
