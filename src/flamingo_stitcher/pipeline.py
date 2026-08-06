@@ -2815,16 +2815,30 @@ def channel_wavelength_nm(ch_id: int) -> Optional[float]:
         return None
 
 
-def describe_channel(ch_id: int) -> str:
-    """A channel index rendered so it cannot be misread as a count.
+def describe_channel(ch_id) -> str:
+    """A channel rendered so it cannot be misread as a count.
 
     Channel numbers here are zero-based HARDWARE indices — the 4th laser is
     channel 3. Logging a bare "channel 3" for a single-channel acquisition
     reads as "three channels" or "the third one of several", when in fact only
     one was acquired. Naming the laser removes the ambiguity.
+
+    Also handles the ``"{ch}_I{side}"`` labels that ``split_illumination``
+    produces, where a one-laser acquisition legitimately yields two output
+    channels — one per light path — and "channel 3_I0" is no clearer than
+    "channel 3" was.
     """
+    text = str(ch_id)
+    if "_I" in text:
+        base, _, side = text.partition("_I")
+        try:
+            nm = channel_wavelength_nm(int(base))
+        except (TypeError, ValueError):
+            nm = None
+        laser = f"channel {base} ({nm:g} nm)" if nm else f"channel {base}"
+        return f"{laser} illumination side {side}"
     nm = channel_wavelength_nm(ch_id)
-    return f"channel {ch_id} ({nm:g} nm)" if nm else f"channel {ch_id}"
+    return f"channel {text} ({nm:g} nm)" if nm else f"channel {text}"
 
 
 def describe_channel_set(

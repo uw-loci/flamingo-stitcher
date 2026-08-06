@@ -282,3 +282,30 @@ class TestInPlaceIsSafeOnReadOnlyInput:
         plain = P.destripe_volume(vol, max_workers=2, direction="horizontal")
 
         np.testing.assert_array_equal(forced, plain)
+
+
+class TestSplitIlluminationLabels:
+    """One laser + split illumination = TWO output channels, legitimately.
+
+    ``_output_channel_units`` labels them "3_I0" / "3_I1", and those labels
+    reach the same logs. "channel 3_I0" was no clearer than "channel 3".
+    """
+
+    def test_a_side_label_names_both_the_laser_and_the_side(self):
+        label = P.describe_channel("3_I0")
+
+        assert "channel 3" in label
+        assert "640" in label
+        assert "side 0" in label
+
+    def test_the_two_sides_are_distinguishable(self):
+        assert P.describe_channel("3_I0") != P.describe_channel("3_I1")
+
+    def test_the_pair_still_leads_with_the_count(self):
+        label = P.describe_channel_set(["3_I0", "3_I1"])
+
+        assert label.startswith("2 ")
+        assert "side 0" in label and "side 1" in label
+
+    def test_an_unparseable_label_does_not_raise(self):
+        assert "weird" in P.describe_channel("weird_Ix")
