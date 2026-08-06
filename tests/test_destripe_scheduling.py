@@ -309,3 +309,56 @@ class TestSplitIlluminationLabels:
 
     def test_an_unparseable_label_does_not_raise(self):
         assert "weird" in P.describe_channel("weird_Ix")
+
+
+class TestBorderQCSpillIsReusable:
+    """QC's spill must match what the first output unit wants.
+
+    With split_illumination on, QC materialized the FUSED reference channel,
+    but the fusion loop's reuse guard required ``side is None`` — so the spill
+    matched no output unit and QC became a silent extra preprocess of every
+    tile. On the rig's 98-tile run that pass took 18,659.7 s (5.2 h) and was
+    thrown away, on top of the two passes the split itself needs.
+    """
+
+    def _units(self, split, sides=(0, 1)):
+        cfg = types.SimpleNamespace(split_illumination=split)
+        pipe = types.SimpleNamespace(config=cfg)
+        tiles = [types.SimpleNamespace(raw_files={3: {s: None for s in sides}})]
+        return P.StitchingPipeline._output_channel_units(pipe, tiles, [3])
+
+    def test_split_expands_one_laser_into_one_unit_per_side(self):
+        units = self._units(split=True)
+
+        assert [u[0] for u in units] == ["3_I0", "3_I1"]
+        assert [u[2] for u in units] == [0, 1]
+
+    def test_unsplit_keeps_a_single_fused_unit(self):
+        units = self._units(split=False)
+
+        assert len(units) == 1
+        assert units[0][2] is None  # side None => sides fused
+
+    def test_the_first_units_side_is_what_qc_should_build(self):
+        """That first side is what gets threaded into _run_border_qc_streaming."""
+        assert self._units(split=True)[0][2] == 0
+        assert self._units(split=False)[0][2] is None
+
+    def test_a_single_sided_acquisition_is_not_split(self):
+        """Nothing to separate — must stay one unit, and QC stays fused."""
+        units = self._units(split=True, sides=(0,))
+
+        assert len(units) == 1
+        assert units[0][2] is None
+
+    @pytest.mark.parametrize(
+        "spill_side,unit_side,reusable",
+        [(0, 0, True), (0, 1, False), (None, None, True), (None, 0, False)],
+    )
+    def test_reuse_requires_a_matching_side(self, spill_side, unit_side, reusable):
+        """The guard compares sides now; it used to demand `side is None`.
+
+        Reusing a fused spill for a single-side unit would hand that channel
+        the wrong pixels, so the match has to be exact in both directions.
+        """
+        assert (unit_side == spill_side) is reusable

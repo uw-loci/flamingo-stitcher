@@ -3571,17 +3571,24 @@ class StitchingPipeline:
 
     def _run_border_qc_streaming(
         self, tiles, process_channels, voxel_size_um, output_path,
-        acquisition_dir, reg_reuse_ch, reg_reuse_data,
+        acquisition_dir, reg_reuse_ch, reg_reuse_data, reuse_side=None,
     ):
         """Streaming border QC. Reuses the registered ref-channel spill when
         available; otherwise materializes the ref channel just for QC.
 
-        Returns ``(ref_ch, tile_data, tmp_dir)`` for a spill this method
+        Returns ``(ref_ch, tile_data, tmp_dir, side)`` for a spill this method
         materialized itself (registration was skipped, so there was none to
         reuse) so the caller can hand it to the fusion loop instead of
         preprocessing + spilling every tile a *second* time; returns
-        ``(None, None, None)`` when it reused the registration spill (nothing
-        new to hand off).
+        ``(None, None, None, None)`` when it reused the registration spill.
+
+        ``reuse_side`` is the illumination side the FIRST output unit will
+        want. It matters because the fusion loop can only reuse a spill whose
+        side matches: with ``split_illumination`` on, a QC spill built from
+        FUSED sides matches nothing, so QC silently became a whole extra
+        preprocess of every tile — on a 98-tile run that was 5.2 hours of
+        destriping thrown away, on top of the two passes the split itself
+        needs.
         """
         if reg_reuse_data is not None:
             # Reuse the registration spill; we own nothing to hand back.
@@ -3589,23 +3596,35 @@ class StitchingPipeline:
                 {reg_reuse_ch: reg_reuse_data}, tiles,
                 acquisition_dir, voxel_size_um, output_path,
             )
-            return None, None, None
+            return None, None, None, None
 
         ref_ch = self.config.reg_channel
         if ref_ch not in process_channels:
             ref_ch = process_channels[0]
+        side_tag = "" if reuse_side is None else f"_I{reuse_side}"
+        if reuse_side is not None:
+            self.logger.info(
+                f"  Border QC will measure illumination side {reuse_side} only "
+                "(sides are being kept separate, so this spill is also the "
+                "first output channel — one preprocess pass instead of two). "
+                "Seam steps are therefore per-light-path, not post-fusion."
+            )
         own_tmp = (
             _scratch_base_dir(self.config, output_path)
             / ".stitch_tmp"
-            / f"qc_ch{ref_ch:02d}"
+            / f"qc_ch{ref_ch:02d}{side_tag}"
         )
         # Materialize the reference channel once. A hard failure here leaves a
         # useless partial spill — drop it and re-raise (the caller swallows).
         try:
-            probe = self._preprocess_single_tile(tiles[0], ref_ch)
+            probe = self._preprocess_single_tile(
+                tiles[0], ref_ch, illum_side=reuse_side
+            )
             shape = probe.shape
             del probe
-            data = self._materialize_tiles_to_disk(tiles, ref_ch, shape, own_tmp)
+            data = self._materialize_tiles_to_disk(
+                tiles, ref_ch, shape, own_tmp, illum_side=reuse_side
+            )
         except BaseException:
             import shutil as _shutil
 
@@ -3625,7 +3644,7 @@ class StitchingPipeline:
         # Hand the spill back so the fusion loop reuses it instead of doing a
         # full second preprocess pass of every tile (the redundant pass this
         # method used to force when registration was skipped).
-        return ref_ch, data, own_tmp
+        return ref_ch, data, own_tmp, reuse_side
 
     def _build_output_basename(self, acquisition_dir: Path) -> str:
         """Build a descriptive base filename from acquisition path and settings.
@@ -4381,6 +4400,10 @@ class StitchingPipeline:
         reg_reuse_ch = None
         reg_reuse_data = None
         reg_reuse_dir = None
+        # Which illumination side the reusable spill was built from.
+        # None = sides fused, which is what the registration path always
+        # produces (it materialises the reference channel without a side).
+        reg_reuse_side = None
         if self.config.skip_registration:
             self._progress_fn(45, "Skipping registration (using stage positions)...")
             self.logger.info(
@@ -4471,9 +4494,17 @@ class StitchingPipeline:
         # --- Optional: tile-border artifact QC (diagnostic, streaming) ---
         if self.config.border_qc_enabled and not self._cancelled_fn():
             try:
-                qc_ch, qc_data, qc_dir = self._run_border_qc_streaming(
+                # Build QC's spill for the side the FIRST output unit wants, so
+                # the fusion loop can actually reuse it. Under
+                # split_illumination a FUSED spill matches no unit, and QC
+                # became a silent extra full preprocess of every tile.
+                _first_side = (
+                    self._output_channel_units(tiles, process_channels) or [(None,) * 3]
+                )[0][2]
+                qc_ch, qc_data, qc_dir, qc_side = self._run_border_qc_streaming(
                     tiles, process_channels, voxel_size_um, output_path,
                     acquisition_dir, reg_reuse_ch, reg_reuse_data,
+                    reuse_side=_first_side,
                 )
                 # If QC materialized its own ref-channel spill (registration was
                 # skipped, so there was none to reuse), keep it and hand it to
@@ -4483,6 +4514,7 @@ class StitchingPipeline:
                     reg_reuse_ch = qc_ch
                     reg_reuse_data = qc_data
                     reg_reuse_dir = qc_dir
+                    reg_reuse_side = qc_side
             except Exception as e:  # QC must never fail a run
                 self.logger.warning(f"Border QC pass failed (skipped): {e}")
 
@@ -4546,12 +4578,13 @@ class StitchingPipeline:
 
                 # Preprocess each tile once, spill to memmap on disk — unless
                 # this is the reference channel, whose tiles were already
-                # materialised for registration (C1): reuse that spill instead
-                # of preprocessing + writing every tile a second time. The reused
-                # spill is the FUSED reference, so it only stands in for an
-                # unsplit (side is None) output channel.
+                # materialised for registration or border QC (C1): reuse that
+                # spill instead of preprocessing + writing every tile a second
+                # time. The spill was built for ONE illumination side (None =
+                # sides fused), so it only stands in for a unit wanting that
+                # same side — otherwise its pixels are not what this unit needs.
                 if (
-                    side is None
+                    side == reg_reuse_side
                     and src_ch == reg_reuse_ch
                     and reg_reuse_data is not None
                 ):
