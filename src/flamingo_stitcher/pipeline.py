@@ -2909,6 +2909,7 @@ def destripe_volume(
     direction: str = "auto",
     params: Optional[Dict[str, Any]] = None,
     in_place: bool = False,
+    cancel_fn: Optional[Any] = None,
 ) -> np.ndarray:
     """Apply PyStripe destriping to each Z-plane using parallel threads.
 
@@ -2935,6 +2936,12 @@ def destripe_volume(
     tile-sized thing actually in RAM. The saving is real only where the input
     is already a writable in-memory array, e.g. the ``destripe_fast`` path,
     which filters the downsampled tile this method produced.
+
+    ``cancel_fn`` is polled per plane. Without it, Cancel did nothing until
+    the whole tile finished: all N planes are submitted to the pool up front,
+    so a 1600-plane tile held the user for a full destripe pass (minutes), and
+    with several tiles in flight, for one pass each. Queued planes now return
+    immediately once it trips, so the pool drains in moments.
 
     Falls back to fewer workers on MemoryError, and to sequential processing
     as a last resort.
@@ -3044,6 +3051,10 @@ def destripe_volume(
     )
 
     def _process_plane(z: int) -> int:
+        # Queued planes turn into no-ops the moment Cancel is pressed, so the
+        # already-submitted backlog drains instead of running to completion.
+        if cancel_fn is not None and cancel_fn():
+            return z
         plane = volume[z].astype(np.float32)
         if transpose:
             plane = plane.T
@@ -3075,13 +3086,19 @@ def destripe_volume(
     milestone = max(1, n_planes // 10)
     completed = 0
 
-    while remaining and n_workers >= 1:
+    cancelled = False
+    while remaining and n_workers >= 1 and not cancelled:
         batch = list(remaining)
         failed: list = []
         try:
             with ThreadPoolExecutor(max_workers=n_workers) as executor:
                 futures = {executor.submit(_process_plane, z): z for z in batch}
                 for future in as_completed(futures):
+                    if cancel_fn is not None and cancel_fn():
+                        cancelled = True
+                        for f in futures:
+                            f.cancel()
+                        break
                     z = futures[future]
                     try:
                         future.result()
@@ -3117,6 +3134,9 @@ def destripe_volume(
             # Last resort: sequential, one plane at a time
             logger.warning("Falling back to sequential destriping")
             for z in sorted(remaining):
+                if cancel_fn is not None and cancel_fn():
+                    cancelled = True
+                    break
                 _process_plane(z)
                 completed += 1
             remaining = set()
@@ -3124,10 +3144,13 @@ def destripe_volume(
 
     elapsed = time.time() - t0
     rate = n_planes / elapsed if elapsed > 0 else 0
-    logger.info(
-        f"Destripe complete: {n_planes} planes in {elapsed:.1f}s "
-        f"({rate:.1f} planes/s)"
-    )
+    if cancelled:
+        logger.info(f"Destripe cancelled after {completed}/{n_planes} planes")
+    else:
+        logger.info(
+            f"Destripe complete: {n_planes} planes in {elapsed:.1f}s "
+            f"({rate:.1f} planes/s)"
+        )
     _destripe_meter.add_planes(n_planes)
     summary = _destripe_meter.finish()
     if summary is not None and summary[2] > 1:
@@ -5130,6 +5153,7 @@ class StitchingPipeline:
                     # anyway, not a duplicate. Kept for the TIFF path, whose
                     # loader returns a real in-memory array.
                     in_place=True,
+                    cancel_fn=self._cancelled_fn,
                 )
             illum_volumes[illum_side] = vol
 
@@ -5183,6 +5207,7 @@ class StitchingPipeline:
                 # `volume` is this method's own downsampled array — writable,
                 # so this genuinely avoids an allocation.
                 in_place=True,
+                cancel_fn=self._cancelled_fn,
             )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far

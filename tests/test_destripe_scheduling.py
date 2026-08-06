@@ -362,3 +362,69 @@ class TestBorderQCSpillIsReusable:
         the wrong pixels, so the match has to be exact in both directions.
         """
         assert (unit_side == spill_side) is reusable
+
+
+class TestDestripeIsCancellable:
+    """Cancel used to do nothing until the whole tile's destripe finished.
+
+    All N planes are submitted to the pool up front, so pressing Cancel on a
+    1600-plane tile meant waiting out a full destripe pass — minutes, and one
+    pass per tile in flight. Queued planes now short-circuit.
+    """
+
+    def _volume(self, n=24):
+        rng = np.random.default_rng(0)
+        return rng.integers(200, 3000, (n, 32, 32)).astype(np.uint16)
+
+    def test_it_stops_early_instead_of_filtering_every_plane(self):
+        filtered = []
+        from flamingo_stitcher import _pystripe_core as C
+        real = C.filter_streaks
+
+        def counting(img, **kw):
+            filtered.append(1)
+            return real(img, **kw)
+
+        vol = self._volume()
+        # Cancel as soon as a couple of planes have gone through.
+        cancel = lambda: len(filtered) >= 3  # noqa: E731
+
+        import unittest.mock as mock
+
+        with mock.patch.object(C, "filter_streaks", counting):
+            P.destripe_volume(vol, max_workers=1, direction="horizontal",
+                              cancel_fn=cancel)
+
+        assert len(filtered) < vol.shape[0], f"{len(filtered)} of {vol.shape[0]}"
+
+    def test_a_cancel_that_never_trips_processes_everything(self):
+        vol = self._volume()
+        out = P.destripe_volume(vol, max_workers=2, direction="horizontal",
+                                cancel_fn=lambda: False)
+
+        assert out.shape == vol.shape
+        assert int(out.max()) > 0
+
+    def test_no_cancel_fn_behaves_exactly_as_before(self):
+        vol = self._volume()
+        with_none = P.destripe_volume(vol, max_workers=2, direction="horizontal")
+        with_false = P.destripe_volume(vol, max_workers=2, direction="horizontal",
+                                       cancel_fn=lambda: False)
+
+        np.testing.assert_array_equal(with_none, with_false)
+
+    def test_cancelling_before_any_work_filters_nothing(self):
+        filtered = []
+        from flamingo_stitcher import _pystripe_core as C
+        real = C.filter_streaks
+        import unittest.mock as mock
+
+        def counting(img, **kw):
+            filtered.append(1)
+            return real(img, **kw)
+
+        with mock.patch.object(C, "filter_streaks", counting):
+            P.destripe_volume(self._volume(), max_workers=2,
+                              direction="horizontal", cancel_fn=lambda: True)
+
+        assert filtered == []

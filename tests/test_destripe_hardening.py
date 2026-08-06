@@ -72,12 +72,15 @@ def _install_spies(monkeypatch):
         return np.zeros((3, 8, 8), dtype=np.uint16)
 
     def fake_destripe(
-        volume, max_workers=None, direction="auto", params=None, in_place=False
+        volume, max_workers=None, direction="auto", params=None, in_place=False,
+        cancel_fn=None,
     ):
         # record that destripe saw a SINGLE-side-shaped volume, and that the
         # caller asked for in-place filtering (a tile is ~3.35 GB, so the
         # second full-volume array doubled peak RAM per in-flight tile)
-        calls.append(("destripe", tuple(volume.shape), in_place))
+        # cancel_fn must be threaded through, or Cancel does nothing until the
+        # whole tile's destripe finishes (minutes per tile in flight).
+        calls.append(("destripe", tuple(volume.shape), in_place, cancel_fn))
         return volume
 
     def fake_fuse(volumes, method="max"):
@@ -113,6 +116,7 @@ def test_destripe_per_side_before_fusion_dual(monkeypatch):
     assert calls[0][1] == (3, 8, 8) and calls[1][1] == (3, 8, 8)
     # and filtered in place — the caller owns the freshly loaded volume
     assert calls[0][2] is True and calls[1][2] is True
+    assert calls[0][3] is not None and calls[1][3] is not None
 
 
 def test_destripe_single_side_no_fusion(monkeypatch):
@@ -125,3 +129,4 @@ def test_destripe_single_side_no_fusion(monkeypatch):
     # One side (ASLM): destripe once, no fusion at all.
     assert [c[0] for c in calls] == ["destripe"], calls
     assert calls[0][2] is True
+    assert calls[0][3] is not None  # cancellable

@@ -1,0 +1,291 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1360 1500" width="1360" height="1500" font-family="'Segoe UI',Helvetica,Arial,sans-serif">
+<defs>
+  <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#5a6472"/>
+  </marker>
+  <marker id="ag" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+    <path d="M0,0 L10,5 L0,10 z" fill="#8a94a6"/>
+  </marker>
+  <style>
+    .t   { font-size:13.5px; fill:#11161d; }
+    .fn  { font-size:10px; fill:#5a6472; font-family:'Cascadia Mono',Consolas,monospace; }
+    .n   { font-size:10.5px; fill:#6b7480; }
+    .h   { font-size:15px; font-weight:600; fill:#11161d; }
+    .hh  { font-size:21px; font-weight:600; fill:#11161d; }
+    .sub { font-size:12px; fill:#5a6472; }
+    .num { font-size:10.5px; font-weight:700; fill:#fff; }
+    .lbl { font-size:11px; font-weight:600; fill:#3d4550; }
+    .box { fill:#fff; stroke:#c6ccd6; stroke-width:1.2; rx:5; }
+    .opt { fill:#fbfcfe; stroke:#c6ccd6; stroke-width:1.2; stroke-dasharray:4 3; rx:5; }
+    .fut { fill:#fafafa; stroke:#c9c9c9; stroke-width:1.2; stroke-dasharray:2 3; rx:5; }
+    .ln  { stroke:#5a6472; stroke-width:1.5; fill:none; marker-end:url(#a); }
+    .lng { stroke:#8a94a6; stroke-width:1.3; fill:none; stroke-dasharray:4 3; marker-end:url(#ag); }
+  </style>
+</defs>
+
+<rect width="1360" height="1500" fill="#f5f7fa"/>
+
+<text x="34" y="42" class="hh">Flamingo Stitcher — processing chain</text>
+<text x="34" y="64" class="sub">Order of operations, v0.9.15. Solid = always runs · dashed = optional · grey dashed = not reachable / planned. Function names in mono.</text>
+
+<!-- ============ LEGEND ============ -->
+<g transform="translate(880,26)">
+  <rect x="0" y="0" width="446" height="52" fill="#fff" stroke="#c6ccd6" rx="5"/>
+  <rect x="12" y="11" width="26" height="13" class="box"/><text x="44" y="21" class="n">always</text>
+  <rect x="100" y="11" width="26" height="13" class="opt"/><text x="132" y="21" class="n">optional</text>
+  <rect x="192" y="11" width="26" height="13" class="fut"/><text x="224" y="21" class="n">planned / no GUI</text>
+  <rect x="12" y="31" width="26" height="13" fill="#fdeaea" stroke="#e0a5a5" rx="3"/><text x="44" y="41" class="n">raw camera frame</text>
+  <rect x="192" y="31" width="26" height="13" fill="#e8f2ea" stroke="#9ec3a8" rx="3"/><text x="224" y="41" class="n">stage frame</text>
+</g>
+
+<!-- ============ THE THREE MODES ============ -->
+<text x="34" y="104" class="h">1 · Three modes — they differ only at the ends</text>
+
+<g transform="translate(34,118)">
+  <rect x="0" y="0" width="420" height="92" class="box"/>
+  <text x="14" y="22" class="h">Multi-Acquisition</text>
+  <text x="14" y="40" class="fn">StitchingDialog</text>
+  <text x="14" y="59" class="n">Folder-per-tile · batch queue of acquisitions</text>
+  <text x="14" y="76" class="fn">discover_tiles()</text>
+</g>
+
+<g transform="translate(470,118)">
+  <rect x="0" y="0" width="420" height="92" class="box"/>
+  <text x="14" y="22" class="h">Single Workflow</text>
+  <text x="14" y="40" class="fn">NativeStitchingDialog(StitchingDialog)</text>
+  <text x="14" y="59" class="n">Flat dir of .raw, X000_Y000 indices. Only difference.</text>
+  <text x="14" y="76" class="fn">discover_flat_tiles()</text>
+</g>
+
+<g transform="translate(906,118)">
+  <rect x="0" y="0" width="420" height="92" class="box"/>
+  <text x="14" y="22" class="h">Multi-View</text>
+  <text x="14" y="40" class="fn">MultiViewStitchingDialog(StitchingDialog)</text>
+  <text x="14" y="59" class="n">Same discovery. Adds rotation placement at step 12.</text>
+  <text x="14" y="76" class="fn">multiview_fusion = True</text>
+</g>
+
+<path d="M244,210 L244,238" class="ln"/>
+<path d="M680,210 L680,238" class="ln"/>
+<path d="M1116,210 L1116,238" class="ln"/>
+<text x="620" y="232" class="lbl">all three share the identical chain below</text>
+
+<!-- ============ PER-TILE CHAIN ============ -->
+<rect x="34" y="248" width="1292" height="672" fill="#fff" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<rect x="34" y="248" width="1292" height="34" fill="#eef1f6" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<rect x="34" y="272" width="1292" height="10" fill="#eef1f6"/>
+<text x="50" y="271" class="h">2 · Per-tile chain — one function, both execution modes</text>
+<text x="486" y="271" class="fn">StitchingPipeline._preprocess_single_tile(tile, ch_id, illum_side)</text>
+
+<!-- raw camera frame band -->
+<rect x="50" y="294" width="1260" height="474" fill="#fdeaea" opacity="0.45" rx="5"/>
+<text x="1296" y="312" class="lbl" text-anchor="end" fill="#a05252">RAW CAMERA FRAME</text>
+
+<!-- step 1 -->
+<g transform="translate(66,304)">
+  <rect x="0" y="0" width="560" height="54" class="box"/>
+  <circle cx="20" cy="27" r="11" fill="#5a6472"/><text x="20" y="31" class="num" text-anchor="middle">1</text>
+  <text x="40" y="23" class="t">Load one volume per illumination side</text>
+  <text x="40" y="40" class="fn">load_tile_volume() → load_raw_volume()  ·  read-only memmap</text>
+</g>
+<path d="M346,358 L346,378" class="ln"/>
+
+<!-- step 2 -->
+<g transform="translate(66,378)">
+  <rect x="0" y="0" width="560" height="66" class="opt"/>
+  <circle cx="20" cy="33" r="11" fill="#c0392b"/><text x="20" y="37" class="num" text-anchor="middle">2</text>
+  <text x="40" y="22" class="t">Destripe — quality (per side, native res)</text>
+  <text x="40" y="39" class="fn">destripe_volume(in_place=True) → _pystripe_core.filter_streaks()</text>
+  <text x="40" y="55" class="n">axis-fixed filter → must run BEFORE orientation, per side BEFORE fusion</text>
+</g>
+<path d="M346,444 L346,464" class="ln"/>
+
+<!-- step 3 -->
+<g transform="translate(66,464)">
+  <rect x="0" y="0" width="560" height="54" class="opt"/>
+  <circle cx="20" cy="27" r="11" fill="#5a6472"/><text x="20" y="31" class="num" text-anchor="middle">3</text>
+  <text x="40" y="23" class="t">Fuse illumination sides  <tspan class="n">(skipped if kept separate)</tspan></text>
+  <text x="40" y="40" class="fn">fuse_illumination_sides(method = max | mean | leonardo)</text>
+</g>
+<path d="M346,518 L346,538" class="ln"/>
+
+<!-- step 4 -->
+<g transform="translate(66,538)">
+  <rect x="0" y="0" width="560" height="54" class="opt"/>
+  <circle cx="20" cy="27" r="11" fill="#5a6472"/><text x="20" y="31" class="num" text-anchor="middle">4</text>
+  <text x="40" y="23" class="t">Flat-field correction</text>
+  <text x="40" y="40" class="fn">_apply_flatfield_volume()  ·  BaSiCPy, isolated env</text>
+</g>
+<path d="M346,592 L346,612" class="ln"/>
+
+<!-- step 5 -->
+<g transform="translate(66,612)">
+  <rect x="0" y="0" width="560" height="54" class="fut"/>
+  <circle cx="20" cy="27" r="11" fill="#9a9a9a"/><text x="20" y="31" class="num" text-anchor="middle">5</text>
+  <text x="40" y="23" class="t" fill="#6b7480">Depth attenuation  <tspan class="n">— backend only, no GUI</tspan></text>
+  <text x="40" y="40" class="fn">correct_depth_attenuation()  ·  geometry-unaware; delete or redesign</text>
+</g>
+<path d="M346,666 L346,686" class="ln"/>
+
+<!-- step 6 -->
+<g transform="translate(66,686)">
+  <rect x="0" y="0" width="560" height="54" class="opt"/>
+  <circle cx="20" cy="27" r="11" fill="#c0392b"/><text x="20" y="31" class="num" text-anchor="middle">6</text>
+  <text x="40" y="23" class="t">Deconvolution — quality (native res)</text>
+  <text x="40" y="40" class="fn">_deconvolve_tile()  ·  GPU Richardson-Lucy</text>
+</g>
+
+<!-- the downsample divider -->
+<path d="M626,713 L700,713" class="ln"/>
+<g transform="translate(700,686)">
+  <rect x="0" y="0" width="270" height="54" class="opt"/>
+  <circle cx="20" cy="27" r="11" fill="#1f6f8b"/><text x="20" y="31" class="num" text-anchor="middle">7</text>
+  <text x="40" y="23" class="t">Downsample</text>
+  <text x="40" y="40" class="fn">downsample_volume(xy, z)</text>
+</g>
+
+<text x="66" y="762" class="lbl" fill="#a05252">↑ quality variants: correct, expensive — the blur/stripe is removed where it was formed</text>
+
+<!-- fast variants, right column -->
+<g transform="translate(700,304)">
+  <rect x="0" y="0" width="610" height="356" fill="#fff" stroke="#c6ccd6" stroke-dasharray="4 3" rx="6"/>
+  <text x="18" y="26" class="h">The same two steps, after downsample</text>
+  <text x="18" y="46" class="n">Why both exist: this is a speed/quality trade, not a different algorithm.</text>
+
+  <g transform="translate(18,64)">
+    <rect x="0" y="0" width="574" height="60" class="opt"/>
+    <circle cx="20" cy="30" r="11" fill="#c0392b"/><text x="20" y="34" class="num" text-anchor="middle">8</text>
+    <text x="40" y="24" class="t">Destripe — fast</text>
+    <text x="40" y="41" class="fn">destripe_volume(in_place=True)  ·  gated by destripe_fast</text>
+    <text x="40" y="55" class="n">level auto-clamps to what the smaller frame supports (else all boundary effects)</text>
+  </g>
+
+  <g transform="translate(18,136)">
+    <rect x="0" y="0" width="574" height="60" class="opt"/>
+    <circle cx="20" cy="30" r="11" fill="#c0392b"/><text x="20" y="34" class="num" text-anchor="middle">9</text>
+    <text x="40" y="24" class="t">Deconvolution — fast</text>
+    <text x="40" y="41" class="fn">_deconvolve_tile()  ·  gated by deconvolution_fast</text>
+    <text x="40" y="55" class="n">cheaper (fewer voxels, smaller PSF); the downsample already mixed the blur</text>
+  </g>
+
+  <rect x="18" y="210" width="574" height="128" fill="#fff8e6" stroke="#e8d08a" rx="5"/>
+  <text x="34" y="232" class="lbl" fill="#7a6320">Ordering rules that are NOT free to change</text>
+  <text x="34" y="252" class="n">• Destripe before orientation — the filter only removes horizontal stripes, and</text>
+  <text x="34" y="268" class="n">   the per-tile rot/flip swaps which axis they run along (the v0.9.5 silent no-op).</text>
+  <text x="34" y="286" class="n">• Destripe per side before fusion — fusing first mixes two stripe patterns.</text>
+  <text x="34" y="304" class="n">• Flat-field after fusion, before downsample — it corrects the fused optics profile.</text>
+  <text x="34" y="322" class="n">• Orientation per tile, never per mosaic — rotating the finished mosaic cannot</text>
+</g>
+<text x="736" y="644" class="n">   make tiles connect that were never aligned (the v0.8.13 finding).</text>
+
+<!-- step 10, orientation: frame change -->
+<path d="M835,740 L835,782" class="ln"/>
+<rect x="50" y="782" width="1260" height="66" fill="#e8f2ea" opacity="0.6" rx="5"/>
+<g transform="translate(400,790)">
+  <rect x="0" y="0" width="560" height="50" class="box"/>
+  <circle cx="20" cy="25" r="11" fill="#2e7d4f"/><text x="20" y="29" class="num" text-anchor="middle">10</text>
+  <text x="40" y="21" class="t">Per-tile orientation — camera axes → stage axes</text>
+  <text x="40" y="38" class="fn">MosaicOrientation.from_name(tile_orientation).apply_volume_xy()</text>
+</g>
+<text x="1296" y="800" class="lbl" text-anchor="end" fill="#42774f">STAGE FRAME →</text>
+<text x="80" y="820" class="n">stride tricks (views),</text>
+<text x="80" y="836" class="n">not contiguous copies</text>
+
+<text x="50" y="884" class="lbl">Execution mode is orthogonal — it changes where tiles LIVE, never what is done to them:</text>
+<g transform="translate(50,892)">
+  <rect x="0" y="0" width="620" height="22" fill="#f0f3f8" stroke="#c6ccd6" rx="4"/>
+  <text x="12" y="16" class="n">in-memory: all preprocessed tiles held in RAM  ·  streaming: each spills to a per-tile memmap in .stitch_tmp/</text>
+</g>
+<g transform="translate(690,892)">
+  <rect x="0" y="0" width="620" height="22" fill="#f0f3f8" stroke="#c6ccd6" rx="4"/>
+  <text x="12" y="16" class="n">split_illumination forces streaming — the split path exists only in the streaming fuse loop</text>
+</g>
+
+<path d="M680,920 L680,948" class="ln"/>
+
+<!-- ============ MOSAIC CHAIN ============ -->
+<rect x="34" y="958" width="1292" height="322" fill="#fff" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<rect x="34" y="958" width="1292" height="34" fill="#eef1f6" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<rect x="34" y="982" width="1292" height="10" fill="#eef1f6"/>
+<text x="50" y="981" class="h">3 · Mosaic chain — once per output channel</text>
+<text x="430" y="981" class="fn">_fuse_channels_streaming() / _load_and_preprocess() → _fuse_channel()</text>
+
+<g transform="translate(50,1006)">
+  <rect x="0" y="0" width="300" height="62" class="opt"/>
+  <circle cx="20" cy="31" r="11" fill="#5a6472"/><text x="20" y="35" class="num" text-anchor="middle">11</text>
+  <text x="40" y="22" class="t">Registration</text>
+  <text x="40" y="39" class="fn">_register_tiles()  ·  phase correlation</text>
+  <text x="40" y="55" class="n">off → stage positions from metadata</text>
+</g>
+<path d="M350,1037 L378,1037" class="ln"/>
+
+<g transform="translate(378,1006)">
+  <rect x="0" y="0" width="300" height="62" class="opt"/>
+  <circle cx="20" cy="31" r="11" fill="#7b4397"/><text x="20" y="35" class="num" text-anchor="middle">12</text>
+  <text x="40" y="22" class="t">Multi-view rotation placement</text>
+  <text x="40" y="39" class="fn">_tile_metadata_affine() → _rotation_affine_zyx()</text>
+  <text x="40" y="55" class="n">Multi-View tab only · rig validation pending</text>
+</g>
+<path d="M678,1037 L706,1037" class="ln"/>
+
+<g transform="translate(706,1006)">
+  <rect x="0" y="0" width="300" height="62" class="opt"/>
+  <circle cx="20" cy="31" r="11" fill="#5a6472"/><text x="20" y="35" class="num" text-anchor="middle">13</text>
+  <text x="40" y="22" class="t">Border QC  <tspan class="n">(diagnostic only)</tspan></text>
+  <text x="40" y="39" class="fn">_run_border_qc_streaming()</text>
+  <text x="40" y="55" class="n">its spill is reused as the first output unit</text>
+</g>
+<path d="M1006,1037 L1034,1037" class="ln"/>
+
+<g transform="translate(1034,1006)">
+  <rect x="0" y="0" width="276" height="62" class="box"/>
+  <circle cx="20" cy="31" r="11" fill="#1f6f8b"/><text x="20" y="35" class="num" text-anchor="middle">14</text>
+  <text x="40" y="22" class="t">Tile-overlap fusion</text>
+  <text x="40" y="39" class="fn">_fuse_channel()  ·  multiview-stitcher</text>
+  <text x="40" y="55" class="n">max | blend | brightest  (+ content-based)</text>
+</g>
+
+<path d="M1172,1068 L1172,1092" class="ln"/>
+<g transform="translate(1034,1092)">
+  <rect x="0" y="0" width="276" height="50" class="opt"/>
+  <circle cx="20" cy="25" r="11" fill="#5a6472"/><text x="20" y="29" class="num" text-anchor="middle">15</text>
+  <text x="40" y="21" class="t">Background zeroing</text>
+  <text x="40" y="38" class="fn">applied inside the dask graph</text>
+</g>
+<path d="M1172,1142 L1172,1166" class="ln"/>
+<g transform="translate(1034,1166)">
+  <rect x="0" y="0" width="276" height="50" class="box"/>
+  <circle cx="20" cy="25" r="11" fill="#2e7d4f"/><text x="20" y="29" class="num" text-anchor="middle">16</text>
+  <text x="40" y="21" class="t">Write + pyramid</text>
+  <text x="40" y="38" class="fn">OME-Zarr · OME-TIFF · .ims · .ozx</text>
+</g>
+
+<!-- confusion callout -->
+<rect x="50" y="1092" width="960" height="124" fill="#fdeaea" stroke="#e0a5a5" rx="5"/>
+<text x="66" y="1114" class="lbl" fill="#8c3b3b">Two controls that are constantly confused — they are not the same thing</text>
+<text x="66" y="1136" class="t">illumination_fusion</text><text x="240" y="1136" class="n">combines the LEFT/RIGHT light-sheet paths of ONE tile</text>
+<text x="66" y="1152" class="fn">max | mean | leonardo — step 3, per tile, raw camera frame</text>
+<text x="66" y="1178" class="t">tile_overlap_fusion</text><text x="240" y="1178" class="n">combines ADJACENT TILES where they overlap</text>
+<text x="66" y="1194" class="fn">max | blend | brightest — step 14, per mosaic, stage frame</text>
+
+<!-- ============ PASSES + PERF ============ -->
+<rect x="34" y="1296" width="636" height="180" fill="#fff" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<text x="50" y="1322" class="h">4 · Passes over every tile</text>
+<text x="50" y="1342" class="n">The biggest driver of runtime. One pass per output unit, plus registration/QC.</text>
+<text x="50" y="1368" class="n">Registration on, sides fused</text><text x="600" y="1368" class="t" text-anchor="end">1</text>
+<text x="50" y="1390" class="n">Registration skipped, QC off</text><text x="600" y="1390" class="t" text-anchor="end">1</text>
+<text x="50" y="1412" class="n">Registration skipped, QC on, sides fused</text><text x="600" y="1412" class="t" text-anchor="end">1</text>
+<text x="50" y="1434" class="n">Registration skipped, QC on, sides SEPARATE</text><text x="600" y="1434" class="t" text-anchor="end">2</text>
+<text x="50" y="1458" class="n" fill="#a05252">before v0.9.15 — QC's fused spill matched no unit, discarded</text><text x="600" y="1458" class="t" text-anchor="end" fill="#a05252">3</text>
+
+<rect x="690" y="1296" width="636" height="180" fill="#fff" stroke="#aab2be" stroke-width="1.4" rx="7"/>
+<text x="706" y="1322" class="h">5 · Performance — measured, not assumed</text>
+<text x="706" y="1346" class="n">Destriping is ~97% of per-tile preprocessing (98 tiles, 1600 planes, 1024²).</text>
+<text x="706" y="1368" class="n">It parallelises to only ~1.5×, flat past two workers, processes no better</text>
+<text x="706" y="1384" class="n">than threads — allocation-bound, not CPU-bound.</text>
+<text x="706" y="1408" class="n" fill="#a05252">So running tiles CONCURRENTLY makes it slower, not faster:</text>
+<text x="706" y="1428" class="fn">1 tile × 24 threads = 25.6 planes/s   ·   4 tiles × 6 threads = 8.4 total</text>
+<text x="706" y="1452" class="n">Since v0.9.13 _pick_preprocess_workers() returns 1 when destriping is on.</text>
+<text x="706" y="1468" class="n">Judge speed by the AGGREGATE throughput line, never the per-tile rate.</text>
+
+</svg>
