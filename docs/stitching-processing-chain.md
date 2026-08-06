@@ -1,6 +1,6 @@
 # Stitching processing chain — order of operations
 
-**Status:** current as of flamingo-stitcher v0.9.15 (2026-08-06).
+**Status:** current as of flamingo-stitcher v0.9.17 (2026-08-06).
 **Companion diagram:** [`stitching-processing-chain.svg`](stitching-processing-chain.svg)
 This document covers **ordering only**: what runs when, and why the order is what it is.
 
@@ -178,7 +178,7 @@ throughput line, never the per-tile rate.
 | Tile-overlap fusion | `tile_overlap_fusion` | Shipped |
 | Content-based blending | `content_based_fusion` | Shipped |
 | Background zeroing | `background_zero_enabled` | Shipped |
-| Border QC | `border_qc_enabled` | Shipped (diagnostic only) |
+| Border QC | `border_qc_enabled` | Shipped (diagnostic only). Its seam-alignment search is bounded by `border_qc_max_shift_px` (default 8); a shift AT the limit is a floor, not a measurement, and the report says so since v0.9.17 |
 | Deconvolution | `deconvolution_enabled` | Shipped, GPU Richardson-Lucy |
 | Multi-view rotation | `multiview_fusion` | Shipped, **rig validation pending** |
 | Depth attenuation | `depth_attenuation` | **Backend + CLI only — no GUI.** Removed 2026-04-23 as geometry-unaware (wrong axis for TSPIM). Decide: delete or redesign. |
