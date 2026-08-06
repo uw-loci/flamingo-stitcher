@@ -288,3 +288,85 @@ def test_find_neighbor_pairs_skips_gap():
     xpairs = [(i, j) for i, j, ax in pairs if ax == "x"]
     assert (0, 1) in xpairs
     assert (1, 2) not in xpairs  # 2.0 gap > 1.5*pitch
+
+
+# --------------------------------------------------------------------------- #
+# Clamped alignment shifts must be reported as a floor, not a measurement.
+#
+# A 98-tile run reported "aligned shift: ds=8" on 57% of its flagged seams.
+# That 8 was the search half-width (min(24, max(8, ceil(6/2.095), 8)) == 8),
+# and _phase_corr_int_shift np.clip()s to it — so those seams were misaligned
+# by AT LEAST 16.8 um by an amount the QC never measured, while the report
+# read like a tidy small offset.
+# --------------------------------------------------------------------------- #
+import numpy as _np  # noqa: E402
+
+from flamingo_stitcher import border_qc as _bq  # noqa: E402
+
+
+def _shifted_pair(shift, n=64):
+    rng = _np.random.default_rng(3)
+    a = rng.random((n, n)).astype(_np.float32)
+    b = _np.roll(a, shift, axis=1)
+    return a, b
+
+
+def test_shift_inside_the_window_is_not_flagged_as_clamped():
+    a, b = _shifted_pair(3)
+
+    d0, d1, clamped = _bq._phase_corr_int_shift(a, b, max_shift=8)
+
+    assert clamped is False
+    assert abs(d1) == 3
+
+
+def test_a_shift_beyond_the_window_reports_clamped():
+    a, b = _shifted_pair(20)
+
+    d0, d1, clamped = _bq._phase_corr_int_shift(a, b, max_shift=8)
+
+    assert clamped is True
+    assert abs(d1) == 8  # the limit, not the real 20
+
+
+def test_the_clamped_value_is_the_limit_not_the_truth():
+    """The whole point: 8 means '>= 8', and only the flag says so."""
+    for true_shift in (9, 15, 30):
+        _, d1, clamped = _bq._phase_corr_int_shift(*_shifted_pair(true_shift), 8)
+        assert clamped is True
+        assert abs(d1) == 8 < true_shift
+
+
+def test_widening_the_search_measures_what_the_narrow_one_clamped():
+    a, b = _shifted_pair(20)
+
+    _, narrow, narrow_clamped = _bq._phase_corr_int_shift(a, b, max_shift=8)
+    _, wide, wide_clamped = _bq._phase_corr_int_shift(a, b, max_shift=28)
+
+    assert narrow_clamped and abs(narrow) == 8
+    assert not wide_clamped and abs(wide) == 20
+
+
+def test_degenerate_inputs_still_return_three_values():
+    z = _np.zeros((8, 8), dtype=_np.float32)
+
+    assert _bq._phase_corr_int_shift(z, z, 8) == (0, 0, False)
+    assert _bq._phase_corr_int_shift(z, _np.zeros((4, 4), _np.float32), 8) == (
+        0, 0, False,
+    )
+
+
+def test_an_explicit_max_shift_is_not_capped_by_the_auto_ceiling():
+    """--border-qc-max-shift must be able to exceed the auto min(24, ...)."""
+    import math
+
+    px = 2.095
+    quant = int(math.ceil(6.0 / px))
+
+    def resolve(requested):
+        if int(requested) > 8:
+            return int(requested)
+        return int(min(24, max(requested, quant, 8)))
+
+    assert resolve(8) == 8      # the default this run used
+    assert resolve(40) == 40    # honoured, not clipped to 24

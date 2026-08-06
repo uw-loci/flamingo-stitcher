@@ -770,6 +770,11 @@ class StitchingConfig:
     border_qc_include_z_seams: bool = False  # niche: Z-tiled mosaics
     border_qc_json: bool = False  # also emit a machine-readable JSON twin
     border_qc_alpha: float = 4.0  # step vs local-gradient ratio
+    # Half-width of the seam alignment search, in EFFECTIVE (post-downsample)
+    # pixels. 0 = auto (the historical 8 px floor, widened for coarse pixels).
+    # Raise it when the report says shifts are hitting the limit — at 8 px a
+    # badly placed mosaic reports a tidy "ds=8" that is really ">=8, unknown".
+    border_qc_max_shift_px: int = 0
     border_qc_beta: float = 3.0  # step vs noise floor
     border_qc_min_component_px: int = 10  # drop flagged blobs smaller than this
     border_qc_z_stride: int = 1  # subsample Z in full mode when huge
@@ -3537,6 +3542,11 @@ class StitchingPipeline:
         return border_qc.BorderQCParams(
             mode=mode,
             alpha=float(self.config.border_qc_alpha),
+            **(
+                {"max_refine_shift_px": int(self.config.border_qc_max_shift_px)}
+                if int(getattr(self.config, "border_qc_max_shift_px", 0) or 0) > 0
+                else {}
+            ),
             beta=float(self.config.border_qc_beta),
             min_component_px=int(self.config.border_qc_min_component_px),
             z_stride=max(1, int(self.config.border_qc_z_stride)),

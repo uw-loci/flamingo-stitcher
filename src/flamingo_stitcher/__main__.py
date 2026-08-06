@@ -134,6 +134,17 @@ def main():
         help="Max parallel destripe threads (default: auto based on available memory)",
     )
     preproc_group.add_argument(
+        "--border-qc-max-shift",
+        type=int,
+        default=None,
+        help=(
+            "Half-width of the border-QC seam alignment search, in effective "
+            "pixels (default 8). Raise it when the QC report says shifts are "
+            "hitting the search limit — at the limit the reported offset is a "
+            "floor, not a measurement."
+        ),
+    )
+    preproc_group.add_argument(
         "--preprocess-workers",
         type=int,
         default=None,
@@ -513,6 +524,9 @@ def main():
         destripe=args.destripe,
         destripe_fast=args.destripe_fast,
         destripe_workers=args.destripe_workers,
+        border_qc_max_shift_px=(
+            0 if args.border_qc_max_shift is None else int(args.border_qc_max_shift)
+        ),
         preprocess_workers=(
             0 if args.preprocess_workers is None else int(args.preprocess_workers)
         ),

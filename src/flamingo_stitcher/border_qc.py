@@ -81,6 +81,9 @@ class BorderStepResult:
     n_samples_evaluated: int = 0
     largest_component_px: int = 0
     used_shift: Tuple[int, int] = (0, 0)
+    # True when used_shift hit the search limit: the real misalignment is at
+    # least this large and was NOT measured.
+    shift_clamped: bool = False
     note: str = ""
 
 
@@ -121,17 +124,23 @@ def _moveaxis_last(vol, dim):
 
 
 def _phase_corr_int_shift(a2d, b2d, max_shift):
-    """Integer (d0, d1) shift aligning ``b2d`` onto ``a2d`` by phase
-    correlation. Returns (0, 0) if scipy is unavailable or the inputs are
-    degenerate. Result is clipped to ``±max_shift`` on each axis."""
+    """Integer (d0, d1, clamped) shift aligning ``b2d`` onto ``a2d``.
+
+    ``clamped`` is True when the peak landed at (or beyond) ``±max_shift`` on
+    either axis, i.e. the returned number is the SEARCH LIMIT and the true
+    misalignment is at least that large — not a measurement. Reporting a
+    clamped value as if it were measured is how a mosaic misaligned by an
+    unknown amount produced a tidy-looking "aligned shift: ds=8" for 57% of
+    its flagged seams.
+    """
     if a2d.shape != b2d.shape or a2d.size == 0:
-        return (0, 0)
+        return (0, 0, False)
     a = np.asarray(a2d, dtype=np.float64)
     b = np.asarray(b2d, dtype=np.float64)
     a = a - a.mean()
     b = b - b.mean()
     if not np.any(a) or not np.any(b):
-        return (0, 0)
+        return (0, 0, False)
     axes = tuple(range(a.ndim))
     fa = np.fft.rfftn(a, axes=axes)
     fb = np.fft.rfftn(b, axes=axes)
@@ -141,11 +150,14 @@ def _phase_corr_int_shift(a2d, b2d, max_shift):
     corr = np.fft.irfftn(r / mag, s=a.shape, axes=axes)
     peak = np.unravel_index(int(np.argmax(corr)), corr.shape)
     shifts = []
+    clamped = False
     for p, n in zip(peak, a.shape):
         s = p if p <= n // 2 else p - n
+        if abs(s) >= max_shift:
+            clamped = True
         s = int(np.clip(s, -max_shift, max_shift))
         shifts.append(s)
-    return (shifts[0], shifts[1])
+    return (shifts[0], shifts[1], clamped)
 
 
 def _refine_overlap_width(a_border, b_border, w0, search):
@@ -236,6 +248,7 @@ def detect_border_steps(
 
     L = a_slab.shape[-1]
     dz = ds = 0
+    shift_clamped = False
     if abutting:
         a_face = a_slab[..., -1]  # (P0, P1)
         b_face = b_slab[..., 0]
@@ -256,7 +269,7 @@ def detect_border_steps(
         if p.refine_shift and _ndi is not None:
             a_prof = a_ov.mean(axis=-1)  # (P0, P1)
             b_prof = b_ov.mean(axis=-1)
-            dz, ds = _phase_corr_int_shift(a_prof, b_prof, search)
+            dz, ds, shift_clamped = _phase_corr_int_shift(a_prof, b_prof, search)
             if dz or ds:
                 b_ov = np.roll(b_ov, shift=(dz, ds), axis=(0, 1))
         kk = max(1, int(round(W * p.k_frac)))
@@ -326,6 +339,7 @@ def detect_border_steps(
         n_samples_evaluated=n_valid,
         largest_component_px=largest,
         used_shift=(int(dz), int(ds)),
+        shift_clamped=bool(shift_clamped),
         note=note,
     )
 
@@ -485,7 +499,12 @@ def run_border_qc(
     # geometry-derived overlap can be several px off — widen the alignment
     # search to cover that quantization (bigger at fine effective pixel sizes).
     quant_px = int(math.ceil(6.0 / max(pixel_size_um, 1e-6)))
-    search_px = int(min(24, max(params.max_refine_shift_px, quant_px, 8)))
+    # An explicit request (> the 8 px default) is honoured as-is; the min(24,…)
+    # cap only bounds the AUTO widening for fine pixel sizes.
+    if int(params.max_refine_shift_px) > 8:
+        search_px = int(params.max_refine_shift_px)
+    else:
+        search_px = int(min(24, max(params.max_refine_shift_px, quant_px, 8)))
     pair_params = replace(params, max_refine_shift_px=search_px)
     for (ia, ib, axis) in pairs:
         if cancelled_fn is not None and cancelled_fn():
@@ -574,6 +593,25 @@ def format_report_text(report: BorderQCReport, *, acquisition: str = "") -> str:
         f"Elapsed: {report.elapsed_s:.1f} s"
     )
     lines.append(" (Intra-tile illumination seams are not analyzed — tile-to-tile borders only.)")
+    # Headline the clamp count. A run where most shifts hit the search limit is
+    # not "slightly misaligned by 8 px" — it is misaligned by an unknown amount
+    # the QC could not measure, and every number below understates it.
+    _flagged = [pr.result for pr in report.pairs if pr.result.flagged]
+    _with_shift = [r for r in _flagged if r.used_shift != (0, 0)]
+    _clamped = [r for r in _with_shift if r.shift_clamped]
+    if _clamped:
+        _px = s.get("pixel_size_um_effective", 0) or 0
+        lines.append(
+            f" ** {len(_clamped)} of {len(_with_shift)} measured shifts hit the "
+            f"+/-{report.params.max_refine_shift_px} px search limit "
+            f"(+/-{report.params.max_refine_shift_px * _px:.1f} um). Those seams are "
+            "misaligned by AT LEAST that much — the true offset was not measured."
+        )
+        lines.append(
+            "    Raise border_qc_max_shift_px (or --border-qc-max-shift) to measure it. "
+            "A large clamped fraction points at a systematic placement error "
+            "(pixel size, overlap, or tile order), not random jitter."
+        )
     if s.get("downsample_xy", 1) and s.get("downsample_xy", 1) > 2:
         lines.append(
             f" NOTE: downsample_xy={s.get('downsample_xy')} softens single-pixel steps; "
@@ -621,7 +659,10 @@ def format_report_text(report: BorderQCReport, *, acquisition: str = "") -> str:
                 f"       severity: {r.median_step_counts:.0f} counts   overlap: {ov}"
             )
         if r.used_shift != (0, 0):
-            lines.append(f"       aligned shift: (dz={r.used_shift[0]}, ds={r.used_shift[1]})")
+            _sh = f"       aligned shift: (dz={r.used_shift[0]}, ds={r.used_shift[1]})"
+            if r.shift_clamped:
+                _sh += "   ** AT SEARCH LIMIT — true offset is LARGER, unmeasured **"
+            lines.append(_sh)
     lines.append("=" * 71)
     return "\n".join(lines)
 
@@ -655,6 +696,7 @@ def report_to_json(report: BorderQCReport, *, acquisition: str = "") -> Dict[str
                 "max_step_counts": pr.result.max_step_counts,
                 "n_samples_evaluated": pr.result.n_samples_evaluated,
                 "used_shift": list(pr.result.used_shift),
+                "shift_clamped": bool(pr.result.shift_clamped),
                 "note": pr.result.note,
             }
             for pr in report.pairs
