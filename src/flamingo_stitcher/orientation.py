@@ -452,6 +452,7 @@ def _load_tile_mips(
     pixel_size_um: Optional[float],
     channel: Optional[int],
     z_range: Optional[Tuple[float, float]],
+    illum_side: Optional[int] = None,
 ) -> "Tuple[List[Tuple[float, float, np.ndarray, str]], float]":
     """Read each tile's MIP once: ``([(x_mm, y_mm, mip, label), ...], pixel_um)``."""
     from flamingo_stitcher.pipeline import (  # lazy: avoid import cycle
@@ -472,7 +473,7 @@ def _load_tile_mips(
 
     loaded: List[Tuple[float, float, np.ndarray, str]] = []
     for t in tiles:
-        mip = _tile_mip(t, channel, z_range)
+        mip = _tile_mip(t, channel, z_range, illum_side)
         if mip is None:
             continue
         loaded.append((float(t.x_mm), float(t.y_mm), mip, _tile_label(t)))
@@ -554,6 +555,7 @@ def orientation_previews(
     label_tiles: bool = True,
     reverse_x: bool = False,
     reverse_y: bool = False,
+    illum_side: Optional[int] = None,
 ) -> "Dict[str, np.ndarray]":
     """Build one mosaic per per-tile orientation (8), under the given tile order.
 
@@ -564,8 +566,15 @@ def orientation_previews(
     sign control) — pick the pixel orientation AND the order that together make
     the tissue continuous across the seams. Tiles are read once, composited
     eight times.
+
+    ``channel`` / ``illum_side`` of None fall back to the lowest index present.
+    Both used to be unreachable from the GUI, so a dual-sided acquisition was
+    always previewed from side 0 with nothing saying so — and orientation is a
+    per-side question.
     """
-    loaded, px = _load_tile_mips(acquisition_dir, pixel_size_um, channel, z_range)
+    loaded, px = _load_tile_mips(
+        acquisition_dir, pixel_size_um, channel, z_range, illum_side
+    )
     if not loaded:
         return {}
     return {
@@ -590,6 +599,7 @@ def _tile_mip(
     tile,
     channel: Optional[int],
     z_range: Optional[Tuple[float, float]] = None,
+    illum_side: Optional[int] = None,
 ) -> Optional[np.ndarray]:
     """Load a tile's max-projection.
 
@@ -597,7 +607,7 @@ def _tile_mip(
     sub-range: project just those planes from the raw/TIFF stack, so structure
     confined to part of the stack isn't buried by the whole-stack projection.
     """
-    raw = _representative_raw(tile, channel)
+    raw = _representative_raw(tile, channel, illum_side)
     if raw is None:
         return None
     if _is_full_range(z_range):
@@ -628,7 +638,18 @@ def _read_mip_companion(raw: Path) -> Optional[np.ndarray]:
     return None
 
 
-def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
+def _representative_raw(
+    tile, channel: Optional[int], illum_side: Optional[int] = None
+) -> Optional[Path]:
+    """The file to preview for this tile.
+
+    ``channel``/``illum_side`` of None fall back to the lowest index, which is
+    what this used to do unconditionally — so a dual-sided acquisition was
+    always previewed from side 0 with no way to see the other, and no
+    indication that a choice had been made. Orientation is a per-side
+    question: the two light paths can differ, and picking one silently is how
+    a hardcoded assumption survives.
+    """
     rf = getattr(tile, "raw_files", None) or {}
     if not rf:
         return None
@@ -638,7 +659,34 @@ def _representative_raw(tile, channel: Optional[int]) -> Optional[Path]:
         by_illum = rf[sorted(rf)[0]]
     if not by_illum:
         return None
+    if illum_side is not None and illum_side in by_illum:
+        return by_illum[illum_side]
     return by_illum[sorted(by_illum)[0]]
+
+
+def available_channels_and_sides(acquisition_dir: Path):
+    """``(channels, sides)`` present in an acquisition, for populating pickers."""
+    from flamingo_stitcher.pipeline import discover_flat_tiles, discover_tiles
+
+    tiles = []
+    for scan in (discover_tiles, discover_flat_tiles):
+        try:
+            tiles = scan(Path(acquisition_dir))
+        except Exception as e:  # noqa: BLE001 - try the other layout
+            logger.debug("%s failed: %s", scan.__name__, e)
+            continue
+        if tiles:
+            break
+    channels = sorted({c for t in tiles for c in (getattr(t, "raw_files", {}) or {})})
+    sides = sorted(
+        {
+            s
+            for t in tiles
+            for m in (getattr(t, "raw_files", {}) or {}).values()
+            for s in (m or {})
+        }
+    )
+    return channels, sides
 
 
 def has_orientation_preview_data(acquisition_dir: Path) -> bool:

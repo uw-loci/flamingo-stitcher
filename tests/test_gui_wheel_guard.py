@@ -197,3 +197,80 @@ def test_a_tile_with_no_metadata_does_not_raise():
     text = _describe([_Empty()])
 
     assert "illumination sides unknown" in text
+
+
+# --------------------------------------------------------------------------- #
+# Orientation preview was hardcoded to the lowest channel AND the lowest
+# illumination side, with nothing saying so — `_representative_raw` ended in
+# `by_illum[sorted(by_illum)[0]]` and the dialog never passed a channel. The
+# two light paths are separate images and can look different, so "which side
+# am I judging orientation from?" was unanswerable.
+# --------------------------------------------------------------------------- #
+class _OTile:
+    def __init__(self, raw_files):
+        self.raw_files = raw_files
+
+
+def test_representative_raw_defaults_to_the_lowest_side():
+    """Unchanged default — old callers must behave exactly as before."""
+    from flamingo_stitcher.orientation import _representative_raw
+
+    tile = _OTile({3: {0: "I0.raw", 1: "I1.raw"}})
+
+    assert _representative_raw(tile, 3) == "I0.raw"
+
+
+def test_representative_raw_honours_an_explicit_side():
+    from flamingo_stitcher.orientation import _representative_raw
+
+    tile = _OTile({3: {0: "I0.raw", 1: "I1.raw"}})
+
+    assert _representative_raw(tile, 3, 1) == "I1.raw"
+
+
+def test_an_absent_side_falls_back_rather_than_dropping_the_tile():
+    """A hole in the mosaic is worse than the other side."""
+    from flamingo_stitcher.orientation import _representative_raw
+
+    tile = _OTile({3: {0: "I0.raw"}})
+
+    assert _representative_raw(tile, 3, 7) == "I0.raw"
+
+
+def test_side_selection_works_for_a_single_sided_acquisition():
+    from flamingo_stitcher.orientation import _representative_raw
+
+    tile = _OTile({3: {0: "only.raw"}})
+
+    assert _representative_raw(tile, 3, 0) == "only.raw"
+
+
+def test_orientation_previews_accepts_a_side():
+    """The plumbing has to reach the public entry point, not stop halfway."""
+    import inspect
+
+    from flamingo_stitcher.orientation import orientation_previews
+
+    params = inspect.signature(orientation_previews).parameters
+    assert "illum_side" in params
+    assert params["illum_side"].default is None  # old behaviour by default
+
+
+def test_channels_and_sides_are_discoverable_for_the_pickers(tmp_path):
+    """The dialog needs the real lists, not a guess."""
+    import sys as _sys
+
+    from flamingo_stitcher import orientation as _o
+
+    fake = [_OTile({3: {0: "a", 1: "b"}}), _OTile({3: {0: "c", 1: "d"}})]
+    mod = _sys.modules["flamingo_stitcher.pipeline"]
+    old_disc, old_flat = mod.discover_tiles, mod.discover_flat_tiles
+    try:
+        mod.discover_tiles = lambda p: fake
+        mod.discover_flat_tiles = lambda p: []
+        channels, sides = _o.available_channels_and_sides(tmp_path)
+    finally:
+        mod.discover_tiles, mod.discover_flat_tiles = old_disc, old_flat
+
+    assert channels == [3]
+    assert sides == [0, 1]

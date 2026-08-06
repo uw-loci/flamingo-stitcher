@@ -13,6 +13,8 @@ separately.
 
 from __future__ import annotations
 
+import logging
+
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -34,6 +36,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from flamingo_stitcher.gui._wheel_guard import install_wheel_guard
+
+logger = logging.getLogger(__name__)
 
 from flamingo_stitcher.orientation import MosaicOrientation
 
@@ -72,13 +78,15 @@ class _PreviewBuildThread(QThread):
 
     def __init__(
         self, acq_path: Path, z_range=None, reverse_x=False, reverse_y=False,
-        parent=None,
+        parent=None, channel=None, illum_side=None,
     ) -> None:
         super().__init__(parent)
         self._acq_path = Path(acq_path)
         self._z_range = z_range
         self._reverse_x = reverse_x
         self._reverse_y = reverse_y
+        self._channel = channel
+        self._illum_side = illum_side
 
     def run(self) -> None:  # noqa: D401
         try:
@@ -97,6 +105,8 @@ class _PreviewBuildThread(QThread):
                 z_range=self._z_range,
                 reverse_x=self._reverse_x,
                 reverse_y=self._reverse_y,
+                channel=self._channel,
+                illum_side=self._illum_side,
             )
             if not previews:
                 self.failed.emit(
@@ -134,6 +144,10 @@ class OrientationPreviewDialog(QDialog):
         self._microscope_name: Optional[str] = None
         self._radio_group: Optional[QButtonGroup] = None
         self._build_ui()
+        # Populate BEFORE the first build so it uses the chosen source rather
+        # than silently defaulting to the lowest channel and side.
+        self._populate_source_pickers()
+        install_wheel_guard(self)
         self._start_build()
 
     def _build_ui(self) -> None:
@@ -148,6 +162,52 @@ class OrientationPreviewDialog(QDialog):
         self._progress = QProgressBar()
         self._progress.setRange(0, 0)  # indeterminate busy bar
         outer.addWidget(self._progress)
+
+        # Controls live ABOVE the panels. They change WHAT is being previewed,
+        # so burying them under a scroll area of eight images meant the tile
+        # order flips — the control most often needed alongside the panels —
+        # were the last thing anyone found.
+        top = QHBoxLayout()
+
+        top.addWidget(QLabel("Channel:"))
+        self._channel_combo = QComboBox()
+        self._channel_combo.setToolTip(
+            "Which acquired channel to preview. Orientation is the same for "
+            "all channels, but a dim one may not show whether tiles connect."
+        )
+        self._channel_combo.currentIndexChanged.connect(self._on_source_changed)
+        top.addWidget(self._channel_combo)
+
+        top.addWidget(QLabel("Illum. side:"))
+        self._illum_combo = QComboBox()
+        self._illum_combo.setToolTip(
+            "Which light path to preview. The two sides are separate images "
+            "and can look different; this used to be fixed at the lowest side "
+            "with nothing saying so."
+        )
+        self._illum_combo.currentIndexChanged.connect(self._on_source_changed)
+        top.addWidget(self._illum_combo)
+
+        top.addSpacing(16)
+
+        # Tile-ORDER reversal (stage-sign): flips the tile layout along an axis
+        # WITHOUT touching the tile pixels. Independent of the per-tile
+        # orientation panels — a system can need a per-tile flip in X but a
+        # tile-order reversal in Y.
+        self._rev_x_cb = QCheckBox("Reverse X order")
+        self._rev_x_cb.setToolTip(
+            "Lay tiles out X3 X2 X1 X0 instead of X0 X1 X2 X3 (stage X sign), "
+            "without flipping the images."
+        )
+        self._rev_x_cb.toggled.connect(self._on_reverse_toggled)
+        top.addWidget(self._rev_x_cb)
+        self._rev_y_cb = QCheckBox("Reverse Y order")
+        self._rev_y_cb.setToolTip("Reverse the tile order along stage Y.")
+        self._rev_y_cb.toggled.connect(self._on_reverse_toggled)
+        top.addWidget(self._rev_y_cb)
+
+        top.addStretch()
+        outer.addLayout(top)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -171,22 +231,6 @@ class OrientationPreviewDialog(QDialog):
         self._z_combo.currentIndexChanged.connect(self._on_z_changed)
         btn_row.addWidget(self._z_combo)
 
-        # Tile-ORDER reversal (stage-sign): flips the tile layout along an axis
-        # WITHOUT touching the tile pixels. Independent of the per-tile
-        # orientation panels — a system can need a per-tile flip in X but a tile-
-        # order reversal in Y.
-        self._rev_x_cb = QCheckBox("Reverse X order")
-        self._rev_x_cb.setToolTip(
-            "Lay tiles out X3 X2 X1 X0 instead of X0 X1 X2 X3 (stage X sign), "
-            "without flipping the images."
-        )
-        self._rev_x_cb.toggled.connect(self._on_reverse_toggled)
-        btn_row.addWidget(self._rev_x_cb)
-        self._rev_y_cb = QCheckBox("Reverse Y order")
-        self._rev_y_cb.setToolTip("Reverse the tile order along stage Y.")
-        self._rev_y_cb.toggled.connect(self._on_reverse_toggled)
-        btn_row.addWidget(self._rev_y_cb)
-
         self._rebuild_btn = QPushButton("Rebuild")
         self._rebuild_btn.setToolTip("Re-read the data and rebuild the preview")
         self._rebuild_btn.clicked.connect(self._start_build)
@@ -208,6 +252,31 @@ class OrientationPreviewDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         btn_row.addWidget(close_btn)
         outer.addLayout(btn_row)
+
+    def _populate_source_pickers(self) -> None:
+        """Fill Channel / Illum. side from what the acquisition actually holds."""
+        try:
+            from flamingo_stitcher.orientation import available_channels_and_sides
+
+            channels, sides = available_channels_and_sides(self._acq_path)
+        except Exception as e:  # noqa: BLE001 - pickers must not block the preview
+            logger.debug(f"Could not list channels/sides: {e!r}")
+            channels, sides = [], []
+
+        for combo, values, fmt in (
+            (self._channel_combo, channels, lambda v: f"C{v:02d}"),
+            (self._illum_combo, sides, lambda v: f"I{v}"),
+        ):
+            combo.blockSignals(True)
+            combo.clear()
+            for v in values:
+                combo.addItem(fmt(v), v)
+            combo.setEnabled(len(values) > 1)
+            combo.blockSignals(False)
+
+    def _on_source_changed(self, _index: int) -> None:
+        """Channel or illumination side changed — rebuild from that source."""
+        self._start_build()
 
     def _on_reverse_toggled(self, _checked: bool) -> None:
         self._reverse_x = self._rev_x_cb.isChecked()
@@ -232,7 +301,13 @@ class OrientationPreviewDialog(QDialog):
             "raw data (this reads image data, so it may take a moment)…"
         )
         self._thread = _PreviewBuildThread(
-            self._acq_path, self._z_range, self._reverse_x, self._reverse_y, self
+            self._acq_path,
+            self._z_range,
+            self._reverse_x,
+            self._reverse_y,
+            self,
+            channel=self._channel_combo.currentData(),
+            illum_side=self._illum_combo.currentData(),
         )
         self._thread.done.connect(self._on_done)
         self._thread.failed.connect(self._on_failed)
