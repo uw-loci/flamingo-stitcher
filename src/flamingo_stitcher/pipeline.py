@@ -6425,6 +6425,39 @@ class StitchingPipeline:
             "illumination_sides": all_sides,
             "angles_deg": all_angles,
             "partial_coverage": partial_coverage,
+            # --- World frame (v2.1) ---
+            # WITHOUT these the output is not self-describing: `origin_um` and
+            # the voxel grid live in a frame the tile placement chose, and a
+            # consumer cannot tell which. `reverse_x_tiles` NEGATES world X
+            # (see the translation_um construction in the fuse paths), so a
+            # mosaic spanning stage X 2.34–8.35 mm is written with
+            # origin_um.x = -8350 — a number a reader will happily mistake for
+            # a stage coordinate and place the volume mirrored and displaced.
+            # `tile_orientation` is the per-tile camera→stage transform, which
+            # fixes how the pixel axes relate to the stage axes.
+            "world_frame": {
+                "tile_orientation": str(
+                    getattr(self.config, "tile_orientation", "") or ""
+                ),
+                "reverse_x_tiles": bool(
+                    getattr(self.config, "reverse_x_tiles", False)
+                ),
+                "reverse_y_tiles": bool(
+                    getattr(self.config, "reverse_y_tiles", False)
+                ),
+                # True when world X/Y are the NEGATION of stage X/Y, i.e. a
+                # consumer must negate them back to recover stage coordinates.
+                "x_axis_negated": bool(
+                    getattr(self.config, "reverse_x_tiles", False)
+                ),
+                "y_axis_negated": bool(
+                    getattr(self.config, "reverse_y_tiles", False)
+                ),
+                # The rotation-stage angle the sample was physically at. Already
+                # present as `angles_deg`, repeated here so everything needed to
+                # place the volume is in one object.
+                "acquisition_angle_deg": (all_angles[0] if all_angles else 0.0),
+            },
             "tiles": tiles_meta,
             # Full processing settings used for this run, so the GUI's "Load
             # Configuration" can reproduce a setup that worked on another
