@@ -36,7 +36,13 @@ dependencies = [
     # that makes dozens of small tiles overlap one block, which the fuser then
     # stacks as float64 (e.g. 81 views × 64×1024×1024 = 40.5 GiB per block) —
     # a machine-killing OOM. 0.1.56 honours the 256px chunk we request.
-    "multiview-stitcher>=0.1.56,<0.2",
+    # 0.1.57 is a HARD floor for correctness, not just memory: every version
+    # through 0.1.56 writes zeros at fusion-block boundaries when a tile's
+    # translation is not a whole number of output voxels (the normal case),
+    # putting a regular grid of black one-voxel lines through the fused
+    # volume. See MIN_SAFE_MVS_VERSION in pipeline.py — the runtime check
+    # there must be kept in step with this pin.
+    "multiview-stitcher>=0.1.57,<0.2",
     # multiview-stitcher's registration (phase correlation + global optimization)
     # imports pandas but declares it only as an OPTIONAL dependency, so a default
     # install silently lacks it: registration then raises "Missing optional

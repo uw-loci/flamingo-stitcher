@@ -159,6 +159,64 @@ def _pkg_version(dist_name: str) -> str:
             return "?"
 
 
+# multiview-stitcher below this version writes ZEROS at every fusion-block
+# boundary whenever a tile's translation is not a whole number of output
+# voxels — which is the normal case, since stage positions are arbitrary
+# relative to the output grid. The result is a regular grid of black
+# one-voxel lines through the fused volume that reads like a tile-seam
+# artifact but tracks the dask chunk grid. Fixed upstream in 0.1.57.
+# Verified by reproduction: 0.1.44/0.1.48/0.1.49/0.1.52/0.1.56 all produce
+# the lines, 0.1.57/0.1.58/0.1.59 do not. Affects blend AND max fusion;
+# content-based weighting happens to mask it (it requests a 2*sigma_2 halo).
+MIN_SAFE_MVS_VERSION = (0, 1, 57)
+
+
+def _parse_version_tuple(text: str) -> Optional[Tuple[int, ...]]:
+    """Leading numeric components of a version string, or None.
+
+    ``0.1.57`` → ``(0, 1, 57)``; ``0.2.0rc1`` → ``(0, 2, 0)``. Returns None for
+    anything unparseable (``"?"``, a git hash) so callers can stay silent
+    rather than guess.
+    """
+    if not text:
+        return None
+    parts: List[int] = []
+    for chunk in str(text).split("."):
+        digits = ""
+        for ch in chunk:
+            if ch.isdigit():
+                digits += ch
+            else:
+                break
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts) if parts else None
+
+
+def check_multiview_stitcher_version(version: Optional[str] = None) -> List[str]:
+    """Warning lines when the installed multiview-stitcher corrupts output.
+
+    Returns [] when the version is new enough — or when it cannot be parsed,
+    since a false alarm on every run is worse than a missed one. See
+    ``MIN_SAFE_MVS_VERSION`` for what the old versions do.
+    """
+    raw = version if version is not None else _pkg_version("multiview-stitcher")
+    parsed = _parse_version_tuple(raw)
+    if parsed is None or parsed >= MIN_SAFE_MVS_VERSION:
+        return []
+    want = ".".join(str(p) for p in MIN_SAFE_MVS_VERSION)
+    return [
+        f"⚠ multiview-stitcher {raw} is TOO OLD and will corrupt this stitch: "
+        f"it writes black one-voxel lines across the fused volume at every "
+        f"fusion-block boundary (a regular grid that looks like tile seams). "
+        f"Upgrade to >= {want}:  pip install -U 'multiview-stitcher>={want}'",
+        f"  If this is a frozen build, it needs rebuilding — the installer "
+        f"pins >= {want}, so a bundle reporting {raw} was not built from the "
+        f"current pin.",
+    ]
+
+
 def environment_summary() -> List[str]:
     """Lines describing the running environment for the log header.
 
@@ -1742,6 +1800,11 @@ def _resolve_frame_size(
     return FRAME_WIDTH, FRAME_HEIGHT
 
 
+# Below this fraction of a frame, "overlap" is not usable: registration has no
+# shared content to correlate and the frame-edge falloff has nowhere to hide.
+MIN_USEFUL_TILE_OVERLAP = 0.03
+
+
 def _detect_tile_spacing_gaps(
     tiles: List["RawTileInfo"],
     frame_width: int,
@@ -1787,6 +1850,27 @@ def _detect_tile_spacing_gaps(
         # Overlapping/touching tiles have step <= coverage. Only warn on a clear
         # gap (>2% of a frame) so float noise / exact-touch don't false-positive.
         if median_step <= coverage * 1.02:
+            # ...but "not a gap" is not the same as "enough overlap". Tiles
+            # stepped at ~exactly one frame abut without overlapping, which
+            # leaves nothing to register on (phase correlation needs shared
+            # content) and no margin to hide each frame's edge falloff, so
+            # every seam shows the vignette step. It also means any stage
+            # drift becomes a real gap. This sits in the old check's blind
+            # spot: a 0.01% overlap passes the gap test silently.
+            overlap_frac = (coverage - median_step) / coverage
+            if overlap_frac < MIN_USEFUL_TILE_OVERLAP:
+                overlap_px = (coverage - median_step) * 1000.0 / pixel_size_um
+                warnings.append(
+                    f"{axis} tiles barely overlap: median {axis} step "
+                    f"{median_step:.4f} mm vs one frame's {axis} coverage "
+                    f"{coverage:.4f} mm — only {overlap_frac * 100:.2f}% "
+                    f"({overlap_px:.1f} px) of overlap. Tile registration "
+                    f"cannot work without shared content (the run will fall "
+                    f"back to stage positions), and with no overlap each "
+                    f"frame's edge falloff lands directly on the seam — "
+                    f"visible as a brightness step at every tile boundary. "
+                    f"Acquire with ~10% tile overlap."
+                )
             continue
         gap_mm = median_step - coverage
         gap_px = gap_mm * 1000.0 / pixel_size_um
@@ -3885,6 +3969,11 @@ class StitchingPipeline:
         self.logger.info(f"=== Stitching Pipeline Start ===")
         for _line in environment_summary():
             self.logger.info(_line)
+        # Loud, before anything expensive: an old multiview-stitcher silently
+        # writes black lines through the output, and finding that out after a
+        # 10-hour fuse is the worst possible time.
+        for _line in check_multiview_stitcher_version():
+            self.logger.warning(_line)
         self.logger.info(f"Input:  {acquisition_dir}")
         self.logger.info(f"Output: {output_path}")
 
@@ -4296,6 +4385,10 @@ class StitchingPipeline:
         self.logger.info(
             f"=== Pipeline complete in {elapsed:.1f}s === Output: {output_path}"
         )
+        # Repeat the version warning at the end: on a multi-hour run the header
+        # has long scrolled away, and this one means the output is corrupt.
+        for _line in check_multiview_stitcher_version():
+            self.logger.warning(_line)
         return output_path
 
     def run_preview(
