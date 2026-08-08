@@ -375,6 +375,35 @@ FOLDER_COORD_PATTERN = re.compile(r"X([-\d.]+)_Y([-\d.]+)")
 
 
 # ---------------------------------------------------------------------------
+# Fused-volume dtype conversion (shared by every fuse path)
+# ---------------------------------------------------------------------------
+def lazy_uint16(darr):
+    """Squeeze a fused SpatialImage's singleton dims and clamp it to uint16
+    **inside the dask graph**.
+
+    Every consumer of a fused array needs this, and it must stay lazy. Doing it
+    eagerly on the already-materialized volume —
+
+        vol = np.clip(vol, 0, 65535).astype(np.uint16)
+
+    — allocates a full-size clip temporary AND a full-size astype result while
+    the original is still referenced, so three copies of the fused volume are
+    live at once. That was a real +2x-output spike in the in-memory path (53 GB
+    on a 26 GB output) that no memory estimate modelled, and it bought nothing:
+    ``multiview_stitcher.fusion`` returns the fused array at ``sims[0].dtype``,
+    which is already uint16. Done lazily the same clamp costs one block.
+
+    Kept as one shared function so the in-memory, streaming and preview paths
+    cannot drift apart again.
+    """
+    import dask.array as _da
+
+    while darr.ndim > 3:
+        darr = darr[0]
+    return _da.clip(darr, 0, 65535).astype(np.uint16)
+
+
+# ---------------------------------------------------------------------------
 # Lazy memmap-backed dask array
 # ---------------------------------------------------------------------------
 def _read_memmap_slice(path, shape, dtype, slices):
@@ -1307,6 +1336,14 @@ def estimate_memory_usage(
         _fusion_coexist = float(
             get_stitching_value("memory", "fusion_coexist_factor", default=2.5)
         )
+        # Content-based blending keeps a longer chain of per-block buffers alive
+        # than plain blending (see the YAML for the term-by-term count against
+        # multiview_stitcher.weights.content_based), so it gets its own factor.
+        _fusion_coexist_cb = float(
+            get_stitching_value(
+                "memory", "fusion_coexist_factor_content_based", default=5.5
+            )
+        )
         # How many output blocks fuse concurrently (dask thread pool). Matches
         # the _pick_fuse_workers auto cap.
         _fusion_concurrency = int(
@@ -1324,6 +1361,7 @@ def estimate_memory_usage(
         _streaming_workers = 4
         _fusion_float_bytes = 8.0
         _fusion_coexist = 2.5
+        _fusion_coexist_cb = 5.5
         _fusion_concurrency = 4
         _deconv_working_factor = 4.0
 
@@ -1405,9 +1443,10 @@ def estimate_memory_usage(
     vz = _views_along(z_vals, chunk_z, px_per_mm_z)
     views_per_block = min(n_tiles, max(1, vx) * max(1, vy) * max(1, vz))
 
-    block_float_gb = (
-        _fusion_coexist * views_per_block * block_vox * _fusion_float_bytes
-    ) / (1024**3)
+    coexist = _fusion_coexist_cb if content_based else _fusion_coexist
+    block_float_gb = (coexist * views_per_block * block_vox * _fusion_float_bytes) / (
+        1024**3
+    )
     # Use the EFFECTIVE concurrent-block count: if the user pinned fuse_workers
     # (a first-class config field, clamped to 8 by _pick_fuse_workers), the
     # executor runs that many concurrent float64 blocks — model the same number
@@ -1453,8 +1492,21 @@ def estimate_memory_usage(
     # All channels' preprocessed tiles stay resident, plus the fusion working
     # set, plus the stacked output array and pyramid overhead during write.
     held_tiles_gb = (n_tiles * n_channels * ds_tile_vox * bpv) / (1024**3)
+    # Materialising one channel: dask's ``.compute()`` keeps every chunk result
+    # alive AND builds the concatenated full-size array from them, so the fuse
+    # phase peaks at 2x the channel, not 1x. With one channel that result IS the
+    # stacked output (``stacked = vol``, no copy); with several, the
+    # pre-allocated stacked array coexists with the channel being computed.
+    # Writing this out explicitly replaces a `max(pyramid, per_channel)` term
+    # that happened to equal 2x output at n_channels == 1 and silently
+    # under-counted every multi-channel run.
+    fused_materialize_gb = 2.0 * per_channel_gb
+    if n_channels > 1:
+        fused_materialize_gb += output_gb
+    # The write phase holds the stacked array plus the pyramid buffers instead.
+    write_phase_gb = output_gb + pyramid_overhead_gb
     in_memory_resident_gb = (
-        held_tiles_gb + fusion_gb + output_gb + max(pyramid_overhead_gb, per_channel_gb)
+        held_tiles_gb + fusion_gb + max(fused_materialize_gb, write_phase_gb)
     )
     in_memory_gb = max(in_memory_resident_gb, materialize_gb)
 
@@ -1510,6 +1562,12 @@ def estimate_memory_usage(
         "preprocess_gb": round(materialize_gb, 1),
         "preprocess_workers": int(pp_workers),
         "limited_by": limited_by,
+        # Peak of the in-memory fuse phase: the pre-allocated stacked array (if
+        # more than one channel) plus the two copies of the channel being
+        # computed that dask's .compute() holds at once. Returned so the figure
+        # is inspectable rather than buried in in_memory_gb.
+        "materialize_fused_gb": round(fused_materialize_gb, 2),
+        "held_tiles_gb": round(held_tiles_gb, 2),
     }
 
 
@@ -4096,6 +4154,7 @@ class StitchingPipeline:
         # it (then free ch0), and compute remaining channels directly into
         # their slice of the stacked array. Peak RAM = stacked + 1 channel
         # working set, NOT stacked + all channels.
+        import dask.array as da
         import dask.diagnostics
 
         channel_origins = []
@@ -4127,6 +4186,22 @@ class StitchingPipeline:
                 fuse_pct + 5,
                 f"Computing {describe_channel(ch_id)} into memory...",
             )
+            # Convert IN the graph (see lazy_uint16) — doing it after .compute()
+            # held three full-size copies of the fused volume at once.
+            darr = lazy_uint16(fused_sim.data)
+            # Background zeroing, in the graph, per chunk — the streaming path
+            # has always done this in its _finalize; the in-memory path silently
+            # ignored the setting, so the same acquisition came out different
+            # depending on which mode auto-select happened to pick.
+            if self.config.background_zero_enabled:
+                _bg = int(self.config.background_zero_thresholds.get(ch_id, 0))
+                if _bg > 0:
+                    self.logger.info(
+                        f"  {describe_channel(ch_id).capitalize()}: background "
+                        f"zeroing below {_bg}"
+                    )
+                    darr = da.where(darr > np.uint16(_bg), darr, np.uint16(0))
+
             # Bound the dask scheduler the same way the streaming path does.
             # multiview-stitcher fuses block-by-block, stacking every source
             # tile that overlaps a block as a float64 array at the block's
@@ -4134,7 +4209,7 @@ class StitchingPipeline:
             # blocks materialise at once — on a heavily-downsampled grid (small
             # tiles, many overlapping one block) that turned a "~10 GB" job into
             # a 190 GB OOM. Capping concurrency keeps peak ≈ workers × one block.
-            fuse_workers = self._pick_fuse_workers(fused_sim.data)
+            fuse_workers = self._pick_fuse_workers(darr)
             if fuse_workers <= 1:
                 scheduler_cfg: Dict[str, Any] = {"scheduler": "synchronous"}
                 scheduler_name = "synchronous"
@@ -4147,11 +4222,8 @@ class StitchingPipeline:
             )
             with dask.config.set(**scheduler_cfg):
                 with dask.diagnostics.ProgressBar():
-                    vol = np.asarray(fused_sim.data.compute())
-            # Squeeze singleton dims from SpatialImage
-            while vol.ndim > 3:
-                vol = vol[0]
-            vol = np.clip(vol, 0, 65535).astype(np.uint16)
+                    vol = np.asarray(darr.compute())
+            del darr
 
             if stacked is None:
                 # First channel — allocate the full stacked array
@@ -4359,10 +4431,7 @@ class StitchingPipeline:
                 fused_sim, _origin = self._fuse_channel(
                     tile_data, voxel_size_um, reg_params, transform_key
                 )
-                darr = fused_sim.data
-                while darr.ndim > 3:
-                    darr = darr[0]
-                darr = da.clip(darr, 0, 65535).astype(np.uint16)
+                darr = lazy_uint16(fused_sim.data)
 
                 fuse_workers = self._pick_fuse_workers(darr)
                 if fuse_workers <= 1:
@@ -4665,9 +4734,7 @@ class StitchingPipeline:
                 def _finalize(dk):
                     # Clip + cast to uint16 in the graph so float64 intermediates
                     # convert per-chunk; apply background zeroing if set.
-                    while dk.ndim > 3:
-                        dk = dk[0]
-                    dk = da.clip(dk, 0, 65535).astype(np.uint16)
+                    dk = lazy_uint16(dk)
                     if bg_threshold > 0:
                         dk = da.where(dk > np.uint16(bg_threshold), dk, np.uint16(0))
                     return dk

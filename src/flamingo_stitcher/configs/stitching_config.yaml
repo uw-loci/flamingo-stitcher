@@ -363,6 +363,21 @@ memory:
   # Coexistence factor: within a block the per-view list, the np.array-stacked
   # copy, and the blending/fusion weight arrays are live at once (~2.5×).
   fusion_coexist_factor: 2.5
+  # Content-based blending runs a longer buffer chain per block than plain
+  # cosine/max blending, so it gets its own factor. Counted from
+  # multiview_stitcher.weights.content_based (0.1.48), in units of
+  # views × block_vox × 8 B:
+  #   float64 stacked transformed views      1.0
+  #   float64 normalized blending weights    1.0
+  #   float32 astype copy of the views       0.5
+  #   float32 accumulated per-view weights   0.5
+  #   float32 np.stack copy of those         0.5
+  #   float32 normalize_weights output       0.5
+  #   nan_gaussian_filter scratch (~6 float32 buffers × 2 nested calls,
+  #     one view at a time)                  ~1.5 at 4 views/block
+  # The scratch share shrinks as views/block grows, so this is the
+  # conservative (over-count) direction for denser overlaps.
+  fusion_coexist_factor_content_based: 5.5
   # Output blocks fused concurrently (dask thread pool; matches the
   # _pick_fuse_workers auto cap).
   fusion_concurrency: 4
