@@ -179,11 +179,40 @@ class TestTheLogDescribesTheSpread(unittest.TestCase):
         warned = [ln for ln in lines if "Z step differs" in ln]
         self.assertTrue(warned, f"no Z-step warning in: {lines}")
         self.assertIn("stretched", warned[0])
+        # The consequence has to be quantified, or "differs" is unactionable.
+        self.assertIn("planes of drift", warned[0])
 
     def test_a_shared_z_step_stays_quiet(self):
         tiles = [self._tile(16), self._tile(24)]
         lines = self._summarise(tiles)
         self.assertFalse([ln for ln in lines if "Z step differs" in ln])
+
+    def test_rounding_noise_in_the_z_bounds_does_not_cry_wolf(self):
+        """The real numbers from the 2026-08-08 97-tile run.
+
+        Each tile's step is derived as (z_max - z_min) / (n_planes - 1) from
+        bounds the acquisition rounds, so tiles land a few nanometres apart.
+        5.0022–5.0047 µm is 0.05% — under one plane of drift across even the
+        deepest tile. An absolute threshold (the first cut used 1e-6 mm) fires
+        on every ragged acquisition and trains the user to ignore the warning.
+        """
+        tiles = [
+            self._tile(1287, step_um=5.0022),
+            self._tile(1931, step_um=5.0047),
+            self._tile(1500, step_um=5.0035),
+        ]
+        lines = self._summarise(tiles)
+        self.assertFalse(
+            [ln for ln in lines if "Z step differs" in ln],
+            "0.05% step spread is arithmetic noise, not a different Z step",
+        )
+
+    def test_the_threshold_sits_between_noise_and_a_real_change(self):
+        """Guard the constant itself: noise is ~0.05%, a real change ~60%."""
+        from flamingo_stitcher.pipeline import Z_STEP_SPREAD_WARN_FRAC
+
+        self.assertGreater(Z_STEP_SPREAD_WARN_FRAC, 0.001)
+        self.assertLess(Z_STEP_SPREAD_WARN_FRAC, 0.10)
 
 
 @unittest.skipUnless(_HAVE, "multiview-stitcher not installed")

@@ -170,6 +170,12 @@ def _pkg_version(dist_name: str) -> str:
 # content-based weighting happens to mask it (it requests a 2*sigma_2 halo).
 MIN_SAFE_MVS_VERSION = (0, 1, 57)
 
+# Fractional spread in per-tile Z step above which the steps are treated as
+# genuinely different rather than as rounding in the acquisition's Z bounds.
+# 1% is far above the observed noise floor (~0.05%) and far below any real
+# step change (5 vs 8 µm = 60%).
+Z_STEP_SPREAD_WARN_FRAC = 0.01
+
 
 def _parse_version_tuple(text: str) -> Optional[Tuple[int, ...]]:
     """Leading numeric components of a version string, or None.
@@ -7153,15 +7159,28 @@ class StitchingPipeline:
         # match even though the depth need not. Differing steps would place
         # each tile's planes at the wrong physical spacing — silently, as a
         # Z-direction stretch — so say so rather than fusing nonsense.
+        # Judge the spread RELATIVE to the step, not in absolute mm. Each tile's
+        # step is derived as (z_max - z_min) / (n_planes - 1) from bounds the
+        # acquisition rounds, so a spread of a few nm is arithmetic noise, not a
+        # different step: a real 97-tile run showed 5.0022–5.0047 µm, which is
+        # 0.05% — under one plane of drift across even the deepest tile. An
+        # actual step change (5 vs 8 µm) is tens of percent.
         steps = [t.z_step_mm for t in tiles if int(t.n_planes) > 1]
-        if steps and (max(steps) - min(steps)) > 1e-6:
-            self.logger.warning(
-                f"  ⚠ Z step differs between tiles "
-                f"({min(steps) * 1000:.4f}–{max(steps) * 1000:.4f} µm). "
-                f"Fusion applies ONE Z voxel size to every tile, so tiles "
-                f"acquired at a different step will be stretched or squashed "
-                f"along Z. Re-acquire with a single Z step."
-            )
+        if steps:
+            lo, hi = min(steps), max(steps)
+            median_step = sorted(steps)[len(steps) // 2]
+            spread_frac = (hi - lo) / median_step if median_step > 0 else 0.0
+            if spread_frac > Z_STEP_SPREAD_WARN_FRAC:
+                drift_planes = (hi - lo) * max(plane_counts) / median_step
+                self.logger.warning(
+                    f"  ⚠ Z step differs between tiles "
+                    f"({lo * 1000:.4f}–{hi * 1000:.4f} µm, "
+                    f"{spread_frac * 100:.1f}%). Fusion applies ONE Z voxel "
+                    f"size to every tile, so tiles acquired at a different "
+                    f"step are stretched or squashed along Z — up to "
+                    f"~{drift_planes:.0f} planes of drift across the deepest "
+                    f"tile. Re-acquire with a single Z step."
+                )
 
         # On-disk input size: sum of every raw file across tiles, channels,
         # and illumination sides. Log both a per-tile average and the total
