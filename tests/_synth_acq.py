@@ -75,6 +75,7 @@ def write_synth_acquisition(
     z_step_um: float = 5.0,
     seed: int = 0,
     inject_border_step: Optional[dict] = None,
+    tile_planes: Optional[dict] = None,
 ) -> Path:
     """Write a tiny synthetic raw acquisition. Returns the acquisition dir.
 
@@ -82,7 +83,14 @@ def write_synth_acquisition(
     edge strip so that tile disagrees with its neighbor along that seam. Keys:
     ``tile=(ix,iy)``, ``edge`` in {left,right,top,bottom}, ``magnitude``,
     optional ``width_px`` (default = the overlap width) and ``z_slice=(z0,z1)``.
+
+    ``tile_planes`` maps ``(ix, iy)`` to that tile's plane count, overriding
+    ``n_planes``. This is what an acquisition with per-tile Z ranges looks like
+    on disk: the scope images only the Z span where the sample actually is, so
+    every tile can be a different depth. Tiles share ``z_start_mm`` and the Z
+    step; only the end (and so the plane count) differs.
     """
+    tile_planes = {tuple(k): int(v) for k, v in (tile_planes or {}).items()}
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ny, nx = grid
@@ -102,7 +110,10 @@ def write_synth_acquisition(
     step_px_y = max(1, int(round(h * (1.0 - overlap))))
     field_w = step_px_x * (nx - 1) + w
     field_h = step_px_y * (ny - 1) + h
-    field = _phantom_field((n_planes, field_h, field_w), seed=seed)
+    # The field must be deep enough for the deepest tile; shallower tiles just
+    # take a shorter slice of it, so overlapping tiles still agree plane-wise.
+    max_planes = max([n_planes, *tile_planes.values()])
+    field = _phantom_field((max_planes, field_h, field_w), seed=seed)
 
     fov_mm_x = pixel_size_um / 1000.0 * w
     fov_mm_y = pixel_size_um / 1000.0 * h
@@ -116,16 +127,22 @@ def write_synth_acquisition(
             y_mm = iy * stage_step_mm_y
             folder = out_dir / f"X{x_mm:.2f}_Y{y_mm:.2f}"
             folder.mkdir(parents=True, exist_ok=True)
+            tile_n_planes = tile_planes.get((ix, iy), n_planes)
+            tile_z_end_mm = (
+                z_start_mm + (tile_n_planes - 1) * (z_step_um / 1000.0)
+                if tile_planes
+                else z_end_mm
+            )
             (folder / "Workflow.txt").write_text(
-                _workflow_text(z_start_mm, z_end_mm, z_step_um, w, h)
+                _workflow_text(z_start_mm, tile_z_end_mm, z_step_um, w, h)
             )
             y0, x0 = iy * step_px_y, ix * step_px_x
-            crop = field[:, y0 : y0 + h, x0 : x0 + w]
+            crop = field[:tile_n_planes, y0 : y0 + h, x0 : x0 + w]
             if inject_border_step and tuple(inject_border_step["tile"]) == (ix, iy):
                 spec = inject_border_step
                 mag = float(spec["magnitude"])
                 edge = spec.get("edge", "right")
-                zc0, zc1 = spec.get("z_slice", (0, n_planes))
+                zc0, zc1 = spec.get("z_slice", (0, tile_n_planes))
                 ow = max(1, int(round(w * overlap)))
                 oh = max(1, int(round(h * overlap)))
                 wpx = int(spec.get("width_px", ow if edge in ("left", "right") else oh))
@@ -153,7 +170,7 @@ def write_synth_acquisition(
                     tile = np.ascontiguousarray(tile)
                     fname = (
                         f"S000_t000000_V000_R0000_X000_Y000_"
-                        f"C{ch:02d}_I{s}_D1_P{n_planes:05d}.raw"
+                        f"C{ch:02d}_I{s}_D1_P{tile_n_planes:05d}.raw"
                     )
                     tile.tofile(str(folder / fname))
     return out_dir

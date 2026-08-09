@@ -370,3 +370,89 @@ def test_an_explicit_max_shift_is_not_capped_by_the_auto_ceiling():
 
     assert resolve(8) == 8      # the default this run used
     assert resolve(40) == 40    # honoured, not clipped to 24
+
+
+
+class TestZAlignmentForPerTileZRanges:
+    """Neighbours need not span the same Z once acquisitions are ragged.
+
+    The detector compares slabs plane index by plane index. That is only
+    meaningful when plane k of each tile is the same depth in the sample —
+    true for a uniform acquisition, false for one with per-tile Z ranges,
+    where a mismatch in plane count raised and took the whole QC pass down
+    ("Border QC pass failed (skipped)") on the 2026-08-08 run.
+    """
+
+    @staticmethod
+    def _tile(z_min, n_planes, step_um=5.0):
+        class _T:
+            pass
+
+        t = _T()
+        t.z_min_mm = z_min
+        t.z_max_mm = z_min + (n_planes - 1) * step_um / 1000.0
+        t.n_planes = n_planes
+        return t
+
+    def test_same_origin_different_depth_crops_to_the_shallower(self):
+        from flamingo_stitcher.border_qc import _align_z
+
+        va = np.arange(10 * 4 * 4, dtype=np.float32).reshape(10, 4, 4)
+        vb = np.arange(6 * 4 * 4, dtype=np.float32).reshape(6, 4, 4)
+        ca, cb, trim = _align_z(va, vb, self._tile(10.0, 10), self._tile(10.0, 6))
+        assert ca.shape[0] == 6 and cb.shape[0] == 6
+        assert trim == 0
+        # Same origin, so plane k must still be plane k of each input.
+        np.testing.assert_array_equal(ca, va[:6])
+        np.testing.assert_array_equal(cb, vb)
+
+    def test_offset_origins_align_by_depth_not_by_index(self):
+        """The correctness point: equal DEPTHS line up, not equal indices."""
+        from flamingo_stitcher.border_qc import _align_z
+
+        # B starts 4 planes deeper than A (0.020 mm at a 5 um step).
+        va = np.arange(10 * 2 * 2, dtype=np.float32).reshape(10, 2, 2)
+        vb = np.arange(10 * 2 * 2, dtype=np.float32).reshape(10, 2, 2)
+        ca, cb, trim = _align_z(va, vb, self._tile(10.0, 10), self._tile(10.020, 10))
+        assert trim == 4
+        assert ca.shape[0] == cb.shape[0] == 6
+        np.testing.assert_array_equal(ca, va[4:10])
+        np.testing.assert_array_equal(cb, vb[0:6])
+
+    def test_disjoint_z_yields_nothing_to_compare(self):
+        from flamingo_stitcher.border_qc import _align_z
+
+        va = np.zeros((6, 2, 2), dtype=np.float32)
+        vb = np.zeros((6, 2, 2), dtype=np.float32)
+        ca, cb, _ = _align_z(va, vb, self._tile(10.0, 6), self._tile(11.0, 6))
+        assert ca is None and cb is None
+
+    def test_identical_geometry_is_passed_through_untouched(self):
+        from flamingo_stitcher.border_qc import _align_z
+
+        va = np.zeros((8, 2, 2), dtype=np.float32)
+        vb = np.ones((8, 2, 2), dtype=np.float32)
+        ca, cb, trim = _align_z(va, vb, self._tile(10.0, 8), self._tile(10.0, 8))
+        assert ca is va and cb is vb and trim == 0
+
+    def test_a_real_step_is_still_found_through_the_alignment(self):
+        """Alignment must not blunt the detector it feeds.
+
+        Same seam, same injected step — one pair uniform, one ragged. The
+        ragged pair used to raise on the shape mismatch; it must now flag.
+        """
+        from flamingo_stitcher.border_qc import _align_z
+
+        params = BorderQCParams(mode="full")
+        a, b = _pair(_base())
+        b[1:5, 10:30, :] += 2000.0  # a step confined to shallow planes
+        uniform = detect_border_steps(a, b, "x", W, params=params)
+        assert uniform.flagged, "control pair must flag"
+
+        # Make B shallower — a per-tile Z range — and re-measure the same step.
+        deep = a.shape[0]
+        ta, tb = self._tile(10.0, deep), self._tile(10.0, deep - 4)
+        ca, cb, _ = _align_z(a, b[: deep - 4], ta, tb)
+        assert ca.shape == cb.shape, "alignment must reconcile the shapes"
+        ragged = detect_border_steps(ca, cb, "x", W, params=params)
+        assert ragged.flagged, "the same step must still be found on ragged tiles"

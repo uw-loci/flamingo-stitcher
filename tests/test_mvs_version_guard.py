@@ -214,3 +214,93 @@ class TestFusionHasNoBlockBoundaryZeros:
         plane = self._fuse(pitch=58.0, chunk=32)
         assert not (plane == 0).all(axis=0).any()
         assert not (plane == 0).all(axis=1).any()
+
+
+class TestStaleMetadataCannotFakeTheVerdict:
+    """The guard must judge the code that RUNS, not leftover packaging.
+
+    On 2026-08-08 a rig running v0.10.0 — an installer verified in CI to bundle
+    multiview-stitcher 0.1.59 — logged "multiview-stitcher 0.1.44" and tripped
+    the too-old guard. Nothing was rebuilt wrong: Inno Setup's [Files] only
+    overwrites, so every old release's versioned *.dist-info directory was
+    still sitting in the install dir and importlib.metadata answered with the
+    oldest one it found.
+
+    Left alone this guard would cry wolf on healthy installs and, worse, go
+    quiet on a genuinely old one whose stale metadata happened to read new.
+    """
+
+    def test_stale_old_metadata_does_not_condemn_a_healthy_module(self):
+        lines = check_multiview_stitcher_version(
+            "0.1.44", module_version="0.1.59", module_path="/app/_internal/mvs.py"
+        )
+        assert not any("TOO OLD" in ln for ln in lines), (
+            "a healthy 0.1.59 module must not be failed for stale metadata"
+        )
+
+    def test_the_mismatch_is_still_reported_as_the_real_problem(self):
+        lines = check_multiview_stitcher_version(
+            "0.1.44", module_version="0.1.59", module_path="/app/_internal/mvs.py"
+        )
+        assert lines, "a version mismatch must not pass in silence"
+        joined = "\n".join(lines)
+        assert "0.1.44" in joined and "0.1.59" in joined
+        assert "dist-info" in joined, "must name what is actually stale"
+        assert "/app/_internal/mvs.py" in joined, "must say which module won"
+
+    def test_stale_new_metadata_cannot_hide_an_old_module(self):
+        """The dangerous direction: metadata reads safe, the code is not."""
+        lines = check_multiview_stitcher_version(
+            "0.1.59", module_version="0.1.44", module_path="/app/_internal/mvs.py"
+        )
+        assert any("TOO OLD" in ln for ln in lines), (
+            "an actually-old module must be flagged however new metadata reads"
+        )
+        assert any("0.1.44" in ln for ln in lines if "TOO OLD" in ln)
+
+    def test_agreement_stays_silent(self):
+        assert (
+            check_multiview_stitcher_version("0.1.59", module_version="0.1.59") == []
+        )
+
+    def test_agreeing_old_versions_warn_once_not_twice(self):
+        lines = check_multiview_stitcher_version("0.1.44", module_version="0.1.44")
+        assert lines
+        assert not any("dist-info" in ln for ln in lines), (
+            "no mismatch to report when both agree"
+        )
+
+    def test_an_unreadable_module_falls_back_to_metadata(self):
+        """Better to judge on metadata than to skip the check entirely."""
+        lines = check_multiview_stitcher_version("0.1.44", module_version="")
+        assert any("TOO OLD" in ln for ln in lines)
+
+    def test_explicit_version_is_not_overruled_by_the_live_env(self):
+        """Callers naming a version get that version judged, full stop."""
+        lines = check_multiview_stitcher_version("0.1.44")
+        assert any("TOO OLD" in ln for ln in lines)
+
+
+class TestInstallerClearsTheOldBundle:
+    """The packaging half of the same bug — see the class above."""
+
+    def _iss(self):
+        from pathlib import Path
+
+        path = Path(__file__).resolve().parents[1] / "installer" / "installer.iss"
+        if not path.exists():
+            pytest.skip("installer.iss not present")
+        return path.read_text(encoding="utf-8", errors="replace")
+
+    def test_install_delete_wipes_the_payload_directory(self):
+        text = self._iss()
+        assert "[InstallDelete]" in text, (
+            "without [InstallDelete] every upgrade layers onto the last one "
+            "and stale dist-info accumulates forever"
+        )
+        assert "{app}\\_internal" in text
+
+    def test_the_delete_precedes_the_copy(self):
+        """Ordering is the whole point: delete-after would erase the install."""
+        text = self._iss()
+        assert text.index("[InstallDelete]") < text.index("[Files]")

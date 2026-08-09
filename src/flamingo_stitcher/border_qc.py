@@ -193,6 +193,42 @@ def _refine_overlap_width(a_border, b_border, w0, search):
     return min(near, key=lambda wt: (abs(wt - w0), wt))
 
 
+def _align_z(va, vb, ta, tb):
+    """Crop two tile volumes to the Z range they physically share.
+
+    The seam detector compares slabs plane index by plane index, which only
+    means anything if plane *k* of each tile is the same depth in the sample.
+    That holds for a uniform acquisition and fails for one with per-tile Z
+    ranges, where every tile has its own z_min and depth: the comparison would
+    either measure two different depths against each other or, once the plane
+    counts differ, raise on the shape mismatch and take the whole QC pass down
+    with it.
+
+    Returns ``(va, vb, a0)`` where ``a0`` is how many planes were trimmed off
+    the front of ``va`` — callers need it to report depths in mm, which are
+    measured from ``ta.z_min_mm``. Returns ``(None, None, 0)`` when the tiles
+    overlap in X/Y but not in Z: nothing to compare, and saying so beats
+    reporting a seam that was never measured.
+    """
+    za, zb = int(va.shape[0]), int(vb.shape[0])
+    # Derive each tile's plane pitch from the tile itself, so this is correct
+    # whatever Z downsample the volumes have already been through.
+    span_a = float(ta.z_max_mm) - float(ta.z_min_mm)
+    step_mm = (span_a / (za - 1)) if za > 1 and span_a > 0 else 0.0
+    if step_mm <= 0:
+        offset = 0
+    else:
+        offset = int(round((float(tb.z_min_mm) - float(ta.z_min_mm)) / step_mm))
+    a0 = max(0, offset)
+    b0 = max(0, -offset)
+    common = min(za - a0, zb - b0)
+    if common <= 0:
+        return None, None, 0
+    if a0 == 0 and b0 == 0 and common == za == zb:
+        return va, vb, 0  # identical geometry — avoid a needless re-slice
+    return va[a0 : a0 + common], vb[b0 : b0 + common], a0
+
+
 def _robust_sigma(x):
     """1.4826 * MAD — robust std estimate. ``x`` already finite."""
     if x.size == 0:
@@ -506,6 +542,7 @@ def run_border_qc(
     else:
         search_px = int(min(24, max(params.max_refine_shift_px, quant_px, 8)))
     pair_params = replace(params, max_refine_shift_px=search_px)
+    n_no_shared_z = 0
     for (ia, ib, axis) in pairs:
         if cancelled_fn is not None and cancelled_fn():
             break
@@ -513,6 +550,14 @@ def run_border_qc(
         va, vb = vol_by_id.get(id(ta)), vol_by_id.get(id(tb))
         if va is None or vb is None:
             continue
+        # X/Y neighbours need not span the same Z (per-tile Z ranges), and the
+        # detector compares plane-for-plane. Trim to what they share.
+        z_trim_a = 0
+        if axis in ("x", "y"):
+            va, vb, z_trim_a = _align_z(va, vb, ta, tb)
+            if va is None:
+                n_no_shared_z += 1
+                continue
         report.n_pairs_checked += 1
         W = _overlap_px(ta, tb, va, axis, pixel_size_um, z_step_um)
         try:
@@ -537,9 +582,10 @@ def run_border_qc(
         if res.area_px:
             pr.area_um2 = res.area_px * eff_um2
         if res.z_index_range is not None and axis in ("x", "y"):
-            z0, z1 = res.z_index_range
+            # Indices are relative to the Z-ALIGNED slab, so add back whatever
+            # _align_z trimmed off the front of tile A before naming a depth.
+            z0, z1 = (i + z_trim_a for i in res.z_index_range)
             pr.z_plane_range = (z0 * ds_z, z1 * ds_z)
-            zmm0 = ta.z_min_mm + (z0 * ds_z) * (z_step_um / 1000.0) / ds_z
             # z_index_range is in the (possibly z-strided) downsampled frame;
             # convert using the native z step per downsampled plane.
             per_ds_plane_mm = (z_step_um / 1000.0)
@@ -559,6 +605,16 @@ def run_border_qc(
 
     report.pairs.sort(key=_severity, reverse=True)
     report.elapsed_s = time.monotonic() - t0
+    if n_no_shared_z and logger is not None:
+        # Not an error — with per-tile Z ranges some neighbours genuinely image
+        # disjoint depths. Say it out loud so "0 seams flagged" is never read as
+        # "every seam checked".
+        logger.info(
+            f"  Border QC skipped {n_no_shared_z} neighbour pair"
+            f"{'s' if n_no_shared_z != 1 else ''}: adjacent in X/Y but sharing "
+            f"no Z range (per-tile Z ranges), so there is no common volume to "
+            f"compare."
+        )
     return report
 
 

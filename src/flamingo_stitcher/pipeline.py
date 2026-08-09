@@ -194,27 +194,95 @@ def _parse_version_tuple(text: str) -> Optional[Tuple[int, ...]]:
     return tuple(parts) if parts else None
 
 
-def check_multiview_stitcher_version(version: Optional[str] = None) -> List[str]:
-    """Warning lines when the installed multiview-stitcher corrupts output.
+def _mvs_module_version() -> Tuple[Optional[str], Optional[str]]:
+    """``(__version__, file path)`` of the imported multiview_stitcher.
+
+    Deliberately separate from ``_pkg_version``. In a frozen bundle the two can
+    disagree: the installer overwrites ``multiview_stitcher/*.py`` in place but
+    never deletes the OLD release's ``*.dist-info`` directory, so several
+    dist-infos pile up and ``importlib.metadata`` answers with whichever it
+    finds first — a version that hasn't been installed for months. The module's
+    own ``__version__`` comes from the code that will actually run, which is the
+    thing the correctness guard cares about.
+    """
+    try:
+        import importlib
+
+        mod = importlib.import_module("multiview_stitcher")
+        return (
+            str(getattr(mod, "__version__", "") or "") or None,
+            str(getattr(mod, "__file__", "") or "") or None,
+        )
+    except Exception:
+        return None, None
+
+
+def check_multiview_stitcher_version(
+    version: Optional[str] = None,
+    module_version: Optional[str] = None,
+    module_path: Optional[str] = None,
+) -> List[str]:
+    """Warning lines when the multiview-stitcher that will RUN corrupts output.
 
     Returns [] when the version is new enough — or when it cannot be parsed,
     since a false alarm on every run is worse than a missed one. See
     ``MIN_SAFE_MVS_VERSION`` for what the old versions do.
+
+    Judged on the imported module, not on package metadata: a stale leftover
+    dist-info makes metadata report a version nobody is running (see
+    ``_mvs_module_version``). When the two disagree we say so, because the
+    disagreement is itself the bug worth fixing — and because otherwise the
+    same guard would either cry wolf on a healthy install or stay silent on a
+    broken one.
     """
-    raw = version if version is not None else _pkg_version("multiview-stitcher")
-    parsed = _parse_version_tuple(raw)
-    if parsed is None or parsed >= MIN_SAFE_MVS_VERSION:
-        return []
+    # Only probe the live environment when the caller named nothing. Passing a
+    # version means "judge THIS one", so a caller's explicit value is never
+    # silently overruled by whatever happens to be importable.
+    raw_meta = version
+    if version is None and module_version is None and module_path is None:
+        raw_meta = _pkg_version("multiview-stitcher")
+        module_version, module_path = _mvs_module_version()
+
+    meta_parsed = _parse_version_tuple(raw_meta or "")
+    mod_parsed = _parse_version_tuple(module_version or "")
+
+    # The module is the code that runs, so it decides. Fall back to metadata
+    # only when the module can't be read at all.
+    effective_raw = module_version if mod_parsed is not None else raw_meta
+    effective = mod_parsed if mod_parsed is not None else meta_parsed
+
+    lines: List[str] = []
+    if (
+        mod_parsed is not None
+        and meta_parsed is not None
+        and mod_parsed != meta_parsed
+    ):
+        where = f" ({module_path})" if module_path else ""
+        lines.append(
+            f"⚠ multiview-stitcher metadata says {raw_meta} but the imported "
+            f"module is {module_version}{where}. That mismatch means stale "
+            f"*.dist-info left behind by an older install — the module version "
+            f"is the one that counts. Reinstall into a clean directory to "
+            f"clear it."
+        )
+
+    if effective is None or effective >= MIN_SAFE_MVS_VERSION:
+        return lines
+
     want = ".".join(str(p) for p in MIN_SAFE_MVS_VERSION)
-    return [
-        f"⚠ multiview-stitcher {raw} is TOO OLD and will corrupt this stitch: "
-        f"it writes black one-voxel lines across the fused volume at every "
-        f"fusion-block boundary (a regular grid that looks like tile seams). "
-        f"Upgrade to >= {want}:  pip install -U 'multiview-stitcher>={want}'",
+    lines.append(
+        f"⚠ multiview-stitcher {effective_raw} is TOO OLD and will corrupt this "
+        f"stitch: it writes black one-voxel lines across the fused volume at "
+        f"every fusion-block boundary (a regular grid that looks like tile "
+        f"seams). Upgrade to >= {want}:  "
+        f"pip install -U 'multiview-stitcher>={want}'"
+    )
+    lines.append(
         f"  If this is a frozen build, it needs rebuilding — the installer "
-        f"pins >= {want}, so a bundle reporting {raw} was not built from the "
-        f"current pin.",
-    ]
+        f"pins >= {want}, so a bundle running {effective_raw} was not built "
+        f"from the current pin."
+    )
+    return lines
 
 
 def environment_summary() -> List[str]:
@@ -5396,7 +5464,7 @@ class StitchingPipeline:
         # `mm[:] = vol`, which handles non-contiguous sources without a
         # full-volume scratch buffer (an np.ascontiguousarray() here cost ~5.7 GB
         # extra per tile and OOM'd multi-channel runs). The per-channel
-        # expected_shape is derived from a preprocessed probe tile, so a
+        # reference_shape is derived from a preprocessed probe tile, so a
         # transpose that swaps the frame dims stays consistent automatically.
         from flamingo_stitcher.orientation import MosaicOrientation
 
@@ -5437,7 +5505,7 @@ class StitchingPipeline:
         self,
         tiles: List[RawTileInfo],
         ch_id: int,
-        expected_shape: tuple,
+        reference_shape: tuple,
         tmp_dir: Path,
         illum_side: Optional[int] = None,
     ) -> List[Tuple[Any, RawTileInfo]]:
@@ -5447,6 +5515,18 @@ class StitchingPipeline:
         backed by a flat on-disk memmap. Fusion chunk-reads become cheap
         file reads — no re-running of the preprocess chain per chunk.
 
+        ``reference_shape`` is measured from a probe of ``tiles[0]`` and fixes
+        the FRAME size only. **Tiles may legitimately differ in depth**: an
+        acquisition with per-tile Z ranges (what Collect Tiles produces, so the
+        scope only images the Z span where the sample actually is) gives every
+        tile its own plane count. Fusion already handles that — each tile is
+        placed at its own ``z_min_mm`` and multiview-stitcher accepts views of
+        differing shape — so depth is read per tile rather than assumed.
+
+        Frame dims are a different matter: Y/X disagreeing across tiles means
+        the AOI, downsample, or orientation changed mid-acquisition, which
+        nothing downstream can reconcile. That still raises.
+
         Caller owns ``tmp_dir`` and must remove it once the returned
         dask arrays are no longer referenced.
         """
@@ -5454,7 +5534,19 @@ class StitchingPipeline:
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         tmp_dir.mkdir(parents=True, exist_ok=True)
-        tile_bytes = int(np.prod(expected_shape) * 2)  # uint16, downsampled (temp disk)
+        frame_shape = tuple(reference_shape[1:])
+        frame_bytes = int(np.prod(frame_shape) * 2) if frame_shape else 0
+        # Depth varies per tile, so the probe's own size is only a reference.
+        # Scale each tile's native plane count by the probe's native→output
+        # ratio (downsample, ISO resolution, whatever preprocessing applied)
+        # rather than re-deriving the factor from config.
+        probe_planes = int(tiles[0].n_planes) if tiles else 0
+        z_ratio = (
+            (int(reference_shape[0]) / probe_planes) if probe_planes > 0 else 1.0
+        )
+
+        def _out_planes(tile: RawTileInfo) -> int:
+            return max(1, int(round(int(tile.n_planes) * z_ratio)))
 
         # Filter to tiles that actually contain this channel, preserving
         # their original indices so memmap filenames stay stable across
@@ -5463,13 +5555,20 @@ class StitchingPipeline:
 
         # Size the worker pool on the NATIVE per-tile peak — preprocessing runs
         # at native resolution before downsample (see _preprocess_peak_bytes).
+        # With per-tile Z ranges the DEEPEST tile sets the peak, so size against
+        # that rather than whichever tile happens to come first: on this
+        # acquisition tile 0 was 1287 planes and others 1502+, and sizing on
+        # tile 0 would hand every worker a budget the real tiles overrun.
         _geo_tile = active[0][1] if active else (tiles[0] if tiles else None)
         if _geo_tile is not None:
             plane_vox = int(_geo_tile.frame_width) * int(_geo_tile.frame_height)
-            native_vox = int(_geo_tile.n_planes) * plane_vox
+            deepest = max(int(t.n_planes) for _, t in active) if active else 0
+            native_vox = max(deepest, int(_geo_tile.n_planes)) * plane_vox
         else:
-            native_vox = int(np.prod(expected_shape))
-            plane_vox = int(np.prod(expected_shape[1:])) if len(expected_shape) > 1 else 0
+            native_vox = int(np.prod(reference_shape))
+            plane_vox = (
+                int(np.prod(reference_shape[1:])) if len(reference_shape) > 1 else 0
+            )
         per_worker_bytes = _preprocess_peak_bytes(
             self.config, native_vox, plane_vox=plane_vox
         )
@@ -5477,10 +5576,11 @@ class StitchingPipeline:
         # Record concurrency so nested per-plane destripe pools inside
         # _preprocess_single_tile can size against it (avoid oversubscription).
         self._active_preprocess_workers = n_workers
+        spill_bytes = sum(frame_bytes * _out_planes(t) for _, t in active)
         self.logger.info(
             f"  Materializing {len(active)} tiles for channel {ch_id} "
             f"→ {tmp_dir} "
-            f"({tile_bytes * len(active) / (1024**3):.1f} GB temp on disk, "
+            f"({spill_bytes / (1024**3):.1f} GB temp on disk, "
             f"{n_workers} worker{'s' if n_workers != 1 else ''})"
         )
 
@@ -5491,12 +5591,17 @@ class StitchingPipeline:
             # downsample/X-flip) happens on this thread; numpy releases
             # the GIL for the heavy ops so multiple workers overlap cleanly.
             vol = self._preprocess_single_tile(tile, ch_id, illum_side=illum_side)
-            if vol.shape != expected_shape:
+            if tuple(vol.shape[1:]) != frame_shape:
                 raise RuntimeError(
-                    f"Tile {i} shape {vol.shape} != expected {expected_shape}"
+                    f"Tile {i} frame is {tuple(vol.shape[1:])} but tile 0 is "
+                    f"{frame_shape}. Every tile must share one frame size — a "
+                    f"mid-acquisition AOI/binning change cannot be stitched. "
+                    f"(Depth may vary per tile; frame size may not.)"
                 )
+            # Depth is whatever this tile actually has — see the docstring.
+            tile_shape = tuple(vol.shape)
             mm_path = tmp_dir / f"tile_{i:04d}.dat"
-            mm = np.memmap(mm_path, dtype=np.uint16, mode="w+", shape=expected_shape)
+            mm = np.memmap(mm_path, dtype=np.uint16, mode="w+", shape=tile_shape)
             mm[:] = vol
             mm.flush()
             del mm, vol
@@ -5504,7 +5609,7 @@ class StitchingPipeline:
             # dask.from_array's unconditional x.copy() cannot materialize
             # the file back into RAM (see commit 88f88c2).
             lazy = _dask_array_from_memmap(
-                mm_path, expected_shape, np.uint16, _DASK_PROCESSING_CHUNKS
+                mm_path, tile_shape, np.uint16, _DASK_PROCESSING_CHUNKS
             )
             return lazy, tile
 
@@ -5567,7 +5672,7 @@ class StitchingPipeline:
             self.logger.info(
                 f"  Preprocessed {completed} tiles in {total:.1f}s "
                 f"({total / completed:.1f}s/tile avg, "
-                f"{completed * tile_bytes / (1024**3) / max(total, 0.001):.1f} GB/s)"
+                f"{spill_bytes / (1024**3) / max(total, 0.001):.1f} GB/s)"
             )
 
         # Return in original tile order so fusion sees tiles in the same
@@ -7024,10 +7129,39 @@ class StitchingPipeline:
         )
         self.logger.info(f"  Channels: {describe_channel_set(sorted(all_ch))}")
         self.logger.info(f"  Illumination side list: {all_illum}")
-        self.logger.info(
-            f"  Planes per tile: {tiles[0].n_planes} "
-            f"(Z range: {tiles[0].z_min_mm:.3f} – {tiles[0].z_max_mm:.3f} mm)"
-        )
+        # Depth is per-tile: an acquisition with per-tile Z ranges images only
+        # the span where the sample is, so plane counts differ. Report the
+        # spread, not tile 0 — logging one tile's depth as "planes per tile"
+        # is what let a 97-tile run die at tile 7 with nothing in the header
+        # hinting the tiles were ever different sizes.
+        plane_counts = [int(t.n_planes) for t in tiles]
+        z_lo = min(t.z_min_mm for t in tiles)
+        z_hi = max(t.z_max_mm for t in tiles)
+        if min(plane_counts) == max(plane_counts):
+            self.logger.info(
+                f"  Planes per tile: {plane_counts[0]} "
+                f"(Z range: {z_lo:.3f} – {z_hi:.3f} mm)"
+            )
+        else:
+            self.logger.info(
+                f"  Planes per tile: {min(plane_counts)}–{max(plane_counts)} "
+                f"(varies — per-tile Z ranges; overall Z {z_lo:.3f} – "
+                f"{z_hi:.3f} mm)"
+            )
+
+        # A single voxel size is applied to every tile, so the Z STEP has to
+        # match even though the depth need not. Differing steps would place
+        # each tile's planes at the wrong physical spacing — silently, as a
+        # Z-direction stretch — so say so rather than fusing nonsense.
+        steps = [t.z_step_mm for t in tiles if int(t.n_planes) > 1]
+        if steps and (max(steps) - min(steps)) > 1e-6:
+            self.logger.warning(
+                f"  ⚠ Z step differs between tiles "
+                f"({min(steps) * 1000:.4f}–{max(steps) * 1000:.4f} µm). "
+                f"Fusion applies ONE Z voxel size to every tile, so tiles "
+                f"acquired at a different step will be stretched or squashed "
+                f"along Z. Re-acquire with a single Z step."
+            )
 
         # On-disk input size: sum of every raw file across tiles, channels,
         # and illumination sides. Log both a per-tile average and the total
