@@ -1,6 +1,6 @@
 # Stitching processing chain — order of operations
 
-**Status:** current as of flamingo-stitcher v0.9.17 (2026-08-06).
+**Status:** current as of flamingo-stitcher v0.10.1 (2026-08-11).
 **Companion diagram:** [`stitching-processing-chain.svg`](stitching-processing-chain.svg)
 This document covers **ordering only**: what runs when, and why the order is what it is.
 
@@ -44,7 +44,10 @@ streaming copy dropping the frame-size arguments and loading cropped tiles at th
 
 | # | Step | Function | Gated by |
 |---|------|----------|----------|
-| 11 | Registration, or stage positions | `_register_tiles` / metadata affine | `not skip_registration` |
+| 11 | Overlap gate | `_registration_overlap_gate` | always (refuses registration below `min_registration_overlap_frac`) |
+| 11a | Registration, or stage positions | `_register_tiles` / metadata affine | `not skip_registration` |
+| 11b | Per-axis shift clamp | `_clamp_registration_shifts` | always, after registration |
+| 11c | Z-refinement pass | `_refine_z_shifts` | `registration_z_refine` |
 | 12 | Multi-view rotation placement | `_tile_metadata_affine` → `_rotation_affine_zyx` | `multiview_fusion` |
 | 13 | Border QC (diagnostic) | `_run_border_qc_streaming` | `border_qc_enabled` |
 | 14 | Tile-overlap fusion | `_fuse_channel` (multiview-stitcher) | `tile_overlap_fusion`, `content_based_fusion` |
@@ -174,7 +177,12 @@ throughput line, never the per-tile rate.
 | Destripe (pystripe) | `destripe`, `destripe_fast` | Shipped — vendored `_pystripe_core` |
 | Downsample | `downsample_xy`, `downsample_z` | Shipped |
 | Per-tile orientation | `tile_orientation` | Shipped — per microscope, remembered |
-| Skip registration | `skip_registration` | Shipped |
+| Skip registration | `skip_registration` | Shipped. **Check this first when tiles do not line up** — with it on, placement is stage metadata alone and no correction is attempted |
+| Registration report | `registration_report_enabled` | Shipped, ON by default — per-tile and per-seam CSVs + text next to `stitch_metadata.json` |
+| Min-overlap registration gate | `min_registration_overlap_frac` | Shipped (5%). Below it, registration is refused rather than attempted: phase correlation on a sliver returns a confident wrong shift |
+| Axial shift bound | `max_registration_shift_z_um` | Shipped. Separate from the lateral bound — an XY mosaic has no Z overlap to derive one from |
+| Phase-correlation upsampling | `registration_upsample_factor` | Shipped. 0 = leave multiview-stitcher's default, which is **2 for 3-D** (~half a binned voxel) |
+| Z refinement pass | `registration_z_refine` | Shipped, opt-in — a second pairwise pass at full Z resolution, ~2-3x registration time |
 | Tile-overlap fusion | `tile_overlap_fusion` | Shipped |
 | Content-based blending | `content_based_fusion` | Shipped |
 | Background zeroing | `background_zero_enabled` | Shipped |
@@ -183,7 +191,7 @@ throughput line, never the per-tile rate.
 | Multi-view rotation | `multiview_fusion` | Shipped, **rig validation pending** |
 | Depth attenuation | `depth_attenuation` | **Backend + CLI only — no GUI.** Removed 2026-04-23 as geometry-unaware (wrong axis for TSPIM). Decide: delete or redesign. |
 | Leonardo FUSE | `illumination_fusion = "leonardo"` | **Partial** — accepted as a value; the isolated-env integration is not finished |
-| Interest-point registration | — | **Planned** — design only |
+| Interest-point registration | — | **Planned** — design only. `registration_seams.csv` is the measurement that would justify starting it: many `below_quality` seams on textured data is the signal |
 | Global tile-position optimisation | — | **Planned** |
 
 ---

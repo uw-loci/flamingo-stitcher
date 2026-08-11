@@ -285,6 +285,50 @@ thin border strips). Detection is most sensitive at **downsample_xy ≤ 2**
 *which* seams are bad; likely causes to chase next are a flat-field /
 exposure mismatch between tiles, or misregistration.
 
+### Symptom: tiles do not line up — small offsets in XY and/or Z
+
+**Check whether registration ran at all, before anything else.** Open
+`registration_report.txt` in the output folder (or search the run log for
+`REGISTRATION SHIFT REPORT`). If it says `DID NOT RUN`, tiles were placed by
+stage metadata alone and nothing attempted to correct them — every offset you
+can see is stage placement error. Uncheck **Skip registration** and re-run.
+This is a real and easily-missed state: the setting lives in QSettings, so once
+checked it persists silently across sessions and across acquisitions.
+
+If registration *did* run, work through the report in order:
+
+1. **Clamped tiles.** A clamped axis was **not measured** — that tile kept its
+   stage position and the true offset is larger and unknown. The summary
+   deliberately excludes clamped tiles, and a large clamped fraction is the
+   finding, not a footnote. Read `*_before_clamp` in `registration_report.csv`:
+   rejected shifts that **scale with distance** point at a pixel-size error,
+   **constant** ones at an overlap error, and ones that **alternate by row** at
+   tile ordering. None of those three are fixed by better registration.
+2. **Rejected seams.** In `registration_seams.csv`, many `below_quality` rows
+   on a visibly textured sample mean the overlap does not correlate — the data
+   is too sparse or the shared region too small. Lower `quality_threshold` only
+   deliberately; 0.2 was abandoned because low-content tiles cleared it with a
+   garbage shift.
+3. **Reflection, not misalignment.** If the shifts are large and structured,
+   check `tile_orientation` before blaming registration. A per-tile *reflection*
+   looks continuous in the index-based orientation preview but places the same
+   feature at two world positions, and no aligner can fix a mirror. This is the
+   Liara ghost-duplicate case.
+4. **Z specifically.** The main pass registers at Z binning 2 and
+   multiview-stitcher upsamples 3-D phase correlation by only 2, so Z resolves
+   to roughly one raw plane while XY resolves a fraction of a pixel. If seams
+   disagree in Z while XY is clean, turn on **Refine Z alignment** (a second
+   pairwise pass, ~2-3x registration time). A refinement that reports
+   corrections *at* its search limit has found floors, not measurements.
+
+**Too little overlap.** `Registration SKIPPED: measured tile overlap is only
+N%` means the tiles overlap below `min_registration_overlap_frac` (5%) and
+registration was refused rather than attempted. That is deliberate: phase
+correlation on a sliver does not fail loudly, it returns a confident wrong
+shift. The fix is acquisition-side — ~10% tile overlap. Note that tile folder
+names quantize the stage position to **0.01 mm**, so on a small frame the
+overlap that reaches the stitcher can differ from the one that was requested.
+
 ---
 
 ## 3. Cross-System Gotchas

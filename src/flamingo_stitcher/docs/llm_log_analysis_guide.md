@@ -29,7 +29,7 @@ selects streaming when the in-memory estimate exceeds ~60% of system RAM.
 |---|---|---|
 | **Discover** | Find tiles, read the stage grid, frame size, pixel size, channels | `Step 1: … tiles in ~AxB grid`, `Frame size (AOI)`, `Objective (ScopeSettings.txt)`, `Effective XY pixel size: … µm/px (the value stitching will use)` |
 | **Preprocess / materialize** | Per tile: fuse L/R illumination sides, optional destripe/flat-field/deconv/downsample; in streaming mode each tile is written once to a scratch memmap | `Materializing N tiles for channel … → …\.stitch_tmp\chNN`, `Ch3: fusing 2 illumination sides (max)`, `Preprocessed N tiles in …s` |
-| **Register** | Align tiles. **Often skipped** (stage positions only) | `Step 3: Registering …` **or** `Step 3: Skipping registration — using stage positions only` |
+| **Register** | Align tiles. **Often skipped** (stage positions only) | `Step 3: Registering …` **or** `Step 3: Skipping registration — using stage positions only`; then `Registration shift clamp: bounds z=… xy=…`, `Registration SKIPPED: measured tile overlap is only …`, `Z refinement: adjusted N/M tiles`, and the whole `REGISTRATION SHIFT REPORT` block |
 | **Border QC** (optional) | Diagnostic pass that flags sharp seams; does not change output | `Running tile-border artifact QC …`, `Border QC: N/M seams flagged` |
 | **Fuse** | Combine overlapping tiles into the output volume; in streaming mode fused into an on-disk `fused.dat` memmap in super-block regions | `Step 4: Fusing channel …`, `Auto super-block: fusing in K×K×K-chunk regions`, `Channel …: shape=… — R super-block region(s)` |
 | **Write** | Stream the fused volume into the chosen output format (+ pyramid) | `Step 6: Writing multi-channel output …`, `Writing pyramidal OME-TIFF: …`, `.ims write complete`, `Releasing Imaris converter (Destroy)…` / `Imaris converter released.`, `Wrote …\stitch_metadata.json` |
@@ -178,7 +178,9 @@ Interpretation:
 - **Registration context** — if the header shows registration was **skipped**,
   those `ds` offsets are **uncorrected**; turning registration on may remove the
   worst seams. If registration was on and offsets persist, it's a harder
-  geometry/rotation issue.
+  geometry/rotation issue. **Do not guess which** — read
+  `registration_report.txt` in the output folder, which says outright whether
+  registration ran and what it did (§7b).
 - **Sensitivity caveat** — heavy `downsample_xy` softens a true 1-native-pixel
   step; QC is most sensitive at `downsample_xy ≤ 2`. Few flags at `xy=4` doesn't
   prove clean seams.
@@ -187,6 +189,41 @@ So a typical mixed report reads as: the **big-step, `ds`-railed** seams are a
 **placement** problem (fix with registration / stage-pitch / camera-angle), while
 the **small-step, aligned** seams are the **per-tile intensity offset** (fix with
 flat-field / intensity equalization).
+
+## 8b. Reading the registration report
+
+Written into the **output folder** (beside `stitch_metadata.json`), not next to
+the log, because it describes that store and travels with it. Also echoed into
+the run log in full, so an old log still has it.
+
+- **`registration_report.txt`** — the summary. Read the header first.
+- **`registration_report.csv`** — one row per tile: `dz/dy/dx` in µm and in
+  frames/pixels, per-axis `clamped_*` flags, and `*_before_clamp`.
+- **`registration_seams.csv`** — one row per **expected** neighbour pair from
+  the stage grid, so a pair registration rejected appears as a row rather than
+  as an absence. `status` is one of `registered`, `pruned` (survived quality,
+  dropped by global-optimization edge pruning), `below_quality`, `dropped` (no
+  edge, and multiview-stitcher does not report why), `not_run`.
+
+**Read it in this order:**
+
+1. **Did it run at all?** `DID NOT RUN` means placement was stage metadata
+   alone. Any tile-to-tile offset in that output is stage placement error and
+   nothing tried to correct it. This is the first thing to check when tiles do
+   not line up.
+2. **How many tiles were clamped?** A clamped axis was **not measured** — the
+   tile kept its stage position and the true shift is unknown and larger. The
+   summary statistics exclude clamped tiles for exactly this reason. A large
+   clamped fraction is itself the diagnosis: read `*_before_clamp` and check
+   whether the rejected shifts **scale with distance** (pixel-size error), are
+   **constant** (overlap error), or **alternate by row** (tile ordering). None
+   of those are registration problems.
+3. **How many seams were used?** Many `below_quality` on a visibly textured
+   sample means the overlap does not correlate — sparse data, or too little
+   shared content.
+4. **Empty cells are unknown, never zero.** A `quality` of 0.0 means the
+   overlap did not correlate; an empty cell means nobody could recover the
+   number. They are not the same finding.
 
 ## 9. What to ask the user when the log is not enough
 
@@ -216,6 +253,12 @@ The log rarely contains these; ask before committing to a diagnosis:
 | **`Write output 0s`** but obvious write time between `Writing …` and `Wrote …` | Phase-timing attributes write to fuse | Cosmetic; compute real write time from the two timestamps. |
 | **Preprocess/materialize appears twice** (`qc_chNN` then `chNN`) with border QC on + registration skipped | Border QC materialized a throwaway spill (fixed after v0.7.1) | Update; or disable border QC / enable registration to avoid the double pass on old builds. |
 | Border QC: many seams, big `median step`, `ds` railed at the cap, one axis | Systematic misregistration (stage pitch / camera angle), uncorrected because registration skipped | Turn registration on; check that axis's pitch/camera-angle calibration. |
+| `Registration SKIPPED: measured tile overlap is only …%` | Tiles overlap less than `min_registration_overlap_frac` (5%). Registration was refused rather than attempted | Not a bug — phase correlation on a sliver returns a confident wrong shift. Re-acquire with ~10% tile overlap. Lower the gate only to diagnose. |
+| `REGISTRATION SHIFT REPORT` says **DID NOT RUN** | `Skip registration` is on, or the run fell back | Uncheck it. This is the first thing to check when tiles do not line up: placement was stage metadata alone. |
+| Many seams `below_quality` in `registration_seams.csv` | The overlap does not correlate: sparse/dim sample, or too little shared content | Lower `quality_threshold` (0.4 default; 0.2 was abandoned as too permissive), or accept stage placement. Many below-quality seams on visibly textured data is the case that would justify interest-point registration. |
+| Many tiles `clamped_z`/`clamped_x` in `registration_report.csv` | Corrections exceeded the plausible bound and were reverted — those tiles are **NOT measured** | Read `*_before_clamp`: shifts scaling with distance ⇒ pixel-size error; constant ⇒ overlap error; alternating by row ⇒ tile ordering. None of those are fixed by registration. |
+| Z disagreement in `registration_seams.csv` while X/Y is clean | The first pass registers at Z binning 2 and multiview-stitcher upsamples 3-D by only 2 | Turn on `registration_z_refine` (~2-3x registration time). |
+| `Z refinement: N corrections came back at the ±… µm search limit` | Those are floors, not measurements; they were rejected | Widen `--z-refine-range-um`, or check tile order — a large fraction usually means a placement error, not a Z error. |
 | Border QC: small `median step` on aligned seams | Per-tile intensity offset | Flat-field (with darkfield); consider intensity equalization (not built in). |
 | **Hard seams in signal-free background**, same at any overlap %, `blend`=dim / `max`=bright | Per-tile intensity offset (§7) | Flat-field first; no overlap mode fixes it. |
 | Blend gives a **dark dip** at seams on a **sparse** sample | Averaging signal against a neighbour's background | Use `max` (default) for sparse / sub-FOV samples. |
