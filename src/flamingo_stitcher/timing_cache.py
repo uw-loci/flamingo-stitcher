@@ -105,6 +105,13 @@ class StitchingTimingKey:
     destripe_fast: bool = False
     deconvolution: bool = False
     flat_field: bool = False
+    # The Z-refinement pass roughly doubles-to-triples registration time (twice
+    # the overlap voxels at Z binning 1, plus ~1.7x the edges with pruning off).
+    # `skip_registration` is already a key axis precisely because
+    # registration-on and registration-off are different cost classes; this is
+    # the same effect one level down, and without it a refined run and a plain
+    # one average into a number that fits neither.
+    z_refine: bool = False
 
     def serialize(self) -> str:
         return (
@@ -123,6 +130,9 @@ class StitchingTimingKey:
             f"ff={int(self.flat_field)}|"
             f"src={self.source_drive}|"
             f"dst={self.dest_drive}"
+            # Appended only when set, so every key string already in a user's
+            # cache stays valid and their learned timings survive this change.
+            + ("|zr=1" if self.z_refine else "")
         )
 
 

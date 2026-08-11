@@ -77,6 +77,12 @@ def main() -> None:
         cfg.content_based_fusion = cfg_in.get("content_based_fusion", False)
         cfg.destripe = cfg_in.get("destripe", False)
         cfg.fusion_superblock_chunks = cfg_in.get("superblock", 0)
+        # Registration defaults to skipped in probes because most of them are
+        # about fusion, but that meant NO probe ever exercised it — so the
+        # scaling test was blind to the whole registration stage, and to the
+        # Z-refinement pass added on top of it.
+        cfg.registration_z_refine = cfg_in.get("z_refine", False)
+        cfg.tile_orientation = cfg_in.get("tile_orientation", "") or ""
         cfg.resource_guard_enabled = False  # never abort tiny probe runs
         # Chunk finer than the mosaic so the fusion geometry mirrors real
         # scale: each output block overlaps only its LOCAL tile neighbourhood,

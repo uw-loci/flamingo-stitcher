@@ -191,3 +191,49 @@ class TestTheNativeTabDoesNotForgetSettings:
         assert key in _setting_keys(
             _method_body("StitchingDialog", "_restore_settings")
         ), key
+
+
+class TestTheTimingCacheKey:
+    """A cost swing the ETA cannot see makes the ETA wrong for both runs."""
+
+    def test_z_refine_is_part_of_the_key(self):
+        from flamingo_stitcher.timing_cache import StitchingTimingKey
+
+        base = dict(
+            n_tiles=10,
+            n_channels=1,
+            n_pyramid_levels=0,
+            n_timepoints=1,
+            output_format="ome-tiff",
+            fusion_method="cosine",
+            skip_registration=False,
+            planes_per_tile=100,
+        )
+        plain = StitchingTimingKey(**base).serialize()
+        refined = StitchingTimingKey(**base, z_refine=True).serialize()
+        assert plain != refined
+
+    def test_an_unrefined_key_is_byte_identical_to_the_old_format(self):
+        # The token is APPENDED only when set, so every key string already in a
+        # user's timing cache stays valid and their learned timings survive.
+        from flamingo_stitcher.timing_cache import StitchingTimingKey
+
+        plain = StitchingTimingKey(
+            n_tiles=10,
+            n_channels=1,
+            n_pyramid_levels=0,
+            n_timepoints=1,
+            output_format="ome-tiff",
+            fusion_method="cosine",
+            skip_registration=False,
+            planes_per_tile=100,
+        ).serialize()
+        assert plain.endswith("dst=")
+        assert "zr=" not in plain
+
+    def test_the_config_drives_the_key(self):
+        from flamingo_stitcher.pipeline import build_timing_key
+
+        cfg = StitchingConfig()
+        cfg.registration_z_refine = True
+        assert build_timing_key([], cfg, None).z_refine is True

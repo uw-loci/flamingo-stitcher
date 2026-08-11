@@ -431,6 +431,9 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
         output_format=config.output_format,
         fusion_method=fusion_method,
         skip_registration=bool(config.skip_registration),
+        # A second pairwise pass is the same class of cost swing as
+        # registration on/off, one level down.
+        z_refine=bool(getattr(config, "registration_z_refine", False)),
         planes_per_tile=planes,
         downsample_xy=int(getattr(config, "downsample_xy", 1) or 1),
         downsample_z=int(getattr(config, "downsample_z", 1) or 1),

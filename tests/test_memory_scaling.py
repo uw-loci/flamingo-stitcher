@@ -120,6 +120,50 @@ class TestStreamingMemoryBounded(unittest.TestCase):
             f"large={large['phase_peaks_mb']}",
         )
 
+    def test_slope_flat_vs_tile_count_with_registration(self):
+        """The same bound, with registration and its Z-refinement pass ON.
+
+        Every other probe in this file skips registration, so until this one
+        existed the whole registration stage — the largest single allocation
+        this pipeline ever made, and the source of the 570 GB OOM — was outside
+        CI's reach. Pairwise registration is bounded per PAIR (multiview-stitcher
+        crops to the overlap bbox before materializing, and forces 3-D pairs to
+        run sequentially), so the slope must stay just as flat as without it.
+        """
+        small = _run_probe(
+            grid=[2, 2], n_planes=16, skip_registration=False, z_refine=True
+        )
+        large = _run_probe(
+            grid=[8, 8], n_planes=16, skip_registration=False, z_refine=True
+        )
+        slope = (large["peak_delta_mb"] - small["peak_delta_mb"]) / (
+            large["tiles"] - small["tiles"]
+        )
+        self.assertLess(
+            slope,
+            _MAX_SLOPE_MB_PER_TILE,
+            f"registration memory scales with tile COUNT at {slope:.2f} MB/tile "
+            f"(ceiling {_MAX_SLOPE_MB_PER_TILE}). "
+            f"{small['peak_delta_mb']:.0f} MB @ {small['tiles']} tiles -> "
+            f"{large['peak_delta_mb']:.0f} MB @ {large['tiles']} tiles. "
+            f"Registration must hold one PAIR's overlap, never all tiles. "
+            f"Phase peaks: small={small['phase_peaks_mb']} "
+            f"large={large['phase_peaks_mb']}",
+        )
+
+    def test_registration_peaks_are_attributed_to_the_register_phase(self):
+        """A registration regression must be traceable to registration.
+
+        The Z-refinement pass reports its status as "Registering tiles (Z
+        refinement)...", which the phase keyword table maps to `register`. If
+        that wording changes, its memory lands in Other/setup and the next
+        person hunts it in the wrong stage.
+        """
+        r = _run_probe(
+            grid=[4, 4], n_planes=16, skip_registration=False, z_refine=True
+        )
+        self.assertIn("register", r["phase_peaks_mb"])
+
     def test_bounded_vs_plane_count(self):
         """16x the Z planes must not SUPER-linearly grow the peak (tiles are
         spilled to disk / paged, not all held whole in RAM)."""
