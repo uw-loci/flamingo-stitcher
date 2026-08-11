@@ -245,6 +245,80 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Channel indices to process (default: all)",
     )
+    reg_group.add_argument(
+        "--skip-registration",
+        action="store_true",
+        default=None,
+        help="Place tiles by stage position only. Any tile-to-tile offset in "
+        "the output is then stage placement error, uncorrected.",
+    )
+    reg_group.add_argument(
+        "--registration-binning",
+        type=int,
+        nargs=3,
+        metavar=("Z", "Y", "X"),
+        default=None,
+        help="Phase-correlation binning per axis (default: 2 4 4)",
+    )
+    reg_group.add_argument(
+        "--reg-upsample",
+        type=int,
+        default=None,
+        help="Sub-pixel upsampling for phase correlation. multiview-stitcher "
+        "defaults 3-D data to 2, i.e. about half a binned voxel; 4-10 is "
+        "usually worth it, especially in Z. 0 = leave its default alone.",
+    )
+    reg_group.add_argument(
+        "--max-reg-shift",
+        type=float,
+        default=None,
+        metavar="UM",
+        help="Max lateral (X/Y) move from the stage position, µm "
+        "(0 = auto: one overlap width)",
+    )
+    reg_group.add_argument(
+        "--max-reg-shift-z",
+        type=float,
+        default=None,
+        metavar="UM",
+        help="Max axial (Z) move from the stage position, µm (0 = auto). "
+        "Separate from --max-reg-shift: a mosaic tiled only in X/Y has no Z "
+        "overlap to derive a bound from.",
+    )
+    reg_group.add_argument(
+        "--min-reg-overlap",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="Skip registration when measured tile overlap is below this "
+        "fraction (default 0.05). Phase correlation on a sliver returns a "
+        "confident wrong answer rather than failing.",
+    )
+    reg_group.add_argument(
+        "--z-refine",
+        dest="z_refine",
+        action="store_true",
+        default=None,
+        help="Second registration pass at fine Z binning and sub-plane "
+        "upsampling, to fix axial alignment the binned main pass cannot "
+        "express. Roughly 2-3x the registration time.",
+    )
+    reg_group.add_argument(
+        "--no-z-refine", dest="z_refine", action="store_false", help=argparse.SUPPRESS
+    )
+    reg_group.add_argument(
+        "--z-refine-range-um",
+        type=float,
+        default=None,
+        help="Half-width of the Z-refine search, µm (default 40). A correction "
+        "returned at the limit is rejected, not applied — it is a floor.",
+    )
+    reg_group.add_argument(
+        "--z-refine-upsample",
+        type=int,
+        default=None,
+        help="Sub-plane upsampling for the Z-refine pass (default 10)",
+    )
 
     # Multi-view (rotation)
     mv_group = parser.add_argument_group("Multi-view (rotation)")
@@ -275,6 +349,26 @@ def build_parser() -> argparse.ArgumentParser:
 
     # QC / diagnostics
     qc_group = parser.add_argument_group("QC & diagnostics")
+    qc_group.add_argument(
+        "--registration-report",
+        dest="registration_report",
+        action="store_true",
+        default=None,
+        help="Write registration_report.csv / registration_seams.csv / "
+        "registration_report.txt into the output dir (default: on)",
+    )
+    qc_group.add_argument(
+        "--no-registration-report",
+        dest="registration_report",
+        action="store_false",
+        help="Suppress the registration report",
+    )
+    qc_group.add_argument(
+        "--registration-report-json",
+        action="store_true",
+        default=None,
+        help="Also write registration_report.json",
+    )
     qc_group.add_argument(
         "--border-qc",
         action="store_true",
@@ -590,7 +684,26 @@ def main():
     # they must be applied as an overlay rather than passed into the constructor
     # above. Passing them in unconditionally is how --quality-threshold spent its
     # life overriding the dataclass default of 0.4 with 0.2 on every CLI run.
-    for _attr, _value in (("quality_threshold", args.quality_threshold),):
+    _binning = args.registration_binning
+    for _attr, _value in (
+        ("quality_threshold", args.quality_threshold),
+        ("skip_registration", args.skip_registration),
+        (
+            "registration_binning",
+            None
+            if _binning is None
+            else {"z": _binning[0], "y": _binning[1], "x": _binning[2]},
+        ),
+        ("registration_upsample_factor", args.reg_upsample),
+        ("max_registration_shift_um", args.max_reg_shift),
+        ("max_registration_shift_z_um", args.max_reg_shift_z),
+        ("min_registration_overlap_frac", args.min_reg_overlap),
+        ("registration_z_refine", args.z_refine),
+        ("registration_z_refine_range_um", args.z_refine_range_um),
+        ("registration_z_refine_upsample", args.z_refine_upsample),
+        ("registration_report_enabled", args.registration_report),
+        ("registration_report_json", args.registration_report_json),
+    ):
         if _value is not None:
             setattr(config, _attr, _value)
 

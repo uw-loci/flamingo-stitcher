@@ -65,6 +65,60 @@ registration:
   # overlap widths, so a tile can never move more than one overlap (no gaps).
   max_shift_um: 0.0
 
+  # Maximum distance (µm) registration may move a tile along Z. Separate from
+  # max_shift_um, which bounds X/Y, because the two cannot share a number: the
+  # lateral bound is the tile OVERLAP width, and a mosaic tiled only in X/Y has
+  # no Z overlap to derive a bound from. 0.0 = auto: at least 8 Z steps and
+  # never under 25 µm (enough for the few-frame stage/focus error seen in
+  # practice), capped at a quarter of the stack depth so a correlation peak
+  # found halfway down the volume is still rejected.
+  max_shift_z_um: 0.0
+
+  # Minimum measured tile overlap (as a fraction of a frame) before
+  # registration is attempted at all. Phase correlation on a sliver of shared
+  # content does not fail loudly — it returns a confident garbage shift, which
+  # is the failure max_shift_um exists to mop up after the fact. Below this,
+  # tiles are placed by stage position and the registration report says why.
+  min_overlap_fraction: 0.05
+
+  # Sub-pixel upsampling factor for phase correlation. multiview-stitcher
+  # silently uses 10 for 2-D data and 2 for 3-D, so every 3-D registration
+  # resolves shifts to about half a BINNED voxel — with binning z=2 that is one
+  # raw plane, on the axis where misalignment matters most.
+  # 0 = leave multiview-stitcher's own default alone. 4-10 costs a slightly
+  # larger correlation matrix per tile pair and nothing else.
+  upsample_factor: 0
+
+  # Dedicated second registration pass whose only job is Z.
+  z_refine:
+    # Off by default: it is a second full pairwise pass, roughly 2-3x the
+    # registration time. Turn it on when registration_seams.csv shows tile
+    # pairs disagreeing in Z while X/Y look clean.
+    enabled: false
+
+    # Half-width of the Z search, µm. A correction that comes back AT the limit
+    # is a lower bound on the error, not the error, so it is rejected (the tile
+    # keeps its first-pass Z) and counted separately in the report.
+    range_um: 40.0
+
+    # Finer Z, same XY as the main pass — the point is Z resolution, and
+    # unbinning XY as well would multiply the cost for nothing.
+    binning:
+      z: 1
+      y: 4
+      x: 4
+
+    # Sub-plane upsampling for this pass. 10 is skimage's 2-D default.
+    upsample_factor: 10
+
+  # Write registration_report.csv / registration_seams.csv /
+  # registration_report.txt into the output directory, next to
+  # stitch_metadata.json. On by default: registration is the one step whose
+  # effect is invisible in the output, and the cost is a few kB.
+  report: true
+  # Machine-readable twin of the text report.
+  report_json: false
+
   # Global optimization — iterative edge-pruning inspired by BigStitcher
   # (Horl et al., Nature Methods 2019).
   global_optimization:

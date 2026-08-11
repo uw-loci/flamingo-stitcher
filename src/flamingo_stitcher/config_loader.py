@@ -310,6 +310,30 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.quality_threshold = float(reg["quality_threshold"])
     if reg.get("max_shift_um") is not None:
         config_obj.max_registration_shift_um = float(reg["max_shift_um"])
+    if reg.get("max_shift_z_um") is not None:
+        config_obj.max_registration_shift_z_um = float(reg["max_shift_z_um"])
+    if reg.get("min_overlap_fraction") is not None:
+        config_obj.min_registration_overlap_frac = float(reg["min_overlap_fraction"])
+    if reg.get("upsample_factor") is not None:
+        config_obj.registration_upsample_factor = int(reg["upsample_factor"])
+    if reg.get("report") is not None:
+        config_obj.registration_report_enabled = bool(reg["report"])
+    if reg.get("report_json") is not None:
+        config_obj.registration_report_json = bool(reg["report_json"])
+    zref = reg.get("z_refine", {})
+    if zref.get("enabled") is not None:
+        config_obj.registration_z_refine = bool(zref["enabled"])
+    if zref.get("range_um") is not None:
+        config_obj.registration_z_refine_range_um = float(zref["range_um"])
+    if zref.get("upsample_factor") is not None:
+        config_obj.registration_z_refine_upsample = int(zref["upsample_factor"])
+    z_binning = zref.get("binning")
+    if z_binning:
+        config_obj.registration_z_refine_binning = {
+            "z": int(z_binning.get("z", 1)),
+            "y": int(z_binning.get("y", 4)),
+            "x": int(z_binning.get("x", 4)),
+        }
     gopt = reg.get("global_optimization", {})
     if gopt.get("absolute_tolerance") is not None:
         config_obj.global_opt_abs_tol = float(gopt["absolute_tolerance"])

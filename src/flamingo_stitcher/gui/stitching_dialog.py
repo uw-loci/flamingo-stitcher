@@ -1146,8 +1146,65 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._max_reg_shift_spin, 3, 1, 1, 3)
 
-        # Proc Row 4: Fusion chunk size
-        proc_layout.addWidget(QLabel("Fusion chunk size:"), 4, 0)
+        # Proc Row 4: axial registration controls. Z is separated from the
+        # lateral cap above because the two are not the same measurement: the
+        # lateral bound is a tile overlap width, and a mosaic tiled only in X/Y
+        # has no Z overlap to derive a bound from.
+        self._max_reg_shift_z_label = QLabel("Max Z shift:")
+        proc_layout.addWidget(self._max_reg_shift_z_label, 4, 0)
+        self._max_reg_shift_z_spin = _NoScrollDoubleSpinBox()
+        self._max_reg_shift_z_spin.setRange(0.0, 100000.0)
+        self._max_reg_shift_z_spin.setDecimals(1)
+        self._max_reg_shift_z_spin.setSingleStep(5.0)
+        self._max_reg_shift_z_spin.setSuffix(" µm")
+        self._max_reg_shift_z_spin.setSpecialValueText("Auto")
+        self._max_reg_shift_z_spin.setValue(0.0)
+        self._max_reg_shift_z_spin.setToolTip(
+            "Cap how far registration may move a tile along Z.\n\n"
+            "Separate from 'Max reg. shift', which bounds X/Y. They cannot share\n"
+            "a number: the lateral cap is one tile OVERLAP width, and tiles that\n"
+            "only tile in X/Y all span the same depth — there is no Z overlap to\n"
+            "derive a bound from, so the lateral value would be arbitrary in Z.\n\n"
+            "Auto (0) = at least 8 Z steps and never under 25 µm (enough for the\n"
+            "few-frame stage/focus drift seen in practice), capped at a quarter of\n"
+            "the stack so a peak found halfway down the volume is still rejected.\n\n"
+            "A tile clamped in Z was NOT measured — it kept its stage position.\n"
+            "The registration report says which tiles those were."
+        )
+        proc_layout.addWidget(self._max_reg_shift_z_spin, 4, 1)
+
+        self._z_refine_cb = QCheckBox("Refine Z alignment ✱")
+        self._z_refine_cb.setToolTip(
+            "Run a second registration pass whose only job is Z.\n\n"
+            "The main pass registers at Z binning 2 and multiview-stitcher\n"
+            "upsamples 3-D phase correlation by only 2, so Z resolves to about one\n"
+            "raw plane while X/Y resolve a fraction of a pixel — the coarsest\n"
+            "treatment on the axis with the coarsest voxel. This pass re-registers\n"
+            "from the first pass's result at full Z resolution and contributes ONLY\n"
+            "its Z component; X/Y are left exactly as the first pass set them.\n\n"
+            "Costs roughly 2-3x the registration time. Turn it on when\n"
+            "registration_seams.csv shows pairs disagreeing in Z while X/Y is clean."
+        )
+        proc_layout.addWidget(self._z_refine_cb, 4, 2)
+
+        self._z_refine_range_spin = _NoScrollDoubleSpinBox()
+        self._z_refine_range_spin.setRange(1.0, 100000.0)
+        self._z_refine_range_spin.setDecimals(0)
+        self._z_refine_range_spin.setSingleStep(10.0)
+        self._z_refine_range_spin.setPrefix("± ")
+        self._z_refine_range_spin.setSuffix(" µm")
+        self._z_refine_range_spin.setValue(40.0)
+        self._z_refine_range_spin.setToolTip(
+            "Half-width of the Z-refinement search.\n\n"
+            "A correction that comes back AT this limit is a lower bound on the\n"
+            "error, not the error, so it is rejected — the tile keeps its\n"
+            "first-pass Z and the report counts it separately. Widening the search\n"
+            "is the fix, not trusting the number."
+        )
+        proc_layout.addWidget(self._z_refine_range_spin, 4, 3)
+
+        # Proc Row 5: Fusion chunk size
+        proc_layout.addWidget(QLabel("Fusion chunk size:"), 5, 0)
         self._chunk_size_combo = QComboBox()
         # Dask graph granularity for the fuse step. Separate from
         # zarr_chunks (the final storage chunk size that determines
@@ -1179,7 +1236,7 @@ class StitchingDialog(PersistentDialog):
             "step is unexpectedly slow and you have RAM headroom.\n"
             "Small helps on tight-RAM systems at the cost of throughput."
         )
-        proc_layout.addWidget(self._chunk_size_combo, 4, 1, 1, 3)
+        proc_layout.addWidget(self._chunk_size_combo, 5, 1, 1, 3)
 
         # Proc Row 5: Tile-border artifact QC (diagnostic)
         self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
@@ -1191,9 +1248,9 @@ class StitchingDialog(PersistentDialog):
             "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
             "single-pixel steps."
         )
-        proc_layout.addWidget(self._border_qc_cb, 5, 0)
+        proc_layout.addWidget(self._border_qc_cb, 6, 0)
         self._border_qc_label = QLabel("QC detail:")
-        proc_layout.addWidget(self._border_qc_label, 5, 1)
+        proc_layout.addWidget(self._border_qc_label, 6, 1)
         self._border_qc_mode_combo = QComboBox()
         self._border_qc_mode_combo.addItem("MIP length (fast)", "mip")
         self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
@@ -1203,12 +1260,27 @@ class StitchingDialog(PersistentDialog):
             "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
             "Pairs only: just the list of offending tile pairs."
         )
-        proc_layout.addWidget(self._border_qc_mode_combo, 5, 2, 1, 2)
+        proc_layout.addWidget(self._border_qc_mode_combo, 6, 2)
+
+        self._reg_report_cb = QCheckBox("Registration report")
+        self._reg_report_cb.setChecked(True)
+        self._reg_report_cb.setToolTip(
+            "Write registration_report.csv, registration_seams.csv and\n"
+            "registration_report.txt into the output folder, beside\n"
+            "stitch_metadata.json.\n\n"
+            "Registration is the one step whose effect is invisible in the output:\n"
+            "it either silently helped or silently hurt. These say how far each\n"
+            "tile moved, which seams were used, and which corrections were\n"
+            "rejected as implausible.\n\n"
+            "Stays on even with Skip registration — the report then says the tiles\n"
+            "were never registered, which is the thing worth knowing."
+        )
+        proc_layout.addWidget(self._reg_report_cb, 6, 3)
 
         # Proc Row 6: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 6, 0, 1, 4)
+        proc_layout.addWidget(legend, 7, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
@@ -2381,6 +2453,14 @@ class StitchingDialog(PersistentDialog):
         # Max reg. shift only applies when registration runs.
         self._max_reg_shift_spin.setEnabled(not checked)
         self._max_reg_shift_label.setEnabled(not checked)
+        # Same for the axial controls. The report checkbox deliberately stays
+        # live: with registration skipped it writes a file saying the tiles were
+        # never registered, which is exactly the fact that went unnoticed for
+        # months.
+        self._max_reg_shift_z_spin.setEnabled(not checked)
+        self._max_reg_shift_z_label.setEnabled(not checked)
+        self._z_refine_cb.setEnabled(not checked)
+        self._z_refine_range_spin.setEnabled(not checked)
 
     def _on_downsample_xy_changed(self, _index: int):
         """Grey out Z combo when XY is iso (iso overrides both factors)."""
@@ -2893,6 +2973,10 @@ class StitchingDialog(PersistentDialog):
         config.content_based_fusion = self._content_fusion_cb.isChecked()
         config.skip_registration = self._skip_reg_cb.isChecked()
         config.max_registration_shift_um = float(self._max_reg_shift_spin.value())
+        config.max_registration_shift_z_um = float(self._max_reg_shift_z_spin.value())
+        config.registration_z_refine = self._z_refine_cb.isChecked()
+        config.registration_z_refine_range_um = float(self._z_refine_range_spin.value())
+        config.registration_report_enabled = self._reg_report_cb.isChecked()
         config.border_qc_enabled = self._border_qc_cb.isChecked()
         config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
         config.registration_binning = self._reg_binning_combo.currentData()
@@ -3086,6 +3170,8 @@ class StitchingDialog(PersistentDialog):
             ("package_ozx", self._ozx_cb),
             ("tiff_pyramids", self._tiff_pyramids_cb),
             ("border_qc_enabled", self._border_qc_cb),
+            ("registration_z_refine", self._z_refine_cb),
+            ("registration_report_enabled", self._reg_report_cb),
         ]
         for name, cb in check_fields:
             if has(name):
@@ -3102,6 +3188,14 @@ class StitchingDialog(PersistentDialog):
         # Spin-box value fields.
         if has("max_registration_shift_um"):
             self._max_reg_shift_spin.setValue(float(cfg["max_registration_shift_um"]))
+        if has("max_registration_shift_z_um"):
+            self._max_reg_shift_z_spin.setValue(
+                float(cfg["max_registration_shift_z_um"])
+            )
+        if has("registration_z_refine_range_um"):
+            self._z_refine_range_spin.setValue(
+                float(cfg["registration_z_refine_range_um"])
+            )
             applied += 1
 
         # Background zeroing: enable state now; per-channel thresholds can only
@@ -5123,6 +5217,10 @@ class StitchingDialog(PersistentDialog):
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
+        s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
+        s.setValue("z_refine", self._z_refine_cb.isChecked())
+        s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
+        s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
@@ -5289,6 +5387,16 @@ class StitchingDialog(PersistentDialog):
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():
             self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
+        self._max_reg_shift_z_spin.setValue(
+            s.value("max_reg_shift_z", 0.0, type=float)
+        )
+        self._z_refine_cb.setChecked(s.value("z_refine", False, type=bool))
+        self._z_refine_range_spin.setValue(
+            s.value("z_refine_range_um", 40.0, type=float)
+        )
+        self._reg_report_cb.setChecked(
+            s.value("registration_report", True, type=bool)
+        )
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
@@ -5408,6 +5516,10 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
         s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
+        s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
+        s.setValue("z_refine", self._z_refine_cb.isChecked())
+        s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
+        s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
         s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
@@ -5573,6 +5685,16 @@ class NativeStitchingDialog(StitchingDialog):
         if 0 <= reg_binning_idx < self._reg_binning_combo.count():
             self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
+        self._max_reg_shift_z_spin.setValue(
+            s.value("max_reg_shift_z", 0.0, type=float)
+        )
+        self._z_refine_cb.setChecked(s.value("z_refine", False, type=bool))
+        self._z_refine_range_spin.setValue(
+            s.value("z_refine_range_um", 40.0, type=float)
+        )
+        self._reg_report_cb.setChecked(
+            s.value("registration_report", True, type=bool)
+        )
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
