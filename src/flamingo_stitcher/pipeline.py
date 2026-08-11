@@ -15,7 +15,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -825,6 +825,16 @@ class StitchingConfig:
     # _register_tiles). 0.0 = auto: use the smaller of the X/Y overlap widths, so
     # a tile can never move more than one overlap (gaps become impossible).
     max_registration_shift_um: float = 0.0
+    # Max distance (µm) registration may move a tile along Z. Separate from
+    # max_registration_shift_um, which bounds X/Y, because the two cannot share
+    # a number: the lateral bound is the tile OVERLAP width, and a mosaic that
+    # tiles only in X/Y has no Z overlap to derive a bound from. Reusing the
+    # lateral value in Z is not conservative, it is arbitrary — and being large,
+    # it effectively switched the Z guard off. 0.0 = auto: enough to admit the
+    # few-frame stage/focus error we actually see (>= 8 Z steps, never under
+    # 25 µm), capped at a quarter of the stack so a garbage correlation peak
+    # halfway down the volume is still rejected.
+    max_registration_shift_z_um: float = 0.0
     # Global optimization residual thresholds — inspired by BigStitcher's
     # iterative edge-pruning algorithm (Hörl et al., Nature Methods 2019).
     # Edges with residuals exceeding abs_tol are removed (if graph stays
@@ -1879,6 +1889,70 @@ def _resolve_frame_size(
 # Below this fraction of a frame, "overlap" is not usable: registration has no
 # shared content to correlate and the frame-edge falloff has nowhere to hide.
 MIN_USEFUL_TILE_OVERLAP = 0.03
+
+# Below this fraction, registration should not be ATTEMPTED. Distinct from the
+# 3% above, which is "the tiling itself is broken": phase correlation on a
+# sliver of shared content does not fail loudly, it returns a confident garbage
+# peak — which is exactly the failure the shift clamp exists to mop up after the
+# fact. Better to place by stage position and say so than to clamp half the
+# tiles and call the result alignment.
+MIN_REGISTRATION_OVERLAP = 0.05
+
+# Auto Z shift bound (see StitchingPipeline._axial_shift_bound). The reported
+# real-world error is 3-6 frames between neighbours, so 8 steps clears it with
+# margin; the 25 µm floor covers finer Z steps where 8 steps is still tiny; the
+# quarter-stack cap keeps a shallow stack from admitting a peak found halfway
+# down the volume.
+_Z_CLAMP_MIN_STEPS = 8
+_Z_CLAMP_FLOOR_UM = 25.0
+_Z_CLAMP_STACK_FRACTION = 0.25
+
+
+class ClampRecord(NamedTuple):
+    """What the shift clamp saw and did for one tile.
+
+    ``dz_um``/``dy_um``/``dx_um`` are the shifts registration proposed, BEFORE
+    any clamping — the report needs the rejected value, not the zero that
+    replaced it, because "we measured +97 µm and did not believe it" and "we
+    measured nothing" are different findings.
+    """
+
+    index: int
+    dz_um: float
+    dy_um: float
+    dx_um: float
+    clamped_xy: bool = False
+    clamped_z: bool = False
+    whole_matrix: bool = False
+
+
+class ClampResult(NamedTuple):
+    """Clamped params plus the evidence of what was clamped and why."""
+
+    params: list
+    records: List[ClampRecord]
+    bound_xy_um: Optional[float] = None
+    bound_z_um: Optional[float] = None
+    source_xy: str = ""
+    source_z: str = ""
+
+    def summary_line(self) -> str:
+        n = len(self.records)
+        n_xy = sum(1 for r in self.records if r.clamped_xy and not r.whole_matrix)
+        n_z = sum(1 for r in self.records if r.clamped_z and not r.whole_matrix)
+        n_whole = sum(1 for r in self.records if r.whole_matrix)
+        seen_z = max((abs(r.dz_um) for r in self.records), default=0.0)
+        seen_y = max((abs(r.dy_um) for r in self.records), default=0.0)
+        seen_x = max((abs(r.dx_um) for r in self.records), default=0.0)
+        return (
+            f"  Registration shift clamp: bounds "
+            f"z={self.bound_z_um:.1f} µm ({self.source_z}), "
+            f"xy={self.bound_xy_um:.1f} µm ({self.source_xy}); "
+            f"clamped z on {n_z}/{n} tiles, xy on {n_xy}/{n}, "
+            f"whole-matrix reverts {n_whole}/{n} "
+            f"(max shift seen z={seen_z:.1f} y={seen_y:.1f} x={seen_x:.1f} µm). "
+            f"A clamped axis was NOT measured — it kept its stage position."
+        )
 
 
 def _detect_tile_spacing_gaps(
@@ -6070,9 +6144,10 @@ class StitchingPipeline:
                         "rel_tol": self.config.global_opt_rel_tol,
                     },
                 )
-            params = self._clamp_registration_shifts(
+            clamp = self._clamp_registration_shifts(
                 list(params), tile_data, voxel_size_um
             )
+            params = clamp.params
             self.logger.info("  Registration complete")
             return params, "registered"
 
@@ -6085,8 +6160,7 @@ class StitchingPipeline:
             reg_logger.setLevel(_saved_level)
 
     def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):
-        """Revert tiles that registration moved farther than the expected
-        overlap back to their stage position.
+        """Revert corrections registration cannot plausibly have measured.
 
         multiview-stitcher's phase correlation bounds a pairwise shift to the
         tile SIZE, not the overlap (see registration.phase_correlation_
@@ -6094,86 +6168,177 @@ class StitchingPipeline:
         tile — background, or a featureless bright blur — can be flung most of a
         tile away on a garbage correlation peak and open a gap between tiles.
 
-        Cap each tile's net per-axis correction at ``max_registration_shift_um``
-        (0 = auto: the smaller of the X/Y overlap widths, so a tile can never
-        move more than one overlap → gaps become impossible). Over-budget tiles
-        are reset to identity, i.e. their stage position — never worse than
-        stage-only mode for that tile. Returns the (possibly clamped) params.
+        **Lateral and axial are bounded separately**, because they are not the
+        same measurement and no single number describes both. X/Y are bounded by
+        the tile overlap width: a tile that moves more than one overlap opens a
+        gap, so that is a real physical ceiling. Z has no such ceiling on an XY
+        mosaic — every tile spans the same depth, so there is no Z overlap to
+        derive one from — and the old code applied the lateral number to Z
+        anyway. That was not conservative, it was arbitrary: being large, it
+        left Z effectively unguarded, while any single over-budget axis reverted
+        the whole matrix and threw away that tile's other two good corrections.
+
+        X and Y are still reverted **together**: they come out of one joint
+        lateral correlation peak, so if one is garbage the peak is garbage. Z is
+        independent, and is what the optional refinement pass measures on its
+        own.
+
+        Returns a `ClampResult`: the (possibly clamped) params plus a per-tile
+        record of what was seen and what was reverted, which the registration
+        report turns into rows. A clamped axis means **not measured** — never
+        report it as a shift of the bound.
         """
         import numpy as _np
 
         n = len(params)
         if n == 0:
-            return params
+            return ClampResult(params=params, records=[])
 
         # Frame extent (µm) from the reference volume + processing voxel size.
         try:
             shp = tile_data[0][0].shape
-            ny, nx = int(shp[-2]), int(shp[-1])
+            nz, ny, nx = int(shp[-3]), int(shp[-2]), int(shp[-1])
         except Exception:
-            return params  # can't size the bound → leave params untouched
+            # Can't size the bound → leave params untouched rather than guess.
+            return ClampResult(params=params, records=[])
         vx = float(voxel_size_um.get("x", 1.0))
         vy = float(voxel_size_um.get("y", 1.0))
-        frame_x_um, frame_y_um = nx * vx, ny * vy
+        vz = float(voxel_size_um.get("z", 1.0))
+        frame_x_um, frame_y_um, depth_um = nx * vx, ny * vy, nz * vz
 
-        def _min_pitch_um(vals):
-            u = sorted({round(v, 4) for v in vals})
-            gaps = [b - a for a, b in zip(u, u[1:]) if b - a > 1e-6]
-            return (min(gaps) * 1000.0) if gaps else None
-
-        xpitch = _min_pitch_um([t.x_mm for _v, t in tile_data])
-        ypitch = _min_pitch_um([t.y_mm for _v, t in tile_data])
-        overlaps = [
-            o
-            for o in (
-                (frame_x_um - xpitch) if xpitch is not None else None,
-                (frame_y_um - ypitch) if ypitch is not None else None,
-            )
-            if o is not None and o > 0
-        ]
-
-        bound = float(getattr(self.config, "max_registration_shift_um", 0.0) or 0.0)
-        auto = bound <= 0.0
-        if auto:
-            bound = min(overlaps) if overlaps else 0.1 * min(frame_x_um, frame_y_um)
-        # Never revert on a sub-pixel rounding quirk.
-        bound = max(bound, 2.0 * max(vx, vy))
+        bound_xy, source_xy = self._lateral_shift_bound(
+            [t for _v, t in tile_data], frame_x_um, frame_y_um, vx, vy
+        )
+        bound_z, source_z = self._axial_shift_bound(depth_um, vz)
 
         clamped = []
-        n_reverted = 0
-        max_seen = 0.0
-        for param in params:
+        records: List[ClampRecord] = []
+        for index, param in enumerate(params):
             try:
                 arr = _np.asarray(param)
-                if arr.ndim == 3:  # leading singleton time axis (t, x_in, x_out)
-                    arr = arr[0]
-                mag = float(_np.max(_np.abs(arr[:3, 3])))  # (z, y, x) shift in µm
+                mat = arr[0] if arr.ndim == 3 else arr
+                dz, dy, dx = (float(v) for v in mat[:3, 3])  # µm, (z, y, x)
+                # Per-axis surgery is only meaningful for a pure translation.
+                # For a general affine the translation column is the motion of
+                # the world ORIGIN, not of the tile, and a rotation puts real Z
+                # displacement into the 3x3 block — so zeroing one component
+                # would neither remove that axis's error nor leave the others
+                # alone. Today the global solve is translation-only, but ANTsPy
+                # or transform="rigid" would not be.
+                translation_only = _np.allclose(mat[:3, :3], _np.eye(3), atol=1e-9)
             except Exception:
                 clamped.append(param)
                 continue
-            max_seen = max(max_seen, mag)
-            if mag > bound and hasattr(param, "copy"):
-                # Reset to stage position by zeroing the correction, in place on
-                # a copy so the param keeps its exact type + coords (xr.DataArray
-                # for real MVS params, ndarray in tests) — a bare identity would
-                # drop the coords rebase_affine needs downstream.
-                reverted = param.copy()
-                buf = reverted.values if hasattr(reverted, "values") else reverted
-                mat = buf[0] if buf.ndim == 3 else buf
-                mat[:3, :3] = _np.eye(3)
-                mat[:3, 3] = 0.0
-                clamped.append(reverted)
-                n_reverted += 1
-            else:
-                clamped.append(param)
 
-        src = "auto=min overlap width" if auto else "config"
-        self.logger.info(
-            f"  Registration shift clamp: bound {bound:.1f} µm ({src}); "
-            f"{n_reverted}/{n} tiles exceeded it and were reset to their stage "
-            f"position (max shift seen {max_seen:.1f} µm)."
+            if translation_only:
+                clamp_xy = max(abs(dy), abs(dx)) > bound_xy
+                clamp_z = abs(dz) > bound_z
+                whole = False
+            else:
+                clamp_xy = clamp_z = whole = max(abs(dz), abs(dy), abs(dx)) > max(
+                    bound_xy, bound_z
+                )
+
+            records.append(
+                ClampRecord(
+                    index=index,
+                    dz_um=dz,
+                    dy_um=dy,
+                    dx_um=dx,
+                    clamped_xy=clamp_xy,
+                    clamped_z=clamp_z,
+                    whole_matrix=whole,
+                )
+            )
+
+            if not (clamp_xy or clamp_z) or not hasattr(param, "copy"):
+                clamped.append(param)
+                continue
+
+            # Zero the offending components in place on a COPY, so the param
+            # keeps its exact type and coords (xr.DataArray for real MVS params,
+            # ndarray in tests) — a bare identity would drop the x_in/x_out
+            # coords that rebase_affine needs downstream.
+            reverted = param.copy()
+            buf = reverted.values if hasattr(reverted, "values") else reverted
+            out = buf[0] if buf.ndim == 3 else buf
+            if whole:
+                out[:3, :3] = _np.eye(3)
+                out[:3, 3] = 0.0
+            else:
+                if clamp_z:
+                    out[0, 3] = 0.0
+                if clamp_xy:
+                    out[1, 3] = 0.0
+                    out[2, 3] = 0.0
+            clamped.append(reverted)
+
+        result = ClampResult(
+            params=clamped,
+            records=records,
+            bound_xy_um=bound_xy,
+            bound_z_um=bound_z,
+            source_xy=source_xy,
+            source_z=source_z,
         )
-        return clamped
+        self.logger.info(result.summary_line())
+        return result
+
+    def _lateral_shift_bound(self, tiles, frame_x_um, frame_y_um, vx, vy):
+        """(bound µm, source) for X/Y: one tile overlap width.
+
+        A tile that moves more than the overlap has, by definition, been pushed
+        past its neighbour's content — which opens a gap rather than closing
+        one. That makes the overlap a real ceiling rather than a taste setting.
+        """
+        configured = float(getattr(self.config, "max_registration_shift_um", 0.0) or 0.0)
+        if configured > 0.0:
+            return max(configured, 2.0 * max(vx, vy)), "config"
+
+        layout = tile_geometry.grid_overlap(
+            tiles, extent_x_um=frame_x_um, extent_y_um=frame_y_um
+        )
+        widths = [
+            ov.overlap_um
+            for ov in (layout["x"], layout["y"])
+            if ov.overlap_um is not None and ov.overlap_um > 0
+        ]
+        if widths:
+            bound, source = min(widths), "auto: min overlap width"
+        else:
+            # No measurable overlap on either axis (single row/column, or a
+            # gapped grid). 10% of a frame is a fallback, not a measurement.
+            bound, source = 0.1 * min(frame_x_um, frame_y_um), "auto: 10% of frame"
+        # Never revert on a sub-pixel rounding quirk.
+        return max(bound, 2.0 * max(vx, vy)), source
+
+    def _axial_shift_bound(self, depth_um, vz):
+        """(bound µm, source) for Z, which has no overlap width to lean on.
+
+        Sized to admit the error we actually see — a few frames of stage/focus
+        drift between tiles — while still rejecting a correlation peak found
+        halfway down the stack.
+        """
+        configured = float(
+            getattr(self.config, "max_registration_shift_z_um", 0.0) or 0.0
+        )
+        binning_z = 1
+        try:
+            binning_z = max(1, int(self.config.registration_binning.get("z", 1) or 1))
+        except Exception:
+            pass
+        # Pass 1 registers at `binning_z` Z voxels, so it can only EXPRESS
+        # multiples of that. A bound below one binned step would clamp pure
+        # quantization and report it as a rejected measurement.
+        floor = 2.0 * binning_z * vz
+
+        if configured > 0.0:
+            return max(configured, floor), "config"
+
+        bound = max(_Z_CLAMP_MIN_STEPS * vz, _Z_CLAMP_FLOOR_UM)
+        if depth_um > 0:
+            bound = min(bound, _Z_CLAMP_STACK_FRACTION * depth_um)
+        return max(bound, floor), "auto"
 
     def _fuse_chunksize(self, tile_data) -> Dict[str, int]:
         """Output chunks for this fuse, sized against the final grid.
@@ -6845,7 +7010,7 @@ class StitchingPipeline:
 
                 params = self._clamp_registration_shifts(
                     list(params), tile_data, voxel_size_um
-                )
+                ).params
 
                 # Apply transforms
                 for msim, param in zip(msims, params):
