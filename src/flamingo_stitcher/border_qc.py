@@ -34,6 +34,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
+from flamingo_stitcher import tile_geometry
+
 try:  # scipy is a hard dep of the package, but keep the detector importable.
     from scipy import ndimage as _ndi
 except Exception:  # pragma: no cover
@@ -409,10 +411,15 @@ def _group_by(vals, tol):
     return groups
 
 
-def _min_pitch(vals):
-    uniq = sorted({round(v, 4) for v in vals})
-    gaps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
-    return min(gaps) if gaps else 0.0
+def _min_pitch(tiles, axis):
+    """Tightest step along `axis`, in mm, or 0.0 when there is only one row.
+
+    The MIN, not the median, because this feeds a grouping *tolerance*: a
+    fraction of the tightest real spacing is the largest wobble that still
+    cannot merge two genuine rows into one.
+    """
+    pitch_um = tile_geometry.min_pitch_um(tiles, axis)
+    return (pitch_um / 1000.0) if pitch_um is not None else 0.0
 
 
 def find_neighbor_pairs(tiles, *, include_z: bool = False):
@@ -424,7 +431,7 @@ def find_neighbor_pairs(tiles, *, include_z: bool = False):
     """
     xs = [t.x_mm for t in tiles]
     ys = [t.y_mm for t in tiles]
-    px, py = _min_pitch(xs), _min_pitch(ys)
+    px, py = _min_pitch(tiles, "x"), _min_pitch(tiles, "y")
     tol_x = 0.25 * px if px else 1e-6
     tol_y = 0.25 * py if py else 1e-6
     pairs: List[Tuple[int, int, str]] = []
@@ -463,18 +470,13 @@ def find_neighbor_pairs(tiles, *, include_z: bool = False):
 
 def _overlap_px(tile_a, tile_b, vol_a, axis, eff_pixel_um, eff_z_um):
     """Overlap in downsampled px along the seam-normal axis."""
-    if axis == "x":
-        extent = vol_a.shape[2]
-        pitch_um = abs(tile_b.x_mm - tile_a.x_mm) * 1000.0
-        return int(round(extent - pitch_um / eff_pixel_um))
-    if axis == "y":
-        extent = vol_a.shape[1]
-        pitch_um = abs(tile_b.y_mm - tile_a.y_mm) * 1000.0
-        return int(round(extent - pitch_um / eff_pixel_um))
-    # z
-    extent = vol_a.shape[0]
-    pitch_um = abs(tile_b.z_min_mm - tile_a.z_min_mm) * 1000.0
-    return int(round(extent - pitch_um / max(eff_z_um, 1e-9)))
+    axis_index = {"x": 2, "y": 1, "z": 0}[axis]
+    voxel_um = max(eff_z_um, 1e-9) if axis == "z" else eff_pixel_um
+    extent_px = vol_a.shape[axis_index]
+    overlap_um = tile_geometry.pair_overlap_um(
+        tile_a, tile_b, axis, extent_px * voxel_um
+    )
+    return int(round(overlap_um / voxel_um))
 
 
 def _tile_name(tile) -> str:

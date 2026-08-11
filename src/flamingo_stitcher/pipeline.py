@@ -19,6 +19,8 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
+from flamingo_stitcher import tile_geometry
+
 logger = logging.getLogger(__name__)
 
 # Separator placed between a phase's own "this step:" ETA and the whole-run
@@ -1905,22 +1907,22 @@ def _detect_tile_spacing_gaps(
         "X": frame_width * pixel_size_um / 1000.0,
         "Y": frame_height * pixel_size_um / 1000.0,
     }
-    positions = {
-        "X": [float(t.x_mm) for t in tiles],
-        "Y": [float(t.y_mm) for t in tiles],
-    }
+    # RAW camera frame, not the processed shape: this warning is about how the
+    # acquisition was set up, so it must not move when someone downsamples.
+    layout = tile_geometry.grid_overlap(
+        tiles,
+        extent_x_um=cov_mm["X"] * 1000.0,
+        extent_y_um=cov_mm["Y"] * 1000.0,
+    )
     warnings: List[str] = []
     for axis in ("X", "Y"):
         coverage = cov_mm[axis]
         if coverage <= 0:
             continue
-        # Distinct rows/cols along this axis (round to 1 µm to fold float noise).
-        uniq = sorted({round(p, 3) for p in positions[axis]})
-        steps = [b - a for a, b in zip(uniq, uniq[1:]) if b - a > 1e-6]
-        if not steps:
+        pitch_um = layout[axis.lower()].pitch_um
+        if pitch_um is None:
             continue
-        steps.sort()
-        median_step = steps[len(steps) // 2]
+        median_step = pitch_um / 1000.0
         # Overlapping/touching tiles have step <= coverage. Only warn on a clear
         # gap (>2% of a frame) so float noise / exact-touch don't false-positive.
         if median_step <= coverage * 1.02:
