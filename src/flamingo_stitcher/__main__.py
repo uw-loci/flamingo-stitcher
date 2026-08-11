@@ -32,7 +32,14 @@ from .orientation import OrientationUnknownError
 from .pipeline import StitchingConfig, StitchingPipeline, discover_tiles
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI surface, separated from running it so tests can inspect defaults.
+
+    Split out because a flag's default is not a cosmetic choice here: anything
+    passed into ``StitchingConfig`` unconditionally overrides the dataclass and
+    the YAML, so a wrong default is a silent behaviour change on every run
+    rather than a visible error.
+    """
     parser = argparse.ArgumentParser(
         description="Stitch Flamingo T-SPIM raw acquisitions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -223,8 +230,13 @@ def main():
     reg_group.add_argument(
         "--quality-threshold",
         type=float,
-        default=0.2,
-        help="Min phase correlation quality (default: 0.2)",
+        # None, not a literal: a value here is passed into StitchingConfig on
+        # every run, so a hardcoded default silently shadows the dataclass's.
+        # This one said 0.2 while the dataclass says 0.4 — the exact value the
+        # dataclass comment calls out as too permissive — so every CLI run
+        # registered at the known-bad threshold. See the overlay below.
+        default=None,
+        help="Min phase correlation quality (default: 0.4)",
     )
     reg_group.add_argument(
         "--channels",
@@ -390,6 +402,11 @@ def main():
         help="Enable debug logging",
     )
 
+    return parser
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
 
     # Setup logging
@@ -548,7 +565,6 @@ def main():
         depth_attenuation=args.depth_attenuation,
         depth_attenuation_mu=args.depth_attenuation_mu,
         reg_channel=args.reg_channel,
-        quality_threshold=args.quality_threshold,
         output_format=args.output_format,
         package_ozx=args.package_ozx,
         zarr_compression=args.zarr_compression,
@@ -569,6 +585,14 @@ def main():
             else None
         ),
     )
+
+    # Value flags whose argparse default is None mean "the user didn't say", so
+    # they must be applied as an overlay rather than passed into the constructor
+    # above. Passing them in unconditionally is how --quality-threshold spent its
+    # life overriding the dataclass default of 0.4 with 0.2 on every CLI run.
+    for _attr, _value in (("quality_threshold", args.quality_threshold),):
+        if _value is not None:
+            setattr(config, _attr, _value)
 
     # Tile orientation: an explicit --tile-orientation flag wins (with any
     # --reverse-*-tiles). Otherwise resolve per-acquisition from the microscope's
