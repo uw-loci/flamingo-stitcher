@@ -19,7 +19,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-from flamingo_stitcher import tile_geometry
+from flamingo_stitcher import registration_report, tile_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -842,6 +842,48 @@ class StitchingConfig:
     # registrations from corrupting the global solution.
     global_opt_abs_tol: float = 3.5  # Max acceptable residual (pixels)
     global_opt_rel_tol: float = 0.01  # Convergence threshold
+
+    # Minimum measured tile overlap fraction before registration is ATTEMPTED.
+    # Phase correlation on a sliver of shared content does not fail loudly — it
+    # returns a confident garbage peak, which is the failure the shift clamp
+    # exists to mop up afterwards. Below this, place by stage position and say
+    # so in the report rather than clamp half the tiles and call it alignment.
+    min_registration_overlap_frac: float = 0.05
+
+    # Sub-pixel upsampling for phase correlation. multiview-stitcher silently
+    # picks 10 for 2-D data and 2 for 3-D (registration.py:412), so every 3-D
+    # registration this pipeline has ever run resolved shifts to about half a
+    # BINNED voxel — with registration_binning z=2 that is one raw plane, on the
+    # axis where misalignment matters most. 0 = leave MVS's default alone (so a
+    # run is byte-identical to before); 4-10 costs a slightly larger correlation
+    # matrix per pair and nothing else.
+    registration_upsample_factor: int = 0
+
+    # Dedicated second registration pass whose only job is Z. The main pass is
+    # binned z=2 for speed, which is the wrong trade for the axis with the
+    # coarsest voxel: it resolves Z to ~one raw plane while resolving XY to a
+    # fraction of a pixel. The second pass re-registers from the first pass's
+    # result at full Z resolution and contributes ONLY its Z component. Off by
+    # default — it is a second pairwise pass, roughly doubling registration
+    # time. Turn it on when the seam report shows Z disagreement.
+    registration_z_refine: bool = False
+    # Half-width of the Z search, µm. A correction that comes back at the limit
+    # is a floor rather than a measurement, so it is rejected (the tile keeps
+    # its pass-1 Z) and counted separately in the report.
+    registration_z_refine_range_um: float = 40.0
+    # Finer Z, same XY as the main pass: the point is Z resolution, and
+    # unbinning XY as well would multiply the cost for nothing.
+    registration_z_refine_binning: Dict[str, int] = field(
+        default_factory=lambda: {"z": 1, "y": 4, "x": 4}
+    )
+    registration_z_refine_upsample: int = 10  # sub-plane; skimage's 2-D default
+
+    # Write registration_report.csv / registration_seams.csv /
+    # registration_report.txt into the output directory. ON by default, unlike
+    # border QC: registration is the one step whose effect is invisible in the
+    # output, and the cost is a few kB and milliseconds.
+    registration_report_enabled: bool = True
+    registration_report_json: bool = False  # machine-readable twin
 
     # Illumination fusion
     illumination_fusion: str = "max"  # "max", "mean", or "leonardo"
@@ -3593,6 +3635,11 @@ class StitchingPipeline:
         self._memory_warning_fn = memory_warning_fn
         self._memory_monitor = None
         self._estimator = None  # built once tile count is known
+        # Per-run registration evidence. Stashed on self, like _estimator,
+        # because _register_tiles is called from three places (in-memory,
+        # preview, streaming) while the report is written at the metadata step,
+        # long after the params have been consumed by fusion.
+        self._registration_report = None
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -3844,6 +3891,38 @@ class StitchingPipeline:
             z_stride=max(1, int(self.config.border_qc_z_stride)),
             include_z_seams=bool(self.config.border_qc_include_z_seams),
         )
+
+    def _write_registration_report(self, output_path, acquisition_dir):
+        """Write the registration evidence next to the stitched output.
+
+        Into the OUTPUT directory, unlike border QC, which puts its report
+        beside the log. These numbers describe the store sitting next to them
+        and have to travel with it when the result is copied off the rig.
+
+        A report is written even when registration did not run — the file says
+        so and names the reason. A missing file is indistinguishable from a
+        feature nobody implemented, which is exactly the ambiguity that let
+        'Skip registration' stay on unnoticed.
+        """
+        report = self._registration_report
+        if report is None:
+            report = registration_report.skipped_report(
+                "no registration stage ran for this output"
+            )
+        acq_name = Path(acquisition_dir).name or "acquisition"
+        written = registration_report.write_report(
+            output_path,
+            report,
+            acquisition=acq_name,
+            write_json=bool(self.config.registration_report_json),
+            logger=self.logger,
+        )
+        for line in registration_report.format_report_text(
+            report, acquisition=acq_name
+        ).splitlines():
+            self.logger.info(line)
+        for path in written.values():
+            self.logger.info(f"  Wrote {path}")
 
     def _run_border_qc(
         self, channel_tile_data, tiles, acquisition_dir, voxel_size_um, output_path
@@ -4347,6 +4426,12 @@ class StitchingPipeline:
             self.logger.info(
                 "Step 3: Skipping registration — using stage positions only"
             )
+            self._registration_report = registration_report.skipped_report(
+                "'Skip registration' was on: tiles were placed by stage position "
+                "only, so any tile-to-tile offset in the output is stage placement "
+                "error and no correction was even attempted",
+                tiles=tiles,
+            )
             reg_params = []
             try:
                 from multiview_stitcher import io as mvs_io
@@ -4530,6 +4615,12 @@ class StitchingPipeline:
             acquisition_dir,
             basename,
         )
+
+        if self.config.registration_report_enabled:
+            try:
+                self._write_registration_report(output_path, acquisition_dir)
+            except Exception as exc:  # evidence must never fail a run
+                self.logger.warning(f"Registration report skipped: {exc}")
 
         elapsed = time.time() - t0
         self.logger.info(
@@ -4753,6 +4844,12 @@ class StitchingPipeline:
             self._progress_fn(45, "Skipping registration (using stage positions)...")
             self.logger.info(
                 "Step 3: Skipping registration \u2014 using stage positions only"
+            )
+            self._registration_report = registration_report.skipped_report(
+                "'Skip registration' was on: tiles were placed by stage position "
+                "only, so any tile-to-tile offset in the output is stage placement "
+                "error and no correction was even attempted",
+                tiles=tiles,
             )
             reg_params = []
             try:
@@ -5299,6 +5396,12 @@ class StitchingPipeline:
             acquisition_dir,
             basename,
         )
+
+        if self.config.registration_report_enabled:
+            try:
+                self._write_registration_report(output_path, acquisition_dir)
+            except Exception as exc:  # evidence must never fail a run
+                self.logger.warning(f"Registration report skipped: {exc}")
 
         elapsed = time.time() - t0
         self.logger.info(
@@ -6113,8 +6216,28 @@ class StitchingPipeline:
 
         self.logger.info(f"  Built {len(msims)} multiscale spatial images")
 
+        tiles = [ti for _v, ti in tile_data]
+        extent_um = self._frame_extent_um(tile_data, voxel_size_um)
+
         if len(msims) <= 1:
+            self._registration_report = registration_report.skipped_report(
+                "single tile — nothing to register against",
+                tiles=tiles,
+                voxel_size_um=voxel_size_um,
+                frame_extent_um=extent_um,
+            )
             self.logger.info("  Single tile — skipping registration")
+            return [], mvs_io.METADATA_TRANSFORM_KEY
+
+        gate_reason = self._registration_overlap_gate(tiles, extent_um)
+        if gate_reason:
+            self.logger.warning(f"  Registration SKIPPED: {gate_reason}")
+            self._registration_report = registration_report.skipped_report(
+                gate_reason,
+                tiles=tiles,
+                voxel_size_um=voxel_size_um,
+                frame_extent_um=extent_um,
+            )
             return [], mvs_io.METADATA_TRANSFORM_KEY
 
         # Run registration
@@ -6122,42 +6245,330 @@ class StitchingPipeline:
             f"  Running phase correlation registration "
             f"(quality threshold={self.config.quality_threshold})..."
         )
+        started = time.time()
+        # Assigned before the try so the finally block cannot raise NameError
+        # over the top of the real failure if an import inside it blows up.
+        reg_logger = logging.getLogger("multiview_stitcher.registration")
+        saved_level = reg_logger.level
         try:
             import dask.diagnostics
 
             # Suppress per-tile-pair registration spam from multiview_stitcher
-            reg_logger = logging.getLogger("multiview_stitcher.registration")
-            _saved_level = reg_logger.level
             reg_logger.setLevel(logging.WARNING)
 
+            sink: Dict[str, Any] = {}
             with dask.diagnostics.ProgressBar():
-                params = registration.register(
-                    msims,
-                    reg_channel_index=0,
-                    transform_key=mvs_io.METADATA_TRANSFORM_KEY,
-                    new_transform_key="registered",
-                    registration_binning=self.config.registration_binning,
-                    post_registration_do_quality_filter=True,
-                    post_registration_quality_threshold=self.config.quality_threshold,
-                    groupwise_resolution_kwargs={
-                        "abs_tol": self.config.global_opt_abs_tol,
-                        "rel_tol": self.config.global_opt_rel_tol,
-                    },
-                )
-            clamp = self._clamp_registration_shifts(
-                list(params), tile_data, voxel_size_um
-            )
+                with registration_report.capture_prefilter_graph(sink):
+                    result = registration.register(
+                        msims,
+                        reg_channel_index=0,
+                        transform_key=mvs_io.METADATA_TRANSFORM_KEY,
+                        new_transform_key="registered",
+                        registration_binning=self.config.registration_binning,
+                        post_registration_do_quality_filter=True,
+                        post_registration_quality_threshold=(
+                            self.config.quality_threshold
+                        ),
+                        pairwise_reg_func_kwargs=self._pairwise_reg_kwargs(
+                            self.config.registration_upsample_factor
+                        ),
+                        groupwise_resolution_kwargs={
+                            "abs_tol": self.config.global_opt_abs_tol,
+                            "rel_tol": self.config.global_opt_rel_tol,
+                        },
+                        return_dict=True,
+                    )
+            params = list(result["params"])
+            clamp = self._clamp_registration_shifts(params, tile_data, voxel_size_um)
             params = clamp.params
+
+            # multiview-stitcher wrote the UNCLAMPED params into the msims under
+            # "registered" before returning, so a second pass starting from that
+            # key would build on exactly the shifts the clamp just rejected.
+            # Overwrite with the clamped ones. set_affine_transform re-derives
+            # from the untouched metadata base, so this is idempotent.
+            for msim, param in zip(msims, params):
+                msi_utils.set_affine_transform(
+                    msim,
+                    param,
+                    transform_key="registered",
+                    base_transform_key=mvs_io.METADATA_TRANSFORM_KEY,
+                )
+
+            params, z_summary = self._refine_z_shifts(
+                msims, params, tile_data, voxel_size_um, registration, clamp
+            )
+
+            self._registration_report = registration_report.build_report(
+                tiles=tiles,
+                params=params,
+                voxel_size_um=voxel_size_um,
+                transform_key="registered",
+                clamp_records=clamp.records,
+                reg_dict=result,
+                prefilter_graph=sink.get("prefilter"),
+                quality_threshold=self.config.quality_threshold,
+                frame_extent_um=extent_um,
+                settings=self._registration_settings(clamp, voxel_size_um),
+                z_refine=z_summary,
+                elapsed_s=time.time() - started,
+            )
             self.logger.info("  Registration complete")
             return params, "registered"
 
         except Exception as e:
             self.logger.error(f"  Registration failed: {e}")
             self.logger.info("  Falling back to metadata positions only")
+            self._registration_report = registration_report.skipped_report(
+                f"registration raised and the run fell back to stage positions: {e}",
+                tiles=tiles,
+                voxel_size_um=voxel_size_um,
+                frame_extent_um=extent_um,
+            )
             return [], mvs_io.METADATA_TRANSFORM_KEY
 
         finally:
-            reg_logger.setLevel(_saved_level)
+            reg_logger.setLevel(saved_level)
+
+    # ------------------------------------------------------------------
+    # Registration helpers
+    # ------------------------------------------------------------------
+
+    def _frame_extent_um(self, tile_data, voxel_size_um) -> Dict[str, float]:
+        """What one tile covers along each axis, in processing-frame µm."""
+        try:
+            shp = tile_data[0][0].shape
+            return {
+                "z": int(shp[-3]) * float(voxel_size_um.get("z", 1.0)),
+                "y": int(shp[-2]) * float(voxel_size_um.get("y", 1.0)),
+                "x": int(shp[-1]) * float(voxel_size_um.get("x", 1.0)),
+            }
+        except Exception:
+            return {}
+
+    def _registration_overlap_gate(self, tiles, extent_um) -> Optional[str]:
+        """Reason to skip registration entirely, or None to proceed.
+
+        Phase correlation needs shared content. Below a few percent overlap it
+        does not return "no answer" — it returns a confident wrong one, and the
+        clamp then reverts tile after tile while the log reads like a successful
+        registration. Refusing up front is both cheaper and more honest.
+        """
+        if not extent_um:
+            return None  # can't measure; let registration try rather than veto it
+        threshold = float(
+            getattr(self.config, "min_registration_overlap_frac", None)
+            or MIN_REGISTRATION_OVERLAP
+        )
+        layout = tile_geometry.grid_overlap(
+            tiles, extent_x_um=extent_um["x"], extent_y_um=extent_um["y"]
+        )
+        fractions = {
+            axis: layout[axis].fraction
+            for axis in ("x", "y")
+            if layout[axis].fraction is not None
+        }
+        if not fractions:
+            return None  # a single row or column: no pitch to judge, so proceed
+        worst_axis = min(fractions, key=lambda a: fractions[a])
+        worst = fractions[worst_axis]
+        if worst >= threshold:
+            return None
+        return (
+            f"measured tile overlap is only {worst * 100:.1f}% on {worst_axis.upper()} "
+            f"(need >= {threshold * 100:.0f}%). Phase correlation on this little "
+            f"shared content returns a confident wrong shift rather than failing, "
+            f"so tiles are placed by stage position instead. Re-acquire with ~10% "
+            f"tile overlap."
+        )
+
+    @staticmethod
+    def _pairwise_reg_kwargs(upsample_factor) -> Optional[Dict[str, Any]]:
+        """kwargs for the pairwise registration function, or None to leave MVS's.
+
+        None rather than {} so an unconfigured run reaches multiview-stitcher
+        exactly as it did before this option existed.
+        """
+        try:
+            factor = int(upsample_factor or 0)
+        except (TypeError, ValueError):
+            return None
+        return {"upsample_factor": factor} if factor > 0 else None
+
+    def _refine_z_shifts(
+        self, msims, params, tile_data, voxel_size_um, registration, clamp
+    ):
+        """Second registration pass whose only contribution is Z.
+
+        The main pass registers at ``registration_binning`` (z=2 by default) and
+        multiview-stitcher upsamples 3-D phase correlation by only 2, so Z comes
+        out quantized to about one raw plane — on the axis with the coarsest
+        voxel and, per the field reports, the largest error. This pass re-runs
+        the same machinery at full Z resolution starting from the first pass's
+        result, so it estimates the RESIDUAL, and contributes **only** its Z
+        component: X/Y stay exactly as pass 1 left them, because two passes
+        arguing about the same axis is how a mosaic oscillates.
+
+        Returns ``(params, ZRefineSummary)``. Any failure here returns pass 1's
+        params untouched — a refinement that cannot run must never cost the
+        registration that already worked.
+        """
+        summary = registration_report.ZRefineSummary(
+            binning=dict(self.config.registration_z_refine_binning),
+            upsample_factor=int(self.config.registration_z_refine_upsample),
+            search_range_um=float(self.config.registration_z_refine_range_um),
+        )
+        if not self.config.registration_z_refine:
+            summary.reason = "disabled (registration_z_refine)"
+            return params, summary
+
+        # Keep "Registering" in the message: the phase attribution in the
+        # estimator and in the memory probes keys off that substring, so the
+        # second pass lands in the register phase rather than in Other/setup.
+        self._progress_fn(48, "Registering tiles (Z refinement)...")
+        self.logger.info(
+            "  Z refinement pass: binning z="
+            f"{summary.binning.get('z')}, upsample={summary.upsample_factor}, "
+            f"search ±{summary.search_range_um:.0f} µm"
+        )
+        try:
+            import dask.diagnostics
+
+            with dask.diagnostics.ProgressBar():
+                refined = registration.register(
+                    msims,
+                    reg_channel_index=0,
+                    # Start from pass 1's (clamped) placement, so what comes
+                    # back is the residual rather than a competing absolute.
+                    transform_key="registered",
+                    registration_binning=dict(
+                        self.config.registration_z_refine_binning
+                    ),
+                    post_registration_do_quality_filter=True,
+                    post_registration_quality_threshold=self.config.quality_threshold,
+                    pairwise_reg_func_kwargs=self._pairwise_reg_kwargs(
+                        self.config.registration_z_refine_upsample
+                    ),
+                    # No pruning, and it has to be none.
+                    #
+                    # Both of multiview-stitcher's grid-aware methods assume the
+                    # views still sit on a clean grid. "keep_axis_aligned" drops
+                    # any edge whose vector is more than 0.05 rad off an axis,
+                    # and pass 2 runs in the frame pass 1 just finished nudging
+                    # tiles out of: on a 2-tile phantom a 1.6 µm lateral
+                    # correction across a 10 µm separation is 9 degrees, and it
+                    # deleted the only edge in the graph. The checkerboard
+                    # default would halve the evidence for no reason too.
+                    #
+                    # So every overlapping pair contributes. That costs roughly
+                    # 1.7x the edges of pass 1 on a regular grid (the diagonals
+                    # come back), which is the bulk of this pass's ~3x cost —
+                    # and it buys more independent Z estimates, which is the
+                    # entire point of running it.
+                    pre_registration_pruning_method=None,
+                    groupwise_resolution_kwargs={
+                        "abs_tol": self.config.global_opt_abs_tol,
+                        "rel_tol": self.config.global_opt_rel_tol,
+                    },
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"  Z refinement failed ({exc}); keeping the first pass's result"
+            )
+            summary.reason = f"failed: {exc}"
+            return params, summary
+
+        merged, summary = self._merge_z_refinement(
+            params, list(refined), summary, clamp
+        )
+        self.logger.info(
+            f"  Z refinement: adjusted {summary.n_tiles_moved}/{len(params)} tiles "
+            f"(|dz| median {summary.median_abs_dz_um:.2f} µm, "
+            f"max {summary.max_abs_dz_um:.2f} µm)"
+        )
+        if summary.n_hit_search_limit:
+            self.logger.warning(
+                f"  Z refinement: {summary.n_hit_search_limit} corrections came back "
+                f"at the ±{summary.search_range_um:.0f} µm search limit and were "
+                f"REJECTED — those are floors, not measurements."
+            )
+        summary.ran = True
+        return merged, summary
+
+    def _merge_z_refinement(self, params, residuals, summary, clamp):
+        """Fold pass 2's Z residual into pass 1's params. Z only, by design."""
+        import numpy as _np
+
+        search = float(summary.search_range_um)
+        bound_z = clamp.bound_z_um if clamp.bound_z_um is not None else search
+        applied: List[float] = []
+        merged = []
+        for index, param in enumerate(params):
+            if index >= len(residuals):
+                merged.append(param)
+                continue
+            try:
+                base = _np.asarray(param, dtype=float)
+                extra = _np.asarray(residuals[index], dtype=float)
+                base_mat = base[0] if base.ndim == 3 else base
+                extra_mat = extra[0] if extra.ndim == 3 else extra
+                # Additive composition (t2 + t1) is only valid for pure
+                # translations; for anything else the axes are coupled and a
+                # Z-only graft is meaningless. Keep pass 1 in that case.
+                eye = _np.eye(3)
+                if not (
+                    _np.allclose(base_mat[:3, :3], eye, atol=1e-9)
+                    and _np.allclose(extra_mat[:3, :3], eye, atol=1e-9)
+                ):
+                    merged.append(param)
+                    continue
+                dz = float(extra_mat[0, 3])
+            except Exception:
+                merged.append(param)
+                continue
+
+            if abs(dz) >= search:
+                # At the search limit the number is a lower bound on the error,
+                # not the error. Applying it would move the tile by an amount we
+                # know to be wrong; reporting it as a result would be worse.
+                summary.n_hit_search_limit += 1
+                merged.append(param)
+                continue
+            total_z = float(base_mat[0, 3]) + dz
+            if abs(total_z) > bound_z:
+                merged.append(param)
+                continue
+            if abs(dz) < 1e-9 or not hasattr(param, "copy"):
+                merged.append(param)
+                continue
+
+            updated = param.copy()
+            buf = updated.values if hasattr(updated, "values") else updated
+            out = buf[0] if buf.ndim == 3 else buf
+            out[0, 3] = total_z
+            merged.append(updated)
+            applied.append(abs(dz))
+
+        summary.n_tiles_moved = len(applied)
+        summary.max_abs_dz_um = max(applied) if applied else 0.0
+        if applied:
+            ordered = sorted(applied)
+            summary.median_abs_dz_um = ordered[len(ordered) // 2]
+        return merged, summary
+
+    def _registration_settings(self, clamp, voxel_size_um) -> Dict[str, Any]:
+        return {
+            "quality_threshold": self.config.quality_threshold,
+            "registration_binning": dict(self.config.registration_binning),
+            "upsample_factor": self.config.registration_upsample_factor,
+            "voxel_z_um": float(voxel_size_um.get("z", 0.0)),
+            "voxel_y_um": float(voxel_size_um.get("y", 0.0)),
+            "voxel_x_um": float(voxel_size_um.get("x", 0.0)),
+            "bound_xy_um": clamp.bound_xy_um,
+            "bound_xy_source": clamp.source_xy,
+            "bound_z_um": clamp.bound_z_um,
+            "bound_z_source": clamp.source_z,
+        }
 
     def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):
         """Revert corrections registration cannot plausibly have measured.
