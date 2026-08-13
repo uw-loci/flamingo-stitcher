@@ -1097,7 +1097,23 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._tiff_pyramids_cb, 1, 3)
 
-        # Proc Row 2: Registration
+        # Registration gets its own titled box. Previously its controls were
+        # spread across the shared grid with each combo stretched to the right
+        # edge, so "Reg. binning:" sat a hand's width from the dropdown it
+        # names and nothing indicated which settings belonged together. Labels
+        # now sit immediately left of the control they label.
+        reg_group = QGroupBox("Registration")
+        reg_layout = QGridLayout()
+        reg_layout.setContentsMargins(8, 4, 8, 6)
+        reg_layout.setHorizontalSpacing(6)
+        reg_layout.setVerticalSpacing(4)
+        # Only the control columns stretch; the label columns stay tight to
+        # their widget instead of being pushed apart by the free space.
+        reg_layout.setColumnStretch(0, 0)
+        reg_layout.setColumnStretch(1, 1)
+        reg_layout.setColumnStretch(2, 0)
+        reg_layout.setColumnStretch(3, 1)
+
         self._skip_reg_cb = QCheckBox("Skip registration")
         self._skip_reg_cb.setToolTip(
             "Use stage positions only \u2014 skip phase-correlation registration.\n\n"
@@ -1108,10 +1124,10 @@ class StitchingDialog(PersistentDialog):
             "  \u2022 Tiles overlap and you need sub-pixel alignment"
         )
         self._skip_reg_cb.toggled.connect(self._on_skip_reg_toggled)
-        proc_layout.addWidget(self._skip_reg_cb, 2, 0)
+        reg_layout.addWidget(self._skip_reg_cb, 0, 0, 1, 2)
 
         self._reg_binning_label = QLabel("Reg. binning:")
-        proc_layout.addWidget(self._reg_binning_label, 2, 1)
+        reg_layout.addWidget(self._reg_binning_label, 0, 2)
         self._reg_binning_combo = QComboBox()
         self._reg_binning_combo.addItem("Fine (z1 y2 x2)", {"z": 1, "y": 2, "x": 2})
         self._reg_binning_combo.addItem("Default (z2 y4 x4)", {"z": 2, "y": 4, "x": 4})
@@ -1120,12 +1136,12 @@ class StitchingDialog(PersistentDialog):
         self._reg_binning_combo.setToolTip(
             "How much to downsample tiles for phase-correlation registration."
         )
-        proc_layout.addWidget(self._reg_binning_combo, 2, 2, 1, 2)
+        reg_layout.addWidget(self._reg_binning_combo, 0, 3)
 
         # Proc Row 3: Max registration shift (registration sub-option; only
         # meaningful when registration runs, so it greys out with Skip reg).
         self._max_reg_shift_label = QLabel("Max reg. shift:")
-        proc_layout.addWidget(self._max_reg_shift_label, 3, 0)
+        reg_layout.addWidget(self._max_reg_shift_label, 1, 0)
         self._max_reg_shift_spin = _NoScrollDoubleSpinBox()
         self._max_reg_shift_spin.setRange(0.0, 100000.0)
         self._max_reg_shift_spin.setDecimals(1)
@@ -1144,14 +1160,14 @@ class StitchingDialog(PersistentDialog):
             "move more than one overlap (gaps impossible). Set a smaller value to\n"
             "allow only fine refinement. Ignored when Skip registration is on."
         )
-        proc_layout.addWidget(self._max_reg_shift_spin, 3, 1, 1, 3)
+        reg_layout.addWidget(self._max_reg_shift_spin, 1, 1)
 
         # Proc Row 4: axial registration controls. Z is separated from the
         # lateral cap above because the two are not the same measurement: the
         # lateral bound is a tile overlap width, and a mosaic tiled only in X/Y
         # has no Z overlap to derive a bound from.
         self._max_reg_shift_z_label = QLabel("Max Z shift:")
-        proc_layout.addWidget(self._max_reg_shift_z_label, 4, 0)
+        reg_layout.addWidget(self._max_reg_shift_z_label, 1, 2)
         self._max_reg_shift_z_spin = _NoScrollDoubleSpinBox()
         self._max_reg_shift_z_spin.setRange(0.0, 100000.0)
         self._max_reg_shift_z_spin.setDecimals(1)
@@ -1171,7 +1187,7 @@ class StitchingDialog(PersistentDialog):
             "A tile clamped in Z was NOT measured — it kept its stage position.\n"
             "The registration report says which tiles those were."
         )
-        proc_layout.addWidget(self._max_reg_shift_z_spin, 4, 1)
+        reg_layout.addWidget(self._max_reg_shift_z_spin, 1, 3)
 
         self._z_refine_cb = QCheckBox("Refine Z alignment ✱")
         self._z_refine_cb.setToolTip(
@@ -1185,8 +1201,9 @@ class StitchingDialog(PersistentDialog):
             "Costs roughly 2-3x the registration time. Turn it on when\n"
             "registration_seams.csv shows pairs disagreeing in Z while X/Y is clean."
         )
-        proc_layout.addWidget(self._z_refine_cb, 4, 2)
+        reg_layout.addWidget(self._z_refine_cb, 2, 0, 1, 2)
 
+        self._z_refine_range_label = QLabel("Z search:")
         self._z_refine_range_spin = _NoScrollDoubleSpinBox()
         self._z_refine_range_spin.setRange(1.0, 100000.0)
         self._z_refine_range_spin.setDecimals(0)
@@ -1201,7 +1218,11 @@ class StitchingDialog(PersistentDialog):
             "first-pass Z and the report counts it separately. Widening the search\n"
             "is the fix, not trusting the number."
         )
-        proc_layout.addWidget(self._z_refine_range_spin, 4, 3)
+        reg_layout.addWidget(self._z_refine_range_label, 2, 2)
+        reg_layout.addWidget(self._z_refine_range_spin, 2, 3)
+
+        reg_group.setLayout(reg_layout)
+        proc_layout.addWidget(reg_group, 2, 0, 3, 4)
 
         # Proc Row 5: Fusion chunk size
         proc_layout.addWidget(QLabel("Fusion chunk size:"), 5, 0)
@@ -2460,6 +2481,7 @@ class StitchingDialog(PersistentDialog):
         self._max_reg_shift_z_spin.setEnabled(not checked)
         self._max_reg_shift_z_label.setEnabled(not checked)
         self._z_refine_cb.setEnabled(not checked)
+        self._z_refine_range_label.setEnabled(not checked)
         self._z_refine_range_spin.setEnabled(not checked)
 
     def _on_downsample_xy_changed(self, _index: int):

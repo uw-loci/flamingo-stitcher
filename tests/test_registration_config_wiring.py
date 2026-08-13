@@ -237,3 +237,84 @@ class TestTheTimingCacheKey:
         cfg = StitchingConfig()
         cfg.registration_z_refine = True
         assert build_timing_key([], cfg, None).z_refine is True
+
+
+class TestEveryWidgetReferenceIsAssigned:
+    """No method may use a `self._widget` the constructor never creates.
+
+    The GUI cannot be imported in CI (no PyQt5), so a typo or a widget added to
+    a layout before it exists raises only on a real user's machine, at dialog
+    construction, as an AttributeError with the tab already half-built. This
+    walks the class instead: every `self._x` READ anywhere in a dialog class
+    must be assigned somewhere in that class or a base class in this file.
+    """
+
+    _CLASSES = ("StitchingDialog", "NativeStitchingDialog", "MultiViewStitchingDialog")
+
+    @staticmethod
+    def _tree():
+        return ast.parse(DIALOG.read_text(encoding="utf-8"))
+
+    def _class_nodes(self):
+        by_name = {
+            n.name: n
+            for n in self._tree().body
+            if isinstance(n, ast.ClassDef)
+        }
+        return by_name
+
+    def test_no_method_reads_an_attribute_nothing_assigns(self):
+        by_name = self._class_nodes()
+        assigned = set()
+        tree = self._tree()
+        # `self.x = ...` anywhere in the file (subclasses inherit, and
+        # setattr-style dynamic creation is rare enough to ignore).
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Store):
+                if isinstance(node.value, ast.Name) and node.value.id == "self":
+                    assigned.add(node.attr)
+        # ...plus class-level constants (`_SETTINGS_GROUP = "..."`), which are
+        # read through self but never assigned through it.
+        for cls in by_name.values():
+            for stmt in cls.body:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name):
+                            assigned.add(target.id)
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(
+                    stmt.target, ast.Name
+                ):
+                    assigned.add(stmt.target.id)
+
+        missing = {}
+        for cls_name in self._CLASSES:
+            cls = by_name.get(cls_name)
+            if cls is None:
+                continue
+            for node in ast.walk(cls):
+                if not (
+                    isinstance(node, ast.Attribute)
+                    and isinstance(node.ctx, ast.Load)
+                    and isinstance(node.value, ast.Name)
+                    and node.value.id == "self"
+                ):
+                    continue
+                name = node.attr
+                if not name.startswith("_"):
+                    continue  # public API / inherited Qt methods
+                if name in assigned:
+                    continue
+                # Methods defined on the class are attributes too.
+                if any(
+                    isinstance(c, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and c.name == name
+                    for other in by_name.values()
+                    for c in other.body
+                ):
+                    continue
+                missing.setdefault(cls_name, set()).add(name)
+
+        assert not missing, (
+            "these attributes are read but never assigned — the dialog will "
+            f"raise AttributeError when built: {missing}"
+        )
