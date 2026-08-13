@@ -239,3 +239,59 @@ class TestNonTranslationalParams:
         out = np.asarray(result.params[0])
         out = out[0] if out.ndim == 3 else out
         assert np.allclose(out[:3, :3], mat[:3, :3])
+
+
+class TestTheBoundIsRelativeToWhereTilesWerePlaced:
+    """A correction every tile shares opens no seam, so it must not be clamped.
+
+    The clamp used to measure each tile against its ORIGINAL stage position.
+    On a large mosaic a systematic offset accumulates past one overlap while
+    every adjacent pair stays perfectly matched — so the far end of the grid
+    got reverted for doing exactly what registration is for.
+    """
+
+    def test_a_mosaic_wide_offset_is_not_clamped(self):
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08, 0.16, 0.24, 0.32], [0.0] * 5)
+        # Every tile moved 60 µm in X — three times the 20 µm overlap, but the
+        # mosaic simply slid and not one seam changed.
+        out = pipe._clamp_registration_shifts(_params([(0, 0, 60)] * 5), td, _VOXEL)
+        for param in out.params:
+            assert _trans(param)[2] == pytest.approx(60, abs=1e-6)
+
+    def test_a_single_tile_flung_away_is_still_clamped(self):
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08, 0.16, 0.24, 0.32], [0.0] * 5)
+        shifts = [(0, 0, 60), (0, 0, 60), (0, 0, 400), (0, 0, 60), (0, 0, 60)]
+        out = pipe._clamp_registration_shifts(_params(shifts), td, _VOXEL)
+        assert out.records[2].clamped_xy is True
+        assert np.allclose(_trans(out.params[2]), 0.0)
+        # ...and its well-behaved neighbours are untouched.
+        assert _trans(out.params[0])[2] == pytest.approx(60, abs=1e-6)
+
+    def test_outliers_cannot_drag_the_baseline_they_are_judged_against(self):
+        # Two bad tiles out of five: the median holds, so both are caught.
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08, 0.16, 0.24, 0.32], [0.0] * 5)
+        shifts = [(0, 0, 0), (0, 0, 300), (0, 0, 0), (0, 0, -300), (0, 0, 0)]
+        out = pipe._clamp_registration_shifts(_params(shifts), td, _VOXEL)
+        assert [r.clamped_xy for r in out.records] == [
+            False, True, False, True, False,
+        ]
+
+    def test_the_record_keeps_both_the_absolute_and_the_relative_shift(self):
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08, 0.16], [0.0] * 3)
+        out = pipe._clamp_registration_shifts(
+            _params([(0, 0, 50), (0, 0, 50), (0, 0, 130)]), td, _VOXEL
+        )
+        assert out.records[2].dx_um == pytest.approx(130.0)  # proposed
+        assert out.records[2].rel_x_um == pytest.approx(80.0)  # judged
+
+    def test_two_tiles_fall_back_to_the_absolute_bound(self):
+        # No majority, so no consensus: with two disagreeing tiles there is no
+        # way to say which one moved, and the stage position is all there is.
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08], [0.0, 0.0])
+        out = pipe._clamp_registration_shifts(_params([(0, 0, 60)] * 2), td, _VOXEL)
+        assert all(np.allclose(_trans(p), 0.0) for p in out.params)

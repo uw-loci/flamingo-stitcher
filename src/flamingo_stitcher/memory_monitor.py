@@ -30,6 +30,77 @@ except Exception:  # pragma: no cover - psutil is a hard dep, but never crash
     _HAVE_PSUTIL = False
 
 
+def _linux_smaps_rollup() -> Dict[str, int]:
+    """`/proc/self/smaps_rollup` as {key: bytes}. Empty on any failure."""
+    out: Dict[str, int] = {}
+    try:
+        with open("/proc/self/smaps_rollup", "r") as handle:
+            for line in handle:
+                key, _, rest = line.partition(":")
+                parts = rest.split()
+                if len(parts) == 2 and parts[1] == "kB":
+                    out[key.strip()] = int(parts[0]) * 1024
+    except Exception:
+        return {}
+    return out
+
+
+def memory_split(proc=None) -> Tuple[int, int]:
+    """``(private_commit_bytes, mapped_resident_bytes)`` for this process.
+
+    These are two genuinely different things and the pipeline's memory model
+    only predicts the first:
+
+    * **private commit** — anonymous memory this process allocated. If it
+      exceeds RAM the process dies. This is what `estimate_memory_usage`
+      projects, and the only figure worth comparing against it.
+    * **mapped resident** — pages of memory-mapped FILES currently in the
+      working set: the tile spill and the multi-hundred-GB `fused.dat`. These
+      are backed by disk, the OS reclaims them under pressure, and they do not
+      by themselves cause an OOM.
+
+    Why this exists: the watchdog used USS, and USS counts both. On Windows
+    `QueryWorkingSetEx` marks a page shared only when another process also maps
+    it, so a 400 GB fused memmap owned by one process reads as entirely
+    private — and the watchdog reported a working set 13x the projection on a
+    run that completed comfortably. Flushing the memmap per region does not
+    help: `flush()` writes pages back and makes them CLEAN, it does not evict
+    them, so they stay resident and stay counted.
+
+    Mapped-resident is not noise, though, and is reported rather than
+    discarded: when the scratch disk is too slow to absorb write-back, that
+    backlog is what freezes the machine.
+    """
+    if not _HAVE_PSUTIL:
+        return (0, 0)
+    proc = proc or psutil.Process()
+    try:
+        info = proc.memory_info()
+    except Exception:
+        return (0, 0)
+
+    # Windows: PrivateUsage — private commit, excludes mapped files by
+    # construction. rss here is WorkingSetSize, which includes them.
+    private = getattr(info, "private", None)
+    if private is not None:
+        rss = int(getattr(info, "rss", 0) or 0)
+        return (int(private), max(0, rss - int(private)))
+
+    # Linux: smaps_rollup separates anonymous from file-backed directly.
+    rollup = _linux_smaps_rollup()
+    if rollup:
+        anon = rollup.get("Anonymous", 0)
+        rss = rollup.get("Rss", 0)
+        return (int(anon), max(0, int(rss) - int(anon)))
+
+    # Nothing better available (macOS, restricted platforms): fall back to USS,
+    # which over-counts by the mapped set rather than under-counting.
+    try:
+        return (int(proc.memory_full_info().uss), 0)
+    except Exception:
+        return (int(getattr(info, "rss", 0) or 0), 0)
+
+
 def top_memory_consumers(
     limit: int = 5, min_gb: float = 1.0, exclude_self: bool = True
 ) -> List[Tuple[str, float, int]]:
@@ -116,11 +187,22 @@ class MemoryMonitor:
         metric: str = "uss",
     ) -> None:
         """
-        metric: "uss" (unique set size — private/committed memory, the right
-            proxy for "will I OOM"; excludes shared + file-backed memmap page
-            cache) or "rss" (resident, includes memmap page cache — overcounts
-            spilled tiles). USS needs /proc/smaps so it's sampled a bit slower;
-            falls back to RSS automatically if unavailable on the platform.
+        metric:
+            "private" (**default, and the one to use against a projection**) —
+                private commit only: anonymous memory this process allocated.
+                Excludes memory-mapped files, so the tile spill and `fused.dat`
+                do not inflate it. This is the quantity
+                `estimate_memory_usage` predicts.
+            "uss" — unique set size. On Windows this *includes* the resident
+                pages of a memmap owned by one process, so on a streaming run
+                it measures mostly on-disk scratch and is not comparable to any
+                projection. Kept for callers that genuinely want total private
+                footprint.
+            "rss" — resident set, includes all mapped file pages.
+
+        `mapped_resident_bytes` is tracked alongside whichever metric is chosen,
+        so a caller can report "and N GB of that is reclaimable file cache"
+        without a second sampling pass.
         """
         self.interval_s = interval_s
         self.threshold_bytes = threshold_bytes
@@ -128,6 +210,11 @@ class MemoryMonitor:
         self.metric = metric
         self.baseline_bytes = 0
         self.peak_bytes = 0
+        # Peak resident memory-mapped file pages seen (tile spill + fused.dat).
+        # Not part of the threshold — it is disk-backed and reclaimable — but
+        # reported, because a scratch disk too slow to absorb write-back is the
+        # documented way this pipeline freezes a machine.
+        self.peak_mapped_bytes = 0
         self._phase: Optional[str] = None
         self._phase_peak: Dict[str, int] = {}
         self._exceeded = False
@@ -138,9 +225,14 @@ class MemoryMonitor:
 
     # -- sampling ---------------------------------------------------------
     def _rss(self) -> int:
-        """Sample the chosen memory metric (USS preferred, RSS fallback)."""
+        """Sample the chosen memory metric, tracking mapped-file residency too."""
         if self._proc is None:
             return 0
+        if self.metric == "private":
+            private, mapped = memory_split(self._proc)
+            if mapped > self.peak_mapped_bytes:
+                self.peak_mapped_bytes = mapped
+            return private
         if self._use_uss:
             try:
                 return int(self._proc.memory_full_info().uss)

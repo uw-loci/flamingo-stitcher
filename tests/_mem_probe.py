@@ -103,6 +103,13 @@ def main() -> None:
         import multiview_stitcher.fusion  # noqa: F401
         import multiview_stitcher.registration  # noqa: F401
 
+        # Deliberately USS here, not the watchdog's "private" metric. USS also
+        # counts the resident pages of the tile spill and the fused memmap, so
+        # it OVER-counts — which for a guard is the safe direction: it can
+        # produce a false failure, never a false pass. `peak_mapped_mb` below
+        # reports the file-backed share so a failure can be attributed rather
+        # than guessed at. (The watchdog uses "private" because it compares
+        # against a projection that excludes the memmaps by construction.)
         mon = MemoryMonitor(interval_s=0.02, metric=cfg_in.get("metric", "uss"))
 
         def progress_fn(pct, msg):
@@ -121,6 +128,7 @@ def main() -> None:
             "illum_sides": len(cfg_in.get("illum_sides", [0])),
             "streaming": cfg.streaming_mode,
             "peak_delta_mb": round(mon.peak_delta_bytes / 1e6, 2),
+            "peak_mapped_mb": round(mon.peak_mapped_bytes / 1e6, 2),
             "phase_peaks_mb": {
                 p: round(v / 1e6, 2) for p, v in mon.phase_peaks_delta().items()
             },

@@ -1957,6 +1957,10 @@ MIN_REGISTRATION_OVERLAP = 0.05
 # margin; the 25 µm floor covers finer Z steps where 8 steps is still tiny; the
 # quarter-stack cap keeps a shallow stack from admitting a peak found halfway
 # down the volume.
+# Fewest tiles for which "what did the mosaic agree on" means anything. With
+# two disagreeing tiles there is no majority and no way to say which one moved.
+_MIN_TILES_FOR_CONSENSUS = 3
+
 _Z_CLAMP_MIN_STEPS = 8
 _Z_CLAMP_FLOOR_UM = 25.0
 _Z_CLAMP_STACK_FRACTION = 0.25
@@ -1969,12 +1973,21 @@ class ClampRecord(NamedTuple):
     any clamping — the report needs the rejected value, not the zero that
     replaced it, because "we measured +97 µm and did not believe it" and "we
     measured nothing" are different findings.
+
+    ``rel_*`` are those shifts minus the neighbours' consensus, and are the
+    values the bound was tested against.
     """
 
     index: int
     dz_um: float
     dy_um: float
     dx_um: float
+    # The same correction with the neighbours' consensus removed. This is what
+    # the bound is applied to: a mosaic-wide offset or a slow drift moves every
+    # tile together and opens no seam, so only the disagreement can be judged.
+    rel_z_um: float = 0.0
+    rel_y_um: float = 0.0
+    rel_x_um: float = 0.0
     clamped_xy: bool = False
     clamped_z: bool = False
     whole_matrix: bool = False
@@ -3794,12 +3807,27 @@ class StitchingPipeline:
         def _on_exceed(used_bytes: int, phase):
             base = getattr(self._memory_monitor, "baseline_bytes", 0) or 0
             delta_gb = max(0, used_bytes - base) / (1024**3)
+            mapped_gb = (
+                getattr(self._memory_monitor, "peak_mapped_bytes", 0) or 0
+            ) / (1024**3)
+            # Report the mapped set alongside, so the number is interpretable.
+            # It is deliberately NOT in the threshold: those are pages of the
+            # tile spill and fused.dat, disk-backed and reclaimed under
+            # pressure. Counting them (as USS did) compared a projection that
+            # excludes the memmaps against a measurement dominated by them.
+            mapped_note = (
+                f" Separately, {mapped_gb:.1f} GB of memory-mapped scratch "
+                f"(tile spill + fused output) is resident; that is disk-backed "
+                f"and reclaimable, and is not part of this threshold."
+                if mapped_gb >= 1.0
+                else ""
+            )
             self.logger.warning(
-                f"  [memory watchdog] working-set memory {delta_gb:.1f} GB "
+                f"  [memory watchdog] private allocation {delta_gb:.1f} GB "
                 f"exceeded projected {projected_gb:.1f} GB × {margin:g} "
                 f"(threshold {threshold_gb:.1f} GB) during phase "
                 f"'{phase or '?'}' ({mode}). The run continues; if it OOMs, "
-                f"{remedy}."
+                f"{remedy}.{mapped_note}"
             )
             if self._memory_warning_fn is not None:
                 try:
@@ -3819,7 +3847,13 @@ class StitchingPipeline:
             interval_s=0.25,
             threshold_bytes=threshold_bytes,
             on_exceed=_on_exceed,
-            metric="uss",
+            # Private commit, NOT uss: the projection above excludes the tile
+            # spill and the fused memmap by construction, so the measurement
+            # has to exclude them too or the comparison is meaningless. On
+            # Windows a single-process memmap reads as private under USS, which
+            # is how a 97-tile run reported 127.7 GB against a 9.4 GB
+            # projection while completing comfortably.
+            metric="private",
         )
         self._memory_monitor.start()
         self.logger.info(
@@ -6634,13 +6668,22 @@ class StitchingPipeline:
         )
         bound_z, source_z = self._axial_shift_bound(depth_um, vz)
 
+        # Judge each tile against where the mosaic AS PLACED put it, not
+        # against its original stage position: a correction every tile shares
+        # slides the whole mosaic and opens no seam. See
+        # _consensus_reference_shift.
+        reference = self._consensus_reference_shift(params)
+
         clamped = []
         records: List[ClampRecord] = []
         for index, param in enumerate(params):
             try:
                 arr = _np.asarray(param)
                 mat = arr[0] if arr.ndim == 3 else arr
-                dz, dy, dx = (float(v) for v in mat[:3, 3])  # µm, (z, y, x)
+                abs_z, abs_y, abs_x = (float(v) for v in mat[:3, 3])  # µm, (z, y, x)
+                # Judge the correction against the mosaic's consensus.
+                ref_z, ref_y, ref_x = reference
+                dz, dy, dx = abs_z - ref_z, abs_y - ref_y, abs_x - ref_x
                 # Per-axis surgery is only meaningful for a pure translation.
                 # For a general affine the translation column is the motion of
                 # the world ORIGIN, not of the tile, and a rotation puts real Z
@@ -6665,9 +6708,15 @@ class StitchingPipeline:
             records.append(
                 ClampRecord(
                     index=index,
-                    dz_um=dz,
-                    dy_um=dy,
-                    dx_um=dx,
+                    # The correction registration proposed, absolute...
+                    dz_um=abs_z,
+                    dy_um=abs_y,
+                    dx_um=abs_x,
+                    # ...and the part of it that disagrees with the neighbours,
+                    # which is what the bound was actually applied to.
+                    rel_z_um=dz,
+                    rel_y_um=dy,
+                    rel_x_um=dx,
                     clamped_xy=clamp_xy,
                     clamped_z=clamp_z,
                     whole_matrix=whole,
@@ -6706,6 +6755,57 @@ class StitchingPipeline:
         )
         self.logger.info(result.summary_line())
         return result
+
+    def _consensus_reference_shift(self, params):
+        """The correction the mosaic as a whole agreed on, as (dz, dy, dx) µm.
+
+        The clamp asks "did this tile move somewhere implausible?", and the only
+        implausible move is one that separates a tile from the tiles it has to
+        line up with. A correction shared by every tile slides the whole mosaic
+        and opens no seam at all — so measuring each tile against **where the
+        stage said it was** rejects exactly the corrections that were working:
+        on a large grid a systematic offset accumulates past one overlap while
+        every adjacent pair stays perfectly matched.
+
+        The reference is the per-axis MEDIAN over all tiles, not the mean: a
+        handful of tiles flung away by a garbage correlation peak is the case
+        this guard exists for, and they must not be allowed to move the
+        baseline they are judged against.
+
+        **Limitation, stated rather than hidden:** this removes a uniform
+        offset, not an arbitrary gradient. If a mosaic drifts steadily from one
+        end to the other by much more than an overlap, the extremes still read
+        as outliers. Per-tile neighbour medians would handle that, but they
+        collapse where a tile has one or two neighbours — an edge or a sparse
+        montage — which is where a drift is largest. If the seam report ever
+        shows gradient-driven clamping on real data, that is the evidence to
+        revisit this with.
+        """
+        import numpy as _np
+
+        # A consensus needs a majority, and two tiles do not have one: when two
+        # tiles disagree there is no way to tell which one moved. Below three,
+        # fall back to judging the absolute displacement from the stage
+        # position — the only check available, and the conservative one.
+        if len(params) < _MIN_TILES_FOR_CONSENSUS:
+            return (0.0, 0.0, 0.0)
+
+        shifts = []
+        for param in params:
+            try:
+                arr = _np.asarray(param)
+                mat = arr[0] if arr.ndim == 3 else arr
+                shifts.append((float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3])))
+            except Exception:
+                shifts.append((0.0, 0.0, 0.0))
+        if not shifts:
+            return (0.0, 0.0, 0.0)
+
+        def _median(axis):
+            ordered = sorted(v[axis] for v in shifts)
+            return float(ordered[len(ordered) // 2])
+
+        return (_median(0), _median(1), _median(2))
 
     def _lateral_shift_bound(self, tiles, frame_x_um, frame_y_um, vx, vy):
         """(bound µm, source) for X/Y: one tile overlap width.
