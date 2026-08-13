@@ -67,32 +67,48 @@ they measure different things:
 - **The watchdog** samples live process memory and warns once if it exceeds
   `projected × 1.5`. It reports the **phase** it fired in.
 
-**Critical nuance for streaming mode:** the fused output (`fused.dat`, can be
-hundreds of GB) and the per-tile spill (`.stitch_tmp\chNN`, can be hundreds of
-GB) are **memory-mapped files on disk** — deliberately "off-RAM." But the OS
-keeps their **dirty/resident pages in the process working set** until write-back.
-On Windows, `psutil` USS counts modified file-mapped pages. So during **fuse**,
-the watchdog can report a large number (e.g. "127 GB") that is mostly
-**write-back lag on the scratch disk, not algorithm allocation.**
+**What the watchdog measures (changed 2026-08-13):** *private commit* — memory
+this process allocated. Memory-mapped FILES are excluded, so the tile spill
+(`.stitch_tmp\chNN`) and the fused output (`fused.dat`) no longer inflate it.
+That makes the two numbers comparable for the first time: the projection
+excludes those memmaps by construction, so the measurement has to as well.
 
-Signs it's the benign memmap-working-set case, not a real allocation problem:
+Its message now reads:
 
-- The warning phase is **`fuse` (streaming)** and the run **kept going / finished**
-  (a real allocation OOM aborts with `MemoryError` / `Unable to allocate …`).
+```
+[memory watchdog] private allocation 6.1 GB exceeded projected 4.0 GB × 1.5
+(threshold 6.0 GB) during phase 'fuse' (streaming). ... Separately, 127.7 GB of
+memory-mapped scratch (tile spill + fused output) is resident; that is
+disk-backed and reclaimable, and is not part of this threshold.
+```
+
+**If you are reading an OLDER log** (before 2026-08-13) the watchdog sampled
+USS, which on Windows counts modified file-mapped pages — a memmap owned by one
+process is not "shared". A 97-tile run reported **127.7 GB against a 9.4 GB
+projection** and completed comfortably in 13h15m: that figure was the resident
+pages of a 407 GB `fused.dat` plus a 675 GB spill being read back, not
+allocation. Flushing per region does **not** fix it — `flush()` writes pages
+back and makes them CLEAN, it does not evict them, so they stay resident and
+stay counted.
+
+Signs it is the benign mapped-file case (in an old log, or in the "Separately…"
+clause of a new one):
+
+- The warning phase is **`fuse` (streaming)** and the run **kept going /
+  finished** (a real allocation OOM aborts with `MemoryError` / `Unable to
+  allocate …`).
 - Output ≫ RAM and a large `fused.dat` / spill is in play.
-- The reported figure is a few× the projection but well under total RAM.
+- The figure is a few× the projection but well under total RAM.
 
 Real allocation pressure to take seriously instead:
 
-- **In-memory mode** watchdog fires — that IS heap; lower resolution or switch to
-  streaming.
+- **In-memory mode** watchdog fires — that IS heap; lower resolution or switch
+  to streaming.
 - The run actually **crashes** with `MemoryError` / `Unable to allocate N GiB`.
 - Watchdog fires in **preprocess/register** (not backed by the big memmaps).
-
-> Recent versions flush the fused memmap after each super-block region to bound
-> those dirty pages, which quiets the spurious fuse-phase warning. If you see the
-> old large fuse-phase figure on an older build and the run completed, treat it as
-> I/O/write-back, not an allocation bug.
+- The mapped figure is huge AND the machine becomes unresponsive: that is
+  write-back backing up on a slow scratch disk, which is the documented way this
+  pipeline freezes a box. Move scratch to fast local NVMe.
 
 ## 5. The time breakdown
 

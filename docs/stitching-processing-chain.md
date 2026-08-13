@@ -46,7 +46,7 @@ streaming copy dropping the frame-size arguments and loading cropped tiles at th
 |---|------|----------|----------|
 | 11 | Overlap gate | `_registration_overlap_gate` | always (refuses registration below `min_registration_overlap_frac`) |
 | 11a | Registration, or stage positions | `_register_tiles` / metadata affine | `not skip_registration` |
-| 11b | Per-axis shift clamp | `_clamp_registration_shifts` | always, after registration |
+| 11b | Per-axis shift clamp, relative to the mosaic | `_clamp_registration_shifts` + `_consensus_reference_shift` | always, after registration |
 | 11c | Z-refinement pass | `_refine_z_shifts` | `registration_z_refine` |
 | 12 | Multi-view rotation placement | `_tile_metadata_affine` → `_rotation_affine_zyx` | `multiview_fusion` |
 | 13 | Border QC (diagnostic) | `_run_border_qc_streaming` | `border_qc_enabled` |
@@ -181,6 +181,7 @@ throughput line, never the per-tile rate.
 | Registration report | `registration_report_enabled` | Shipped, ON by default — per-tile and per-seam CSVs + text next to `stitch_metadata.json` |
 | Min-overlap registration gate | `min_registration_overlap_frac` | Shipped (5%). Below it, registration is refused rather than attempted: phase correlation on a sliver returns a confident wrong shift |
 | Axial shift bound | `max_registration_shift_z_um` | Shipped. Separate from the lateral bound — an XY mosaic has no Z overlap to derive one from |
+| Shift bound reference | — | Shipped. Bounds are applied to a tile's disagreement with the mosaic's median correction, not to its displacement from the stage position: a shared offset opens no seam |
 | Phase-correlation upsampling | `registration_upsample_factor` | Shipped. 0 = leave multiview-stitcher's default, which is **2 for 3-D** (~half a binned voxel) |
 | Z refinement pass | `registration_z_refine` | Shipped, opt-in — a second pairwise pass at full Z resolution, ~2-3x registration time |
 | Tile-overlap fusion | `tile_overlap_fusion` | Shipped |

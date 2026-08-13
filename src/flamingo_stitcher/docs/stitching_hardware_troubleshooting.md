@@ -285,6 +285,32 @@ thin border strips). Detection is most sensitive at **downsample_xy ≤ 2**
 *which* seams are bad; likely causes to chase next are a flat-field /
 exposure mismatch between tiles, or misregistration.
 
+### Symptom: the memory watchdog reports far more than it projected
+
+**First: which number is it?** Since 2026-08-13 the watchdog measures *private
+commit* — memory the process allocated — and reports memory-mapped scratch
+separately, in a clause beginning "Separately, N GB of memory-mapped scratch".
+Only the first number is comparable to the projection. The second is the tile
+spill and `fused.dat`: disk-backed, reclaimed under pressure, and excluded from
+the projection by design.
+
+**On an older log** the watchdog sampled USS, which on Windows counts modified
+file-mapped pages (a memmap owned by one process is not "shared"). A 97-tile
+run reported 127.7 GB against a 9.4 GB projection and finished comfortably —
+that was a 407 GB `fused.dat` plus a 675 GB spill being read back. Flushing per
+region does not help: `flush()` makes pages clean, it does not evict them.
+
+So: **run completed, phase `fuse`, streaming, huge output** → mapped-file
+residency, not an allocation bug. **Run crashed with `MemoryError`**, or the
+warning fired in **preprocess/register**, or the mode is **in-memory** → real
+allocation; lower the worker count, downsample, or turn off content-based
+blending.
+
+**A large mapped figure is still worth acting on** when the machine goes
+unresponsive: that is write-back backing up because the scratch disk cannot
+absorb it, which is the freeze described earlier in this section. Move the
+scratch dir to fast local NVMe.
+
 ### Symptom: tiles do not line up — small offsets in XY and/or Z
 
 **Check whether registration ran at all, before anything else.** Open
