@@ -27,6 +27,7 @@ import argparse
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, Optional
 
 from .orientation import OrientationUnknownError
 from .pipeline import StitchingConfig, StitchingPipeline, discover_tiles
@@ -259,6 +260,29 @@ def build_parser() -> argparse.ArgumentParser:
         metavar=("Z", "Y", "X"),
         default=None,
         help="Phase-correlation binning per axis (default: 2 4 4)",
+    )
+    reg_group.add_argument(
+        "--reg-binning-xy",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Lateral phase-correlation binning, applied to both X and Y "
+            "(default: 4). Overrides the Y/X components of "
+            "--registration-binning."
+        ),
+    )
+    reg_group.add_argument(
+        "--reg-binning-z",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Axial phase-correlation binning, independent of XY (default: 2). "
+            "Sets the floor on Z precision -- a shift resolves to about one "
+            "binned voxel -- so 1 is the cheapest way to improve Z alignment. "
+            "Overrides the Z component of --registration-binning."
+        ),
     )
     reg_group.add_argument(
         "--reg-upsample",
@@ -499,6 +523,36 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_registration_binning(args) -> Optional[Dict[str, int]]:
+    """The per-axis binning the flags ask for, or None if none was given.
+
+    XY and Z are chosen independently, as in the GUI, and layer OVER the
+    three-axis ``--registration-binning`` so a script that already passes it
+    keeps working and can still override one axis.
+
+    None means "the user said nothing" and must stay None: passing a value in
+    unconditionally is exactly how ``--quality-threshold`` spent its life
+    overriding the dataclass default of 0.4 with 0.2 on every CLI run.
+
+    Lives here rather than inline in ``main()`` so it can be tested. Inline, a
+    test can only re-implement it — and a copy of the logic passes whatever the
+    shipped logic does.
+    """
+    binning = None
+    if getattr(args, "registration_binning", None) is not None:
+        z, y, x = args.registration_binning
+        binning = {"z": z, "y": y, "x": x}
+    xy_arg = getattr(args, "reg_binning_xy", None)
+    z_arg = getattr(args, "reg_binning_z", None)
+    if xy_arg is not None or z_arg is not None:
+        binning = dict(binning or {"z": 2, "y": 4, "x": 4})
+        if xy_arg is not None:
+            binning["y"] = binning["x"] = xy_arg
+        if z_arg is not None:
+            binning["z"] = z_arg
+    return binning
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
@@ -684,16 +738,11 @@ def main():
     # they must be applied as an overlay rather than passed into the constructor
     # above. Passing them in unconditionally is how --quality-threshold spent its
     # life overriding the dataclass default of 0.4 with 0.2 on every CLI run.
-    _binning = args.registration_binning
+    _binning = resolve_registration_binning(args)
     for _attr, _value in (
         ("quality_threshold", args.quality_threshold),
         ("skip_registration", args.skip_registration),
-        (
-            "registration_binning",
-            None
-            if _binning is None
-            else {"z": _binning[0], "y": _binning[1], "x": _binning[2]},
-        ),
+        ("registration_binning", _binning),
         ("registration_upsample_factor", args.reg_upsample),
         ("max_registration_shift_um", args.max_reg_shift),
         ("max_registration_shift_z_um", args.max_reg_shift_z),

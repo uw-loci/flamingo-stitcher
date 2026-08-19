@@ -1126,17 +1126,55 @@ class StitchingDialog(PersistentDialog):
         self._skip_reg_cb.toggled.connect(self._on_skip_reg_toggled)
         reg_layout.addWidget(self._skip_reg_cb, 0, 0, 1, 2)
 
+        # XY and Z chosen separately, laid out like the Downsample row above.
+        # They were one three-way preset (Fine/Default/Fast) that moved both at
+        # once, which is the wrong coupling: Z binning sets the floor on how
+        # precisely a Z shift can be resolved -- at the default z=2 that is one
+        # raw plane, and the 3-6 frame offsets this registration exists to fix
+        # are only a few times bigger. Halving Z costs one axis of correlation
+        # work; being forced to halve XY as well costs four times that for no
+        # gain in Z precision.
         self._reg_binning_label = QLabel("Reg. binning:")
         reg_layout.addWidget(self._reg_binning_label, 0, 2)
-        self._reg_binning_combo = QComboBox()
-        self._reg_binning_combo.addItem("Fine (z1 y2 x2)", {"z": 1, "y": 2, "x": 2})
-        self._reg_binning_combo.addItem("Default (z2 y4 x4)", {"z": 2, "y": 4, "x": 4})
-        self._reg_binning_combo.addItem("Fast (z4 y8 x8)", {"z": 4, "y": 8, "x": 8})
-        self._reg_binning_combo.setCurrentIndex(1)
-        self._reg_binning_combo.setToolTip(
-            "How much to downsample tiles for phase-correlation registration."
+        rb_layout = QHBoxLayout()
+        rb_layout.setSpacing(4)
+        self._reg_binning_xy_label = QLabel("XY")
+        rb_layout.addWidget(self._reg_binning_xy_label)
+        self._reg_binning_xy_combo = QComboBox()
+        for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
+            self._reg_binning_xy_combo.addItem(_label, _value)
+        self._reg_binning_xy_combo.setToolTip(
+            "How much to bin tiles laterally for phase correlation.\n"
+            "Applied to BOTH X and Y — a lateral peak is one joint\n"
+            "correlation, so splitting them further would not buy anything.\n\n"
+            "Cost scales with the square of this: 2x is a quarter of the work\n"
+            "of 1x. 4x (default) is enough for the lateral shifts a stage\n"
+            "makes; drop to 2x or 1x only if the seam report shows XY\n"
+            "disagreement."
         )
-        reg_layout.addWidget(self._reg_binning_combo, 0, 3)
+        rb_layout.addWidget(self._reg_binning_xy_combo)
+        rb_layout.addSpacing(16)  # visible gap between the XY group and Z group
+        self._reg_binning_z_label = QLabel("Z")
+        rb_layout.addWidget(self._reg_binning_z_label)
+        self._reg_binning_z_combo = QComboBox()
+        for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
+            self._reg_binning_z_combo.addItem(_label, _value)
+        self._reg_binning_z_combo.setToolTip(
+            "How much to bin tiles axially for phase correlation, independent\n"
+            "of XY.\n\n"
+            "This sets the FLOOR on Z precision: a shift can only be resolved\n"
+            "to about one binned voxel, so at the default 2x that is one raw\n"
+            "plane. The tile offsets this registration exists to fix are 3-6\n"
+            "frames, so there is not much headroom.\n\n"
+            "1x doubles the correlation volume but is the cheapest way to\n"
+            "improve Z alignment — it costs one axis, where lowering XY costs\n"
+            "two. Use it before reaching for 'Refine Z alignment', which runs\n"
+            "a whole second pass."
+        )
+        rb_layout.addWidget(self._reg_binning_z_combo)
+        rb_layout.addStretch(1)
+        reg_layout.addLayout(rb_layout, 0, 3)
+        self._set_registration_binning({"z": 2, "y": 4, "x": 4})
 
         # Proc Row 3: Max registration shift (registration sub-option; only
         # meaningful when registration runs, so it greys out with Skip reg).
@@ -1326,7 +1364,8 @@ class StitchingDialog(PersistentDialog):
             self._frame_size_combo,
             self._fusion_combo,
             self._tile_fusion_combo,
-            self._reg_binning_combo,
+            self._reg_binning_xy_combo,
+            self._reg_binning_z_combo,
             self._chunk_size_combo,
         ):
             _combo.currentIndexChanged.connect(self._refresh_memory_estimate)
@@ -2467,10 +2506,53 @@ class StitchingDialog(PersistentDialog):
             self.layout().activate()
         self.resize(self.width(), self.sizeHint().height())
 
+    def _registration_binning(self) -> dict:
+        """The per-axis binning dict multiview-stitcher wants, from XY and Z.
+
+        The dict stays the one canonical form -- it is what the pipeline, the
+        YAML and the CLI all carry, and what MVS is handed. XY and Z are how
+        it is CHOSEN, not a second place it is stored.
+        """
+        xy = int(self._reg_binning_xy_combo.currentData() or 1)
+        z = int(self._reg_binning_z_combo.currentData() or 1)
+        return {"z": z, "y": xy, "x": xy}
+
+    def _set_registration_binning(self, binning) -> None:
+        """Drive the XY and Z combos from a per-axis dict.
+
+        A dict whose X and Y differ cannot be shown exactly, so the larger of
+        the two is selected and the mismatch logged rather than silently
+        halving one axis's binning -- the run would then do less work than the
+        configuration asked for, which is the direction that costs time, not
+        correctness.
+        """
+        if not isinstance(binning, dict):
+            return
+        try:
+            z = int(binning.get("z", 2))
+            y = int(binning.get("y", 4))
+            x = int(binning.get("x", y))
+        except (TypeError, ValueError):
+            return
+        if x != y:
+            logger.warning(
+                f"Registration binning has x={x} and y={y}; the dialog offers "
+                f"one lateral factor, so showing {max(x, y)}x. Set them "
+                f"separately in the config file if they must differ."
+            )
+        self._set_combo_by_data(self._reg_binning_xy_combo, max(x, y))
+        self._set_combo_by_data(self._reg_binning_z_combo, z)
+
     def _on_skip_reg_toggled(self, checked: bool):
         """Enable/disable registration controls based on skip state."""
-        self._reg_binning_combo.setEnabled(not checked)
-        self._reg_binning_label.setEnabled(not checked)
+        for _widget in (
+            self._reg_binning_xy_combo,
+            self._reg_binning_z_combo,
+            self._reg_binning_xy_label,
+            self._reg_binning_z_label,
+            self._reg_binning_label,
+        ):
+            _widget.setEnabled(not checked)
         # Max reg. shift only applies when registration runs.
         self._max_reg_shift_spin.setEnabled(not checked)
         self._max_reg_shift_label.setEnabled(not checked)
@@ -3001,7 +3083,7 @@ class StitchingDialog(PersistentDialog):
         config.registration_report_enabled = self._reg_report_cb.isChecked()
         config.border_qc_enabled = self._border_qc_cb.isChecked()
         config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
-        config.registration_binning = self._reg_binning_combo.currentData()
+        config.registration_binning = self._registration_binning()
         config.package_ozx = self._ozx_cb.isChecked()
         config.tiff_pyramids = self._tiff_pyramids_cb.isChecked()
         config.streaming_mode = self._streaming_combo.currentData()
@@ -3173,7 +3255,6 @@ class StitchingDialog(PersistentDialog):
             ("tile_overlap_fusion", self._tile_fusion_combo),
             ("downsample_xy", self._downsample_xy_combo),
             ("downsample_z", self._downsample_z_combo),
-            ("registration_binning", self._reg_binning_combo),
             ("streaming_mode", self._streaming_combo),
             ("output_chunksize", self._chunk_size_combo),
             ("border_qc_mode", self._border_qc_mode_combo),
@@ -3181,6 +3262,11 @@ class StitchingDialog(PersistentDialog):
         for name, combo in combo_fields:
             if has(name):
                 applied += self._set_combo_by_data(combo, cfg[name])
+
+        # Not a combo any more: one per-axis dict drives two controls.
+        if has("registration_binning"):
+            self._set_registration_binning(cfg["registration_binning"])
+            applied += 1
 
         check_fields = [
             ("flat_field_correction", self._flat_field_cb),
@@ -5237,7 +5323,13 @@ class StitchingDialog(PersistentDialog):
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
         s.setValue("border_qc", self._border_qc_cb.isChecked())
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
-        s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
+        # New keys, and deliberately the FACTORS rather than a combo index.
+        # The old "reg_binning" key held an index into a three-way preset, so
+        # reading it now would turn a stale 0/1/2 into 1x/2x/4x -- a different
+        # binning than was ever chosen, applied silently. Leaving that key
+        # unread lets it age out instead.
+        s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
+        s.setValue("reg_binning_z", self._reg_binning_z_combo.currentData())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -5405,9 +5497,14 @@ class StitchingDialog(PersistentDialog):
         if _qi >= 0:
             self._border_qc_mode_combo.setCurrentIndex(_qi)
 
-        reg_binning_idx = s.value("reg_binning", 1, type=int)  # default = index 1
-        if 0 <= reg_binning_idx < self._reg_binning_combo.count():
-            self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
+        _rb_xy = s.value("reg_binning_xy", 4, type=int)
+        self._set_registration_binning(
+            {
+                "z": s.value("reg_binning_z", 2, type=int),
+                "y": _rb_xy,
+                "x": _rb_xy,
+            }
+        )
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)
@@ -5536,7 +5633,13 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("skip_registration", self._skip_reg_cb.isChecked())
         s.setValue("border_qc", self._border_qc_cb.isChecked())
         s.setValue("border_qc_mode", self._border_qc_mode_combo.currentData())
-        s.setValue("reg_binning", self._reg_binning_combo.currentIndex())
+        # New keys, and deliberately the FACTORS rather than a combo index.
+        # The old "reg_binning" key held an index into a three-way preset, so
+        # reading it now would turn a stale 0/1/2 into 1x/2x/4x -- a different
+        # binning than was ever chosen, applied silently. Leaving that key
+        # unread lets it age out instead.
+        s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
+        s.setValue("reg_binning_z", self._reg_binning_z_combo.currentData())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -5703,9 +5806,14 @@ class NativeStitchingDialog(StitchingDialog):
         if _qi >= 0:
             self._border_qc_mode_combo.setCurrentIndex(_qi)
 
-        reg_binning_idx = s.value("reg_binning", 1, type=int)
-        if 0 <= reg_binning_idx < self._reg_binning_combo.count():
-            self._reg_binning_combo.setCurrentIndex(reg_binning_idx)
+        _rb_xy = s.value("reg_binning_xy", 4, type=int)
+        self._set_registration_binning(
+            {
+                "z": s.value("reg_binning_z", 2, type=int),
+                "y": _rb_xy,
+                "x": _rb_xy,
+            }
+        )
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)

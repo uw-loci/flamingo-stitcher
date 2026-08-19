@@ -343,7 +343,11 @@ If registration *did* run, work through the report in order:
 4. **Z specifically.** The main pass registers at Z binning 2 and
    multiview-stitcher upsamples 3-D phase correlation by only 2, so Z resolves
    to roughly one raw plane while XY resolves a fraction of a pixel. If seams
-   disagree in Z while XY is clean, turn on **Refine Z alignment** (a second
+   disagree in Z while XY is clean, **try `Reg. binning` Z = 1x first.** The
+   lateral and axial factors are independent (`--reg-binning-z 1`, or
+   `registration.binning.z` in YAML), and dropping Z alone doubles the
+   correlation volume where dropping XY would quadruple it — for no gain in Z.
+   If that is not enough, turn on **Refine Z alignment** (a whole second
    pairwise pass, ~2-3x registration time). A refinement that reports
    corrections *at* its search limit has found floors, not measurements.
 

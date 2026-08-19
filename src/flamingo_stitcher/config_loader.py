@@ -301,10 +301,14 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.reg_channel = int(reg["channel"])
     binning = reg.get("binning")
     if binning:
+        # `xy` is the shape the GUI and CLI offer, so accept it here too rather
+        # than making the config file the one place that spells it differently.
+        # Explicit y/x still win, for a file that genuinely needs them apart.
+        lateral = binning.get("xy")
         config_obj.registration_binning = {
             "z": int(binning.get("z", 2)),
-            "y": int(binning.get("y", 4)),
-            "x": int(binning.get("x", 4)),
+            "y": int(binning.get("y", lateral if lateral is not None else 4)),
+            "x": int(binning.get("x", lateral if lateral is not None else 4)),
         }
     if reg.get("quality_threshold") is not None:
         config_obj.quality_threshold = float(reg["quality_threshold"])
