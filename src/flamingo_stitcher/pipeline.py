@@ -520,6 +520,43 @@ def _glob_tile_files(directory: Path) -> List[Path]:
 FOLDER_COORD_PATTERN = re.compile(r"X([-\d.]+)_Y([-\d.]+)")
 
 
+def acquisition_is_flat(acquisition_dir: Path) -> bool:
+    """Does this acquisition hold tile FILES directly, rather than tile folders?
+
+    The two layouts this package reads, and the two dialogs that read them:
+
+    * **Subfolder-per-tile** — ``<sample>/<date>/X4.00_Y12.00/*.raw``. The
+      acquisition directory is a bare date, so its own name does not say which
+      sample it is.
+    * **Flat** (the C++ server's native output, Single Workflow) —
+      ``<whatever>/<dataset>/*.raw``. The acquisition directory IS the dataset
+      and its name is the descriptive one.
+
+    Used for output naming, where the difference matters: a date needs its
+    sample folder prepended to mean anything, and a dataset does not.
+
+    Built from the same two primitives the discovery functions use rather than
+    a third opinion about layout -- this package has shipped one bug three
+    times by keeping copies of a single rule.
+    """
+    try:
+        if _glob_tile_files(acquisition_dir):
+            return True
+        for sub in sorted(acquisition_dir.iterdir()):
+            if not sub.is_dir():
+                continue
+            if FOLDER_COORD_PATTERN.search(sub.name):
+                return False  # a tile folder: subfolder-per-tile layout
+            if _glob_tile_files(sub):
+                return True  # dated flat layout: <dataset>/<date>/*.raw
+    except OSError:
+        # Unreadable or gone. Naming must not be the thing that fails a run, and
+        # the old behaviour is the safer default here: a redundant prefix is
+        # ugly, a missing one can collide two samples' dates in one folder.
+        return False
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Fused-volume dtype conversion (shared by every fuse path)
 # ---------------------------------------------------------------------------
@@ -4099,24 +4136,39 @@ class StitchingPipeline:
     def _build_output_basename(self, acquisition_dir: Path) -> str:
         """Build a descriptive base filename from acquisition path and settings.
 
-        Combines the sample name (parent folder) and date (acquisition folder)
-        with short tags for enabled preprocessing steps, so multiple stitch
-        runs with different settings produce distinct filenames.
+        Short tags for the enabled preprocessing steps are appended either way,
+        so runs with different settings produce distinct filenames.
+
+        What goes in front of them depends on the layout, because the two
+        layouts put the descriptive name in different places:
+
+        * **Subfolder-per-tile** — ``.../OrganoidV2/2026-04-05``. The
+          acquisition folder is a bare date, so the sample folder is prepended:
+          ``2026-04-05.ome.zarr`` on its own would not say which sample it is,
+          and two samples stitched to one output folder would collide.
+        * **Flat** (Single Workflow) — ``.../whatever/MyDataset``. The
+          acquisition folder IS the dataset. Prepending its parent produced
+          ``whatever_MyDataset`` next to a ``MyDataset_stitched`` folder: a
+          name taken from a directory that says nothing about the data, and
+          disagreeing with the folder holding it.
 
         Examples:
-            OrganoidV2_2026-04-05
+            OrganoidV2_2026-04-05                    (subfolder-per-tile)
             OrganoidV2_2026-04-05_destripe
-            OrganoidV2_2026-04-05_destripe_atten
+            MyDataset                                (flat)
+            MyDataset_destripe
         """
-        # Derive sample + date from path: .../OrganoidV2/2026-04-05
-        acq_name = acquisition_dir.name  # e.g. "2026-04-05"
-        parent_name = acquisition_dir.parent.name  # e.g. "OrganoidV2"
+        acq_name = acquisition_dir.name
 
-        # Avoid redundancy if parent is a drive root or generic name
-        if parent_name and parent_name not in (".", "/", "\\"):
-            base = f"{parent_name}_{acq_name}"
-        else:
+        if acquisition_is_flat(acquisition_dir):
             base = acq_name
+        else:
+            parent_name = acquisition_dir.parent.name
+            # Avoid redundancy if parent is a drive root or generic name
+            if parent_name and parent_name not in (".", "/", "\\"):
+                base = f"{parent_name}_{acq_name}"
+            else:
+                base = acq_name
 
         # Append short preprocessing tags
         tags = []
