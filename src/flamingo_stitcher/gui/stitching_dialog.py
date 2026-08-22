@@ -379,6 +379,10 @@ class StitchingDialog(PersistentDialog):
         # Initial paint of the Native → Output voxel readout using whatever
         # restore left in the spins + combos.
         self._update_voxel_readout()
+        # And the initial button state. Without this the row opened with
+        # Discover Tiles enabled over an empty queue, and nothing pointing at
+        # Add... — the one thing that can actually be done from here.
+        self._update_action_buttons()
 
     def _setup_ui(self):
         """Create and layout UI components."""
@@ -439,39 +443,11 @@ class StitchingDialog(PersistentDialog):
 
         queue_btn_layout = QHBoxLayout()
 
-        # Discover Tiles is the FIRST action in the queue row and is accent-
-        # coloured to draw the eye — it's the easy-to-forget step between adding
-        # directories and running. It flashes while the queue has items added
-        # since the last Discover (see _discover_needed and the flash timer).
-        self._discover_btn = QPushButton("Discover Tiles")
-        self._discover_btn.setToolTip(
-            "Scan all queued directories for tile data so channels, frame size\n"
-            "and Z step are detected before you Run.\n"
-            "Flashes when directories were added since the last Discover.\n"
-            "(Optional — Run will auto-discover if needed.)"
-        )
-        self._discover_btn.clicked.connect(self._on_discover)
-        queue_btn_layout.addWidget(self._discover_btn)
-
-        # Flash state: True once the queue changes (item added) until Discover
-        # runs. The timer toggles the button between its steady accent style and
-        # a brighter highlight while _discover_needed is set.
-        self._discover_needed = False
-        self._discover_flash_on = False
-        self._discover_flash_timer = QTimer(self)
-        self._discover_flash_timer.setInterval(550)
-        self._discover_flash_timer.timeout.connect(self._on_discover_flash_tick)
-
-        self._orientation_btn = QPushButton("Orientation Preview…")
-        self._orientation_btn.setToolTip(
-            "Preview all 8 whole-mosaic orientations for the selected\n"
-            "acquisition (built from its per-tile MIP files) so you can pick\n"
-            "the one where the sample is framed correctly. Useful when a new\n"
-            "microscope frames the mosaic differently. Does not run a stitch."
-        )
-        self._orientation_btn.clicked.connect(self._on_orientation_preview)
-        queue_btn_layout.addWidget(self._orientation_btn)
-
+        # Left to right in the order the work is done. Add... comes first
+        # because it is the first thing anyone must click: with an empty queue
+        # there is nothing to discover and nothing to run, so leading with
+        # Discover Tiles pointed the eye at a disabled button. Add All in Folder
+        # sits beside it as the bulk variant of the same step, then Discover.
         self._add_btn = QPushButton("Add...")
         self._add_btn.setToolTip("Add an acquisition directory to the queue")
         self._add_btn.clicked.connect(self._add_to_queue)
@@ -484,6 +460,40 @@ class StitchingDialog(PersistentDialog):
         )
         self._add_folder_btn.clicked.connect(self._add_folder_to_queue)
         queue_btn_layout.addWidget(self._add_folder_btn)
+
+        # Accent-coloured to draw the eye — it's the easy-to-forget step between
+        # adding directories and running. It flashes while the queue has items
+        # added since the last Discover (see _discover_needed and the timer).
+        self._discover_btn = QPushButton("Discover Tiles")
+        self._discover_btn.setToolTip(
+            "Scan all queued directories for tile data so channels, frame size\n"
+            "and Z step are detected before you Run.\n"
+            "Flashes when directories were added since the last Discover.\n"
+            "(Optional — Run will auto-discover if needed.)"
+        )
+        self._discover_btn.clicked.connect(self._on_discover)
+        queue_btn_layout.addWidget(self._discover_btn)
+
+        # One flashing call-to-action at a time, pointing at whichever step is
+        # next: Add... while the queue is empty, Discover Tiles once there is
+        # something to discover. Two buttons flashing at once is noise, not
+        # guidance.
+        self._discover_needed = False
+        self._cta_flash_on = False
+        self._cta_button = None
+        self._cta_flash_timer = QTimer(self)
+        self._cta_flash_timer.setInterval(550)
+        self._cta_flash_timer.timeout.connect(self._on_cta_flash_tick)
+
+        self._orientation_btn = QPushButton("Orientation Preview…")
+        self._orientation_btn.setToolTip(
+            "Preview all 8 whole-mosaic orientations for the selected\n"
+            "acquisition (built from its per-tile MIP files) so you can pick\n"
+            "the one where the sample is framed correctly. Useful when a new\n"
+            "microscope frames the mosaic differently. Does not run a stitch."
+        )
+        self._orientation_btn.clicked.connect(self._on_orientation_preview)
+        queue_btn_layout.addWidget(self._orientation_btn)
 
         self._requeue_btn = QPushButton("Re-queue")
         self._requeue_btn.setToolTip(
@@ -4806,34 +4816,65 @@ class StitchingDialog(PersistentDialog):
             f"QPushButton:disabled {{ background-color: #888; color: #ccc; }}"
         )
 
-    def _on_discover_flash_tick(self):
-        """Toggle the Discover button between its steady accent and the bright
-        highlight (driven by _discover_flash_timer while a Discover is due)."""
-        self._discover_flash_on = not self._discover_flash_on
-        self._set_btn_discover(self._discover_btn, highlight=self._discover_flash_on)
+    def _on_cta_flash_tick(self):
+        """Toggle the current call-to-action between accent and bright highlight."""
+        if self._cta_button is None:
+            return
+        self._cta_flash_on = not self._cta_flash_on
+        self._set_btn_discover(self._cta_button, highlight=self._cta_flash_on)
 
-    def _start_discover_flash(self):
-        if not self._discover_flash_timer.isActive():
-            self._discover_flash_on = True
-            self._set_btn_discover(self._discover_btn, highlight=True)
-            self._discover_flash_timer.start()
+    def _stop_cta_flash(self):
+        """Stop flashing and return the flashing button to its plain state."""
+        self._cta_flash_timer.stop()
+        self._cta_flash_on = False
+        if self._cta_button is not None:
+            self._set_btn_default(self._cta_button)
+            self._cta_button = None
 
-    def _stop_discover_flash(self):
-        self._discover_flash_timer.stop()
-        self._discover_flash_on = False
+    def _flash_cta(self, button):
+        """Flash exactly this button, stopping any other that was flashing."""
+        if self._cta_button is not button:
+            self._stop_cta_flash()
+            self._cta_button = button
+        if not self._cta_flash_timer.isActive():
+            self._cta_flash_on = True
+            self._set_btn_discover(button, highlight=True)
+            self._cta_flash_timer.start()
+
+    def _next_step_button(self):
+        """The button the user has to press next, or None if nothing is owed.
+
+        Empty queue -> Add..., because nothing else can be done until something
+        is queued; a flashing Discover Tiles over an empty queue pointed at a
+        button that was disabled anyway. Otherwise Discover Tiles while one is
+        due. Never both: two things flashing is noise, not guidance.
+        """
+        if self._batch_running:
+            return None
+        if not self._queue:
+            return self._add_btn
+        if self._discover_needed and self._discover_btn.isEnabled():
+            return self._discover_btn
+        return None
 
     def _refresh_discover_style(self):
-        """Apply the Discover button's accent/flash style from current state:
-        disabled -> plain; enabled + Discover due -> flashing; enabled +
-        up-to-date -> steady accent."""
-        if not self._discover_btn.isEnabled():
-            self._stop_discover_flash()
-            self._set_btn_default(self._discover_btn)
-        elif self._discover_needed:
-            self._start_discover_flash()
+        """Point the flashing call-to-action at the next step, and style Discover.
+
+        Discover keeps its steady blue accent whenever it is enabled and not
+        itself the flashing one, so it still reads as the notable action in the
+        row rather than dropping to a plain button.
+        """
+        target = self._next_step_button()
+        if target is None:
+            self._stop_cta_flash()
         else:
-            self._stop_discover_flash()
-            self._set_btn_discover(self._discover_btn, highlight=False)
+            self._flash_cta(target)
+
+        if self._cta_button is not self._discover_btn:
+            if self._discover_btn.isEnabled():
+                self._set_btn_discover(self._discover_btn, highlight=False)
+            else:
+                self._set_btn_default(self._discover_btn)
 
     # --- Logging helper ---
 
