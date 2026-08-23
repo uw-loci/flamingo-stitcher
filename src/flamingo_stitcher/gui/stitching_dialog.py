@@ -4094,6 +4094,41 @@ class StitchingDialog(PersistentDialog):
             self._log(f"⚠ {message}")
         return item_config
 
+    def _apply_scope_profile(self, item_config, acq_path):
+        """Swap in this acquisition's microscope + objective stitching options.
+
+        Unlike the destripe preset this is never fatal to get wrong — every
+        value has a working default — so an unknown scope is a note, not a
+        warning. What it must not do is stay silent: a run whose thresholds came
+        from a saved profile and a run using the defaults can behave very
+        differently, and the log is where that gets answered later.
+        """
+        from dataclasses import replace
+
+        from flamingo_stitcher import scope_profiles
+
+        try:
+            scope, objective, values, source = (
+                scope_profiles.resolve_for_acquisition(acq_path)
+            )
+        except Exception as e:  # noqa: BLE001 - never block a run on this
+            self._log(f"⚠ Could not resolve stitching options by microscope: {e}")
+            return item_config
+
+        applied, message = scope_profiles.describe_resolution(
+            scope, objective, values, source
+        )
+        if not applied:
+            self._log(message)
+            return item_config
+
+        item_config = replace(item_config, scope_profile_source=source)
+        changed = scope_profiles.apply_profile(item_config, values)
+        self._log(message)
+        for line in changed:
+            self._log(f"   {line}")
+        return item_config
+
     def _save_destripe_preset_for_selection(self) -> None:
         """Persist the current destripe settings under the selected scope."""
         if not self._queue:
@@ -4137,6 +4172,12 @@ class StitchingDialog(PersistentDialog):
         # own tuning instead of whichever was last touched in the GUI.
         if item_config.destripe:
             item_config = self._apply_destripe_preset(item_config, item["path"])
+
+        # Registration thresholds are per-MICROSCOPE and per-OBJECTIVE for the
+        # same reason: how much of a mosaic can register, and how far the stage
+        # can plausibly be wrong, are facts about an instrument. Resolved per
+        # item so a queue mixing rigs gets each one's own tuning.
+        item_config = self._apply_scope_profile(item_config, item["path"])
 
         self._worker = StitchingWorker(
             config=item_config,

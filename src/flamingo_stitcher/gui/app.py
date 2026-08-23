@@ -204,6 +204,13 @@ def main() -> int:
     tabs.addTab(single, "Single Workflow")
     tabs.addTab(multiview, "Multi-View")
 
+    # Options — per-microscope, per-objective registration tuning. Its own tab
+    # rather than a panel inside each dialog because the values belong to an
+    # instrument, not to a run, and all three dialogs consume the same store.
+    from flamingo_stitcher.gui.options_panel import OptionsPanel
+
+    tabs.addTab(OptionsPanel(window), "Options")
+
     # Updates tab — checks GitHub Releases for newer installers (standalone
     # build only; the in-app Py2Flamingo dialogs ship their own updates).
     settings = QSettings()
