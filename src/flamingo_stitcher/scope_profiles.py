@@ -76,6 +76,24 @@ class Tunable:
 # report, which is the test for whether a knob belongs in the UI at all.
 TUNABLES: Tuple[Tunable, ...] = (
     Tunable(
+        field="min_tile_structure",
+        label="Minimum tile structure to register",
+        kind="float",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        decimals=2,
+        help=(
+            "Tiles below this are held out of the registration and placed with "
+            "the mosaic. The score is texture relative to noise, so it does NOT "
+            "track brightness — bright, featureless agarose scores the same as "
+            "empty air, which is why an intensity threshold cannot do this job. "
+            "Featureless material sits at about 0.09; real structure crosses it "
+            "at a contrast-to-noise ratio near 1. Lower it if dim sample is "
+            "being held out; the per-tile scores are in the registration report."
+        ),
+    ),
+    Tunable(
         field="quality_threshold",
         label="Seam quality threshold",
         kind="float",

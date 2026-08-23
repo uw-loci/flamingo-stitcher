@@ -310,6 +310,16 @@ def build_parser() -> argparse.ArgumentParser:
         "overlap to derive a bound from.",
     )
     reg_group.add_argument(
+        "--min-tile-structure",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="Hold tiles with less structure than this out of the registration "
+        "(default 0.15). Texture relative to noise, so it does not track "
+        "brightness: bright featureless agarose scores the same as empty air. "
+        "Featureless material sits near 0.09. 0 registers every tile.",
+    )
+    reg_group.add_argument(
         "--min-registered-seams",
         type=float,
         default=None,
@@ -761,6 +771,7 @@ def main():
         ("max_registration_shift_z_um", args.max_reg_shift_z),
         ("min_registration_overlap_frac", args.min_reg_overlap),
         ("min_registered_seam_frac", args.min_registered_seams),
+        ("min_tile_structure", args.min_tile_structure),
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),

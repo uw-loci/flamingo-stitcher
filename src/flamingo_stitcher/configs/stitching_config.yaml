@@ -96,6 +96,22 @@ registration:
   # part of the grid can ever register. 0 disables the check entirely.
   min_registered_seam_fraction: 0.5
 
+  # Minimum "structure" a tile must have to be registered at all. Tiles below
+  # this are held out of the registration graph and placed with the mosaic --
+  # the multiview-stitcher maintainer's own recommendation for background tiles
+  # (issue #70), because phase correlation on a featureless volume returns a
+  # confident wrong shift rather than no shift.
+  #
+  # The score is texture relative to noise: std(smoothed) / std(raw). It does
+  # NOT track brightness, which is the point -- a sample in agarose in an FEP
+  # tube has several backgrounds at several brightnesses, and the agarose is
+  # bright AND featureless, so an intensity threshold calls it content.
+  #
+  # Measured: featureless material scores 0.087-0.090 across a 3000x brightness
+  # range; real structure crosses that floor at a contrast-to-noise ratio near
+  # 1, below which there is nothing to register on anyway.
+  min_tile_structure: 0.15
+
   # Sub-pixel upsampling factor for phase correlation. multiview-stitcher
   # silently uses 10 for 2-D data and 2 for 3-D, so every 3-D registration
   # resolves shifts to about half a BINNED voxel — with binning z=2 that is one

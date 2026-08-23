@@ -69,6 +69,7 @@ __all__ = [
     "STATUS_BELOW_QUALITY",
     "STATUS_DROPPED",
     "STATUS_IMPLAUSIBLE_SHIFT",
+    "STATUS_NO_CONTENT",
     "STATUS_NOT_RUN",
     "STATUS_PRUNED",
     "STATUS_REGISTERED",
@@ -97,6 +98,7 @@ STATUS_REGISTERED = "registered"  # edge survived quality AND fed the global sol
 STATUS_PRUNED = "pruned"  # survived quality, dropped by edge pruning
 STATUS_BELOW_QUALITY = "below_quality"  # correlation below the threshold
 STATUS_IMPLAUSIBLE_SHIFT = "implausible_shift"  # passed quality, shift is not physical
+STATUS_NO_CONTENT = "no_content"  # a side has nothing to register against
 STATUS_DROPPED = "dropped"  # expected pair, no edge, reason unrecoverable
 STATUS_NOT_RUN = "not_run"  # registration skipped / gated off / failed
 
@@ -389,6 +391,25 @@ def capture_prefilter_graph(sink: dict, reject=None):
 # ---------------------------------------------------------------------------
 
 
+def _remap(mapping: Dict[Tuple[int, int], Any], index_map: Optional[Sequence[int]]):
+    """Translate graph node ids to tile indices.
+
+    When background tiles are held out of the registration, the graph is built
+    over the SUBSET, so its node ids are positions in that subset. Everything
+    downstream — the seam rows, the coverage guard, the report — is indexed by
+    tile. Without this, a held-out mosaic silently reports the wrong pairs.
+    """
+    if index_map is None:
+        return mapping
+    out: Dict[Tuple[int, int], Any] = {}
+    for (a, b), value in mapping.items():
+        try:
+            out[_edge_key(index_map[a], index_map[b])] = value
+        except (IndexError, TypeError):
+            continue
+    return out
+
+
 def _tile_name(tile, index: int) -> str:
     """The folder name — the only key present for every layout.
 
@@ -487,6 +508,8 @@ def extract_seams(
     reg_dict: Optional[Mapping[str, Any]] = None,
     prefilter_graph: Any = None,
     rejected_edges: Optional[Mapping[Tuple[int, int], str]] = None,
+    index_map: Optional[Sequence[int]] = None,
+    content_by_index: Optional[Sequence[bool]] = None,
     quality_threshold: Optional[float] = None,
     frame_extent_um: Optional[Mapping[str, float]] = None,
     ran: bool = True,
@@ -540,6 +563,18 @@ def extract_seams(
     if ran and rejected_edges:
         rejected = {_edge_key(a, b): str(r) for (a, b), r in rejected_edges.items()}
 
+    # Graph ids are subset positions when background tiles were held out.
+    surviving = _remap(surviving, index_map)
+    prefilter = _remap(prefilter, index_map)
+    rejected = _remap(rejected, index_map)
+    residuals = _remap(residuals, index_map)
+    if index_map is not None:
+        used = {
+            _edge_key(index_map[a], index_map[b])
+            for a, b in used
+            if a < len(index_map) and b < len(index_map)
+        }
+
     rows: List[SeamResult] = []
     for index_a, index_b, axis in expected:
         key = _edge_key(index_a, index_b)
@@ -562,6 +597,19 @@ def extract_seams(
                 pass
 
         if not ran:
+            rows.append(row)
+            continue
+
+        if content_by_index is not None and not (
+            content_by_index[index_a] and content_by_index[index_b]
+        ):
+            # One side has nothing to register against, so this seam was never
+            # attempted. Distinct from a seam that WAS attempted and failed:
+            # there is no visible content here to be discontinuous, so it must
+            # not count against the mosaic when deciding whether registration
+            # can be trusted or whether a tear matters.
+            row.status = STATUS_NO_CONTENT
+            row.note = "a tile on this seam has no structure to register against"
             rows.append(row)
             continue
 
@@ -637,6 +685,9 @@ class MosaicCoverage:
     """
 
     n_tiles: int = 0
+    # Seams that were actually attempted: pairs where a side had no structure to
+    # register against are excluded, because counting them makes a sparse
+    # mosaic read as a failed registration rather than a sparse one.
     n_expected_seams: int = 0
     n_registered_seams: int = 0
     # Every component, largest first, isolated tiles included as singletons.
@@ -743,8 +794,15 @@ def mosaic_coverage(n_tiles: int, seams: Sequence[SeamResult]) -> MosaicCoverage
         return a
 
     n_registered = 0
+    n_expected = 0
     for seam in seams or []:
-        if getattr(seam, "status", None) != STATUS_REGISTERED:
+        status = getattr(seam, "status", None)
+        if status == STATUS_NO_CONTENT:
+            # Never attempted, and nothing visible here to misalign. Counting it
+            # would make a sparse mosaic look like a failed registration.
+            continue
+        n_expected += 1
+        if status != STATUS_REGISTERED:
             continue
         a, b = int(seam.index_a), int(seam.index_b)
         if not (0 <= a < n and 0 <= b < n):
@@ -766,13 +824,15 @@ def mosaic_coverage(n_tiles: int, seams: Sequence[SeamResult]) -> MosaicCoverage
 
     unconstrained = []
     for seam in seams or []:
+        if getattr(seam, "status", None) == STATUS_NO_CONTENT:
+            continue  # a tear between empty tiles is not a tear anyone can see
         a, b = int(seam.index_a), int(seam.index_b)
         if 0 <= a < n and 0 <= b < n and component_of[a] != component_of[b]:
             unconstrained.append((a, b))
 
     return MosaicCoverage(
         n_tiles=n,
-        n_expected_seams=len(seams or []),
+        n_expected_seams=n_expected,
         n_registered_seams=n_registered,
         components=components,
         component_of=component_of,
@@ -790,6 +850,8 @@ def build_report(
     reg_dict: Optional[Mapping[str, Any]] = None,
     prefilter_graph: Any = None,
     rejected_edges: Optional[Mapping[Tuple[int, int], str]] = None,
+    index_map: Optional[Sequence[int]] = None,
+    content_by_index: Optional[Sequence[bool]] = None,
     quality_threshold: Optional[float] = None,
     frame_extent_um: Optional[Mapping[str, float]] = None,
     settings: Optional[Dict[str, Any]] = None,
@@ -834,6 +896,8 @@ def build_report(
                 reg_dict=reg_dict,
                 prefilter_graph=prefilter_graph,
                 rejected_edges=rejected_edges,
+                index_map=index_map,
+                content_by_index=content_by_index,
                 quality_threshold=quality_threshold,
                 frame_extent_um=frame_extent_um,
             )
@@ -1034,7 +1098,8 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
         f"{report.count(STATUS_PRUNED)} pruned · "
         f"{report.count(STATUS_BELOW_QUALITY)} below quality · "
         f"{report.count(STATUS_IMPLAUSIBLE_SHIFT)} implausible shift · "
-        f"{report.count(STATUS_DROPPED)} no edge"
+        f"{report.count(STATUS_DROPPED)} no edge · "
+        f"{report.count(STATUS_NO_CONTENT)} nothing to register"
     )
     s = report.settings
     if s:
@@ -1244,6 +1309,7 @@ def report_to_json(
                 STATUS_PRUNED,
                 STATUS_BELOW_QUALITY,
                 STATUS_IMPLAUSIBLE_SHIFT,
+                STATUS_NO_CONTENT,
                 STATUS_DROPPED,
                 STATUS_NOT_RUN,
             )

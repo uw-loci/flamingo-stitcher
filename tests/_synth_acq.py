@@ -124,6 +124,8 @@ def write_synth_acquisition(
     inject_border_step: Optional[dict] = None,
     tile_planes: Optional[dict] = None,
     tile_z_offset_planes: Optional[dict] = None,
+    featureless_tiles: Optional[Sequence] = None,
+    featureless_level: float = 3000.0,
     z_texture: bool = False,
 ) -> Path:
     """Write a tiny synthetic raw acquisition. Returns the acquisition dir.
@@ -146,9 +148,17 @@ def write_synth_acquisition(
     disagreement registration exists to find. Distinct from ``tile_planes``,
     which changes a tile's depth rather than its origin.
 
+    ``featureless_tiles`` is a list of ``(ix, iy)`` written as a BRIGHT,
+    smooth constant plus noise instead of phantom content — agarose, mounting
+    medium, an empty region of gel. ``featureless_level`` sets how bright, and
+    the default is deliberately brighter than the phantom: the failure this
+    exists to reproduce is a tile that any intensity threshold calls "content"
+    while having nothing whatsoever for phase correlation to lock onto.
+
     ``z_texture`` makes the phantom genuinely three-dimensional (see
     ``_phantom_field``). A Z-alignment test needs it; nothing else does.
     """
+    featureless = {tuple(t) for t in (featureless_tiles or [])}
     tile_planes = {tuple(k): int(v) for k, v in (tile_planes or {}).items()}
     tile_z_offset_planes = {
         tuple(k): int(v) for k, v in (tile_z_offset_planes or {}).items()
@@ -207,7 +217,16 @@ def write_synth_acquisition(
             # The Z offset moves where in the field this tile's pixels come
             # from; its Workflow.txt above still claims the shared z_start_mm.
             z0 = tile_z_offset_planes.get((ix, iy), 0)
-            crop = field[z0 : z0 + tile_n_planes, y0 : y0 + h, x0 : x0 + w]
+            if (ix, iy) in featureless:
+                # Bright and smooth: what an intensity test mistakes for sample.
+                rng = np.random.default_rng(seed + 977 * (iy * nx + ix))
+                crop = np.clip(
+                    rng.normal(featureless_level, featureless_level / 75.0,
+                               (tile_n_planes, h, w)),
+                    0, _UINT16_MAX,
+                ).astype(field.dtype)
+            else:
+                crop = field[z0 : z0 + tile_n_planes, y0 : y0 + h, x0 : x0 + w]
             if inject_border_step and tuple(inject_border_step["tile"]) == (ix, iy):
                 spec = inject_border_step
                 mag = float(spec["magnitude"])

@@ -19,7 +19,7 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-from flamingo_stitcher import registration_report, tile_geometry
+from flamingo_stitcher import registration_report, tile_content, tile_geometry
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +63,7 @@ SHAREABLE_CONFIG_FIELDS = (
     "max_registration_shift_z_um",
     "min_registration_overlap_frac",
     "min_registered_seam_frac",
+    "min_tile_structure",
     "scope_profile_source",
     "registration_upsample_factor",
     "registration_z_refine",
@@ -916,6 +917,14 @@ class StitchingConfig:
     # with nothing tying the groups together. Below this fraction the run is
     # placed by stage position and the report says why. 0 disables the check.
     min_registered_seam_frac: float = DEFAULT_MIN_REGISTERED_SEAM_FRAC
+
+    # Minimum structure score for a tile to be REGISTERED at all. Tiles below it
+    # are held out of the registration graph and placed with the mosaic. The
+    # score is texture relative to noise, so it does not track brightness: a
+    # bright, featureless volume of agarose scores the same as empty air, which
+    # is the whole reason an intensity threshold cannot do this job. See
+    # `tile_content` for the calibration behind the default.
+    min_tile_structure: float = tile_content.DEFAULT_MIN_STRUCTURE
 
     # Which per-microscope/objective profile shaped this run ("liara|17.0x"),
     # or "" if none did. Set by whoever applied it, and read by the pipeline so
@@ -6365,9 +6374,40 @@ class StitchingPipeline:
             )
             return [], mvs_io.METADATA_TRANSFORM_KEY
 
+        # Hold tiles with nothing to register against out of the graph
+        # entirely, rather than letting them in and dealing with the wreckage.
+        # This is the multiview-stitcher maintainer's own recommendation for
+        # exactly this failure (issue #70): a background tile produces a
+        # confident wrong shift, and the cheapest way not to believe it is not
+        # to ask.
+        content = self._score_tile_content(tile_data)
+        keep = [i for i, c in enumerate(content) if c.has_content]
+        content_flags = [c.has_content for c in content]
+        index_map = None
+        reg_msims = msims
+        if len(keep) < len(msims):
+            if len(keep) < 2:
+                reason = (
+                    f"only {len(keep)} of {len(msims)} tiles have structure to "
+                    f"register against, which is not enough to align anything. "
+                    f"{tile_content.describe(content)}"
+                )
+                self.logger.warning(f"  Registration SKIPPED: {reason}")
+                self._registration_report = registration_report.skipped_report(
+                    reason,
+                    tiles=tiles,
+                    voxel_size_um=voxel_size_um,
+                    frame_extent_um=extent_um,
+                )
+                return [], mvs_io.METADATA_TRANSFORM_KEY
+            index_map = keep
+            reg_msims = [msims[i] for i in keep]
+        self._tiles_registered = len(reg_msims)
+
         # Run registration
         self.logger.info(
-            f"  Running phase correlation registration "
+            f"  Running phase correlation registration on {len(reg_msims)} of "
+            f"{len(msims)} tiles "
             f"(quality threshold={self.config.quality_threshold})..."
         )
         started = time.time()
@@ -6386,7 +6426,7 @@ class StitchingPipeline:
             with dask.diagnostics.ProgressBar():
                 with registration_report.capture_prefilter_graph(sink, reject):
                     result = registration.register(
-                        msims,
+                        reg_msims,
                         reg_channel_index=0,
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
@@ -6404,7 +6444,9 @@ class StitchingPipeline:
                         },
                         return_dict=True,
                     )
-            params = list(result["params"])
+            params = self._expand_to_all_tiles(
+                list(result["params"]), index_map, len(msims)
+            )
 
             # Extract the seams once, here: the guard below and the report have
             # to be reading the same rows or the report cannot explain the
@@ -6415,6 +6457,8 @@ class StitchingPipeline:
                 reg_dict=result,
                 prefilter_graph=sink.get("prefilter"),
                 rejected_edges=sink.get("rejected"),
+                index_map=index_map,
+                content_by_index=content_flags,
                 quality_threshold=self.config.quality_threshold,
                 frame_extent_um=extent_um,
             )
@@ -6454,7 +6498,7 @@ class StitchingPipeline:
                     quality_threshold=self.config.quality_threshold,
                     frame_extent_um=extent_um,
                     settings=self._registration_settings(
-                        None, voxel_size_um, coverage
+                        None, voxel_size_um, coverage, content
                     ),
                     applied=False,
                     reason=reason,
@@ -6470,16 +6514,17 @@ class StitchingPipeline:
             # key would build on exactly the shifts the clamp just rejected.
             # Overwrite with the clamped ones. set_affine_transform re-derives
             # from the untouched metadata base, so this is idempotent.
-            for msim, param in zip(msims, params):
+            for position, msim in enumerate(reg_msims):
                 msi_utils.set_affine_transform(
                     msim,
-                    param,
+                    params[index_map[position] if index_map else position],
                     transform_key="registered",
                     base_transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                 )
 
             params, z_summary = self._refine_z_shifts(
-                msims, params, tile_data, voxel_size_um, registration, clamp
+                reg_msims, params, tile_data, voxel_size_um, registration, clamp,
+                index_map,
             )
 
             self._registration_report = registration_report.build_report(
@@ -6492,7 +6537,7 @@ class StitchingPipeline:
                 quality_threshold=self.config.quality_threshold,
                 frame_extent_um=extent_um,
                 settings=self._registration_settings(
-                    clamp, voxel_size_um, coverage
+                    clamp, voxel_size_um, coverage, content
                 ),
                 z_refine=z_summary,
                 elapsed_s=time.time() - started,
@@ -6614,7 +6659,8 @@ class StitchingPipeline:
         return {"upsample_factor": factor} if factor > 0 else None
 
     def _refine_z_shifts(
-        self, msims, params, tile_data, voxel_size_um, registration, clamp
+        self, msims, params, tile_data, voxel_size_um, registration, clamp,
+        index_map=None,
     ):
         """Second registration pass whose only contribution is Z.
 
@@ -6631,10 +6677,32 @@ class StitchingPipeline:
         params untouched — a refinement that cannot run must never cost the
         registration that already worked.
         """
+        # The search range must not exceed the clamp's Z bound. Searching past
+        # it cannot produce anything that survives — a correction beyond the
+        # bound is reverted the moment it comes back — so the extra range buys
+        # nothing and costs two ways: the pass does more work, and every peak
+        # that runs to the wider limit is reported as "at the search limit",
+        # which reads as a failed measurement rather than as a setting asking
+        # for something it would refuse to use.
+        #
+        # On the run that motivated this the range was 40 um against a 25 um
+        # bound, and 14 of 28 corrections came back at the limit.
+        requested_range = float(self.config.registration_z_refine_range_um)
+        effective_range = requested_range
+        bound_z = getattr(clamp, "bound_z_um", None) if clamp is not None else None
+        if bound_z and requested_range > float(bound_z):
+            effective_range = float(bound_z)
+            self.logger.info(
+                f"  Z refinement search range reduced from "
+                f"{requested_range:.0f} to {effective_range:.0f} µm to match the "
+                f"Z shift bound — a correction beyond the bound would be "
+                f"reverted anyway. Raise 'Maximum axial correction' for this "
+                f"microscope if the stage really does drift further."
+            )
         summary = registration_report.ZRefineSummary(
             binning=dict(self.config.registration_z_refine_binning),
             upsample_factor=int(self.config.registration_z_refine_upsample),
-            search_range_um=float(self.config.registration_z_refine_range_um),
+            search_range_um=effective_range,
         )
         if not self.config.registration_z_refine:
             summary.reason = "disabled (registration_z_refine)"
@@ -6697,7 +6765,10 @@ class StitchingPipeline:
             return params, summary
 
         merged, summary = self._merge_z_refinement(
-            params, list(refined), summary, clamp
+            params,
+            self._expand_to_all_tiles(list(refined), index_map, len(params)),
+            summary,
+            clamp,
         )
         self.logger.info(
             f"  Z refinement: adjusted {summary.n_tiles_moved}/{len(params)} tiles "
@@ -6773,6 +6844,64 @@ class StitchingPipeline:
             ordered = sorted(applied)
             summary.median_abs_dz_um = ordered[len(ordered) // 2]
         return merged, summary
+
+    def _score_tile_content(self, tile_data):
+        """Which tiles have structure phase correlation can lock onto.
+
+        Intensity is the wrong question. A fish in agarose in an FEP tube has
+        several backgrounds at several brightnesses, and the agarose is both
+        bright and completely featureless — so any threshold on brightness hands
+        the registration a tile full of smooth gel and calls it content. See
+        `tile_content` for the measure and its calibration.
+        """
+        threshold = getattr(self.config, "min_tile_structure", None)
+        results = tile_content.score_tiles(
+            [volume for volume, _ti in tile_data],
+            min_structure=(
+                tile_content.DEFAULT_MIN_STRUCTURE
+                if threshold is None
+                else float(threshold)
+            ),
+        )
+        self.logger.info(f"  Tile content: {tile_content.describe(results)}")
+        for record in results:
+            if not record.has_content:
+                folder = getattr(tile_data[record.index][1], "folder", None)
+                label = f" ({folder.name})" if folder is not None else ""
+                self.logger.info(
+                    f"    Tile {record.index}{label} held out of "
+                    f"registration: {record.note}"
+                )
+        return results
+
+    def _expand_to_all_tiles(self, params, index_map, n_tiles):
+        """Subset registration params back onto every tile.
+
+        Tiles held out of the registration get an identity correction, which
+        puts them at their stage position — and `_bind_unconstrained_tiles` then
+        moves them with the mosaic like any other tile nothing measured, so the
+        whole thing still translates as one rigid body.
+        """
+        if index_map is None:
+            return list(params)
+        import numpy as _np
+
+        template = next((p for p in params if hasattr(p, "copy")), None)
+        out = []
+        for _ in range(n_tiles):
+            if template is None:
+                out.append(_np.eye(4))
+                continue
+            blank = template.copy()
+            buf = blank.values if hasattr(blank, "values") else blank
+            mat = buf[0] if buf.ndim == 3 else buf
+            mat[:3, :3] = _np.eye(3)
+            mat[:3, 3] = 0.0
+            out.append(blank)
+        for position, tile_index in enumerate(index_map):
+            if position < len(params) and 0 <= tile_index < n_tiles:
+                out[tile_index] = params[position]
+        return out
 
     def _pairwise_shift_reject(self, tile_data, voxel_size_um):
         """A predicate that throws out a pairwise shift the geometry forbids.
@@ -6855,41 +6984,62 @@ class StitchingPipeline:
         shift rather than zero. Its own placement is still unmeasured — it just
         stops being unmeasured in a way that tears its neighbours.
 
+        Each component is normalised as a WHOLE, never flattened. A component
+        with two or more tiles has a measured internal alignment, and replacing
+        every member with one number throws that measurement away — BigStitcher
+        states the rule for this case explicitly: align connected components
+        relative to each other using metadata, "while keeping the results from
+        the first round within a component". So what is removed is the
+        component's arbitrary global offset (each one is anchored to its own
+        reference view, so the offsets are not comparable), not its internal
+        structure.
+
         Returns ``(params, bound_indices)``.
         """
         import numpy as _np
 
         if not coverage.components or coverage.is_safe_to_apply:
             return params, []
-        dominant = set(coverage.components[0])
-        loose = [i for i in range(len(params)) if i not in dominant]
-        if not loose or len(dominant) < _MIN_TILES_FOR_CONSENSUS:
+        dominant = coverage.components[0]
+        if len(dominant) < _MIN_TILES_FOR_CONSENSUS:
             return params, []
 
-        cz, cy, cx = self._median_shift(params, sorted(dominant))
+        # The frame everything is expressed in: the dominant component keeps its
+        # placement exactly, and every other component is brought alongside it.
+        anchor = self._median_shift(params, dominant)
         out = list(params)
         bound = []
-        for index in loose:
-            param = out[index]
-            if not hasattr(param, "copy"):
-                continue
-            try:
-                moved = param.copy()
-                buf = moved.values if hasattr(moved, "values") else moved
-                mat = buf[0] if buf.ndim == 3 else buf
-                if not _np.allclose(mat[:3, :3], _np.eye(3), atol=1e-9):
-                    continue  # not a pure translation; leave it alone
-                mat[0, 3], mat[1, 3], mat[2, 3] = cz, cy, cx
-                out[index] = moved
-                bound.append(index)
-            except Exception:
-                continue
+        for component in coverage.components[1:]:
+            # Its own offset, which is arbitrary — subtract it and add the
+            # anchor's, so the component moves as a rigid body onto the mosaic.
+            own = self._median_shift(params, component)
+            delta = tuple(a - o for a, o in zip(anchor, own))
+            for index in component:
+                param = out[index]
+                if not hasattr(param, "copy"):
+                    continue
+                try:
+                    moved = param.copy()
+                    buf = moved.values if hasattr(moved, "values") else moved
+                    mat = buf[0] if buf.ndim == 3 else buf
+                    if not _np.allclose(mat[:3, :3], _np.eye(3), atol=1e-9):
+                        continue  # not a pure translation; leave it alone
+                    mat[0, 3] += delta[0]
+                    mat[1, 3] += delta[1]
+                    mat[2, 3] += delta[2]
+                    out[index] = moved
+                    bound.append(index)
+                except Exception:
+                    continue
+        cz, cy, cx = anchor
         if bound:
+            n_groups = len(coverage.components) - 1
             self.logger.info(
-                f"  Registration: {len(bound)} tiles had no registered seam and "
-                f"were moved with the mosaic (consensus dz={cz:.1f} dy={cy:.1f} "
-                f"dx={cx:.1f} µm) rather than left behind. Their own placement "
-                f"is unmeasured — see the seam table."
+                f"  Registration: {len(bound)} tiles in {n_groups} group(s) had "
+                f"no seam tying them to the main mosaic, and were moved onto it "
+                f"(anchor dz={cz:.1f} dy={cy:.1f} dx={cx:.1f} µm) rather than "
+                f"left behind. Any alignment measured WITHIN such a group is "
+                f"kept; only its offset from the mosaic is unmeasured."
             )
         return out, bound
 
@@ -6968,8 +7118,15 @@ class StitchingPipeline:
         )
 
     def _registration_settings(
-        self, clamp, voxel_size_um, coverage=None
+        self, clamp, voxel_size_um, coverage=None, content=None
     ) -> Dict[str, Any]:
+        """Settings block for the report.
+
+        `tiles_registered` is read back from what was actually handed to
+        `register()`, not derived from the content scores. Those two can only
+        differ if the hold-out is broken — which is exactly the bug a test
+        computing it from the scores would be unable to see.
+        """
         settings = {
             "quality_threshold": self.config.quality_threshold,
             "registration_binning": dict(self.config.registration_binning),
@@ -6998,6 +7155,22 @@ class StitchingPipeline:
                     "tiles_bound_to_mosaic": len(coverage.bound_tiles),
                 }
             )
+        registered = getattr(self, "_tiles_registered", None)
+        if registered is not None:
+            settings["tiles_registered"] = int(registered)
+        if content is not None:
+            configured = getattr(self.config, "min_tile_structure", None)
+            settings["min_tile_structure"] = float(
+                tile_content.DEFAULT_MIN_STRUCTURE
+                if configured is None
+                else configured
+            )
+            settings["tiles_without_structure"] = sum(
+                1 for c in content if not c.has_content
+            )
+            scored = [c.structure for c in content if c.measured]
+            if scored:
+                settings["tile_structure_range"] = [min(scored), max(scored)]
         return settings
 
     def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):

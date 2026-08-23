@@ -260,6 +260,52 @@ class TestBindUnconstrainedTiles:
         assert bound == []
         assert out is params
 
+    def test_a_second_real_group_keeps_its_own_internal_alignment(self):
+        """The bug this replaced: flattening every non-dominant tile onto one
+        number destroys the alignment a second group actually measured.
+
+        BigStitcher states the rule — align components relative to each other
+        from metadata, "while keeping the results from the first round within a
+        component". On the real run, tiles 21 and 22 formed a group with a
+        measured dx of 68.8 um between them; flattening set both to the same
+        value and threw that measurement away.
+        """
+        pipe = StitchingPipeline(StitchingConfig())
+        # 0-3 are the dominant group; 4 and 5 form a second REAL group with a
+        # measured 20 um between them.
+        cov = rr.mosaic_coverage(
+            6, grid_seams(2, 3, [(0, 1), (2, 3), (0, 2), (1, 3), (4, 5)])
+        )
+        params = _params(
+            [(0, 0, -100), (0, 0, -100), (0, 0, -100), (0, 0, -100),
+             (0, 0, 10), (0, 0, 30)]
+        )
+        out, bound = pipe._bind_unconstrained_tiles(params, cov)
+        assert sorted(bound) == [4, 5]
+        # Their 20 um internal separation survives -- this is the point.
+        internal = _trans(out[5])[2] - _trans(out[4])[2]
+        assert internal == pytest.approx(20.0)
+        # ...and the group as a whole has moved onto the mosaic. (_median_shift
+        # takes the UPPER median on an even count, so the group's median tile
+        # lands exactly on the anchor and the other sits 20 um off it.)
+        assert _trans(out[4])[2] == pytest.approx(-120.0)
+        assert _trans(out[5])[2] == pytest.approx(-100.0)
+
+    def test_the_group_lands_centred_on_the_mosaics_placement(self):
+        pipe = StitchingPipeline(StitchingConfig())
+        cov = rr.mosaic_coverage(
+            6, grid_seams(2, 3, [(0, 1), (2, 3), (0, 2), (1, 3), (4, 5)])
+        )
+        params = _params(
+            [(0, 0, -100)] * 4 + [(0, 0, 10), (0, 0, 30)]
+        )
+        out, _ = pipe._bind_unconstrained_tiles(params, cov)
+        # Its median moves onto the dominant group's median; the dominant group
+        # itself is untouched.
+        assert sorted([_trans(out[4])[2], _trans(out[5])[2]])[1] == pytest.approx(-100.0)
+        for i in range(4):
+            assert _trans(out[i])[2] == pytest.approx(-100.0)
+
     def test_it_declines_when_the_dominant_group_is_too_small_to_have_a_consensus(self):
         # 2 tiles cannot vote on where the mosaic is; binding 4 others to them
         # would be guessing, not consensus.
@@ -343,3 +389,37 @@ class TestZeroMeansDisabled:
         ]
         extent = {"x": 100.0, "y": 100.0, "z": 10.0}
         assert pipe._registration_overlap_gate(tiles, extent) is not None
+
+
+class TestZSearchRangeMatchesTheBound:
+    """Searching past the clamp's Z bound cannot produce anything that survives.
+
+    On the real run the search was +/-40 um against a 25 um bound, and 14 of 28
+    corrections came back "at the search limit" -- reported as failed
+    measurements when they were really the settings asking for something the
+    clamp would refuse to use.
+    """
+
+    def _summary(self, requested, bound):
+        from types import SimpleNamespace
+
+        pipe = StitchingPipeline(
+            StitchingConfig(
+                registration_z_refine=False,          # stop after the summary
+                registration_z_refine_range_um=requested,
+            )
+        )
+        clamp = SimpleNamespace(bound_z_um=bound)
+        _params, summary = pipe._refine_z_shifts(
+            [], [], [], {"z": 1.0, "y": 1.0, "x": 1.0}, None, clamp
+        )
+        return summary
+
+    def test_a_range_beyond_the_bound_is_reduced_to_it(self):
+        assert self._summary(40.0, 25.0).search_range_um == pytest.approx(25.0)
+
+    def test_a_range_inside_the_bound_is_left_alone(self):
+        assert self._summary(15.0, 25.0).search_range_um == pytest.approx(15.0)
+
+    def test_no_bound_leaves_the_request_untouched(self):
+        assert self._summary(40.0, None).search_range_um == pytest.approx(40.0)

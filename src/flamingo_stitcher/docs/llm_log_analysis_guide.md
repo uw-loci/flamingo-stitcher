@@ -215,7 +215,17 @@ the run log in full, so an old log still has it.
 - **`registration_report.txt`** — the summary. Read the header first: it has
   **three** states, not two. *DID NOT RUN* (registration was never attempted),
   *RAN but its result was NOT APPLIED* (it was measured and refused — the seam
-  table is the evidence for why), and a normal applied run.
+  table is the evidence for why), and a normal applied run. `tiles_registered`
+  says how many tiles actually entered the graph, which is **not** the tile
+  count when the content gate held some out.
+
+  **Brightness is not content.** The gate scores texture relative to noise
+  precisely because a bright, featureless volume — agarose, mounting medium —
+  is exactly what an intensity threshold mistakes for sample, and it gives
+  phase correlation nothing to lock onto. A straight edge (an FEP tube wall)
+  is the opposite trap: it scores as structure and is still a poor alignment
+  target, because it slides along its own length without changing the
+  correlation. That one is caught by the shift bound, not by the content gate.
 - **`registration_report.csv`** — one row per tile: `dz/dy/dx` in µm and in
   frames/pixels, per-axis `clamped_*` flags, and `*_before_clamp`.
 - **`registration_seams.csv`** — one row per **expected** neighbour pair from
@@ -277,6 +287,8 @@ The log rarely contains these; ask before committing to a diagnosis:
 | `Registration: N tiles had no registered seam and were moved with the mosaic` | Those tiles registered against nothing. Rather than leave them at their stage position while their neighbours moved — which opens a seam by the full size of the correction — they were given the mosaic's consensus shift. | Informational. Their own placement is **not measured**; a shared shift simply opens no seam. If N is large, the sample covers little of the grid. |
 | `REGISTRATION SHIFT REPORT` says **DID NOT RUN** | `Skip registration` is on, or the run fell back | Uncheck it. This is the first thing to check when tiles do not line up: placement was stage metadata alone. |
 | Many seams `below_quality` in `registration_seams.csv` | The overlap does not correlate: sparse/dim sample, or too little shared content | Lower `quality_threshold` (0.4 default; 0.2 was abandoned as too permissive), or accept stage placement. Many below-quality seams on visibly textured data is the case that would justify interest-point registration. |
+| `Tile content: N of M tiles have nothing to register against` / seams with status `no_content` | Those tiles scored below `min_tile_structure` and were held out of the registration graph, then placed with the mosaic. Their seams are excluded from the trust threshold, because there is no visible content there to be discontinuous. | Normal on a sparse mosaic. Check `tile_structure_range` in the report: featureless material scores ~0.09 whatever its brightness, so a range like 0.08–0.85 is a clean separation. If **dim real sample** is being held out, lower **Minimum tile structure** for this microscope (`--min-tile-structure`); 0 registers every tile. |
+| Sample is present but `tiles_without_structure` counts it as empty | The score is texture relative to noise, and it falls to the featureless floor at a contrast-to-noise ratio near 1 — at which point there is genuinely nothing for phase correlation to find either. | Not a threshold problem; the tile is too dim to register on. Fix the acquisition (exposure/laser) rather than the threshold, or accept stage placement for those tiles. |
 | `below_quality` seams cluster by **grid position** (whole outer columns/rows near 0.0 while the middle scores 0.3+) | Not a registration fault — the sample only covers part of the mosaic and the outer tiles are background. This is the shape that produces a disconnected registration graph. | Restrict the run to the tiles containing sample. Averaging seam quality per tile onto the grid makes this obvious in one glance. |
 | Seams with status `implausible_shift`, and `N seams passed the quality threshold but proposed a shift the geometry forbids` | The seam correlated well and proposed a shift larger than the tiles' overlap — at which point they do not overlap at all, so it cannot be a measurement of their relative position. Dropped **before** the global solve so it could not move every tile in its component. | Usually nothing: the guard did its job. A high count means the overlaps are correlating on something repetitive or elongated. Note the fix is **not** lowering `quality_threshold` — a confident wrong peak scores *well*, so that makes it worse. Tighten **Maximum lateral correction** for this microscope (Options tab / `--max-reg-shift`) instead; the automatic bound is one whole overlap. |
 | Many tiles `clamped_z`/`clamped_x` in `registration_report.csv` | Corrections exceeded the plausible bound and were reverted to the mosaic's consensus placement — those tiles are **NOT measured** (they are not at their stage position either; a clamped tile keeps the shift the whole mosaic agreed on, which opens no seam) | Read `*_before_clamp`: shifts scaling with distance ⇒ pixel-size error; constant ⇒ overlap error; alternating by row ⇒ tile ordering. None of those are fixed by registration. |
