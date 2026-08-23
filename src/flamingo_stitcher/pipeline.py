@@ -29,6 +29,14 @@ logger = logging.getLogger(__name__)
 # plain-text status (CLI/logs) also reads cleanly.
 OVERALL_ETA_SEP = "   ·   "
 
+# Fraction of expected seams that must register before the result is believed.
+# A default, not a constant: how much of a mosaic contains registerable content
+# depends on the sample and the scope, so this is overridable per microscope and
+# objective (config `min_registered_seam_frac`). Half is where "most seams
+# agree" stops being true.
+DEFAULT_MIN_REGISTERED_SEAM_FRAC = 0.5
+
+
 # StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
 # block so a run's settings can be reloaded into the GUI ("Load Configuration",
 # to share a setup that worked). The file-specific ones at the end are recorded
@@ -54,6 +62,8 @@ SHAREABLE_CONFIG_FIELDS = (
     "max_registration_shift_um",
     "max_registration_shift_z_um",
     "min_registration_overlap_frac",
+    "min_registered_seam_frac",
+    "scope_profile_source",
     "registration_upsample_factor",
     "registration_z_refine",
     "registration_z_refine_range_um",
@@ -898,6 +908,21 @@ class StitchingConfig:
     # exists to mop up afterwards. Below this, place by stage position and say
     # so in the report rather than clamp half the tiles and call it alignment.
     min_registration_overlap_frac: float = 0.05
+
+    # Fraction of expected seams that must register before the result is used
+    # at all. Registration can succeed on a handful of seams and fail on the
+    # rest — a sample covering part of the grid does exactly that — and
+    # multiview-stitcher then solves each connected group of tiles independently
+    # with nothing tying the groups together. Below this fraction the run is
+    # placed by stage position and the report says why. 0 disables the check.
+    min_registered_seam_frac: float = DEFAULT_MIN_REGISTERED_SEAM_FRAC
+
+    # Which per-microscope/objective profile shaped this run ("liara|17.0x"),
+    # or "" if none did. Set by whoever applied it, and read by the pipeline so
+    # a GUI run that already resolved a profile — and let the user override a
+    # control on top of it — is not silently re-overridden here. Also the
+    # provenance answer to "why did this run use that threshold?".
+    scope_profile_source: str = ""
 
     # Sub-pixel upsampling for phase correlation. multiview-stitcher silently
     # picks 10 for 2-D data and 2 for 3-D (registration.py:412), so every 3-D
@@ -1988,6 +2013,7 @@ MIN_USEFUL_TILE_OVERLAP = 0.03
 # fact. Better to place by stage position and say so than to clamp half the
 # tiles and call the result alignment.
 MIN_REGISTRATION_OVERLAP = 0.05
+
 
 # Auto Z shift bound (see StitchingPipeline._axial_shift_bound). The reported
 # real-world error is 3-6 frames between neighbours, so 8 steps clears it with
@@ -4303,6 +4329,7 @@ class StitchingPipeline:
             self.logger.warning(_line)
         self.logger.info(f"Input:  {acquisition_dir}")
         self.logger.info(f"Output: {output_path}")
+        self._apply_scope_profile(acquisition_dir)
 
         # --- Step 1: Discover tiles ---
         self._progress_fn(2, "Discovering tiles...")
@@ -6355,8 +6382,9 @@ class StitchingPipeline:
             reg_logger.setLevel(logging.WARNING)
 
             sink: Dict[str, Any] = {}
+            reject = self._pairwise_shift_reject(tile_data, voxel_size_um)
             with dask.diagnostics.ProgressBar():
-                with registration_report.capture_prefilter_graph(sink):
+                with registration_report.capture_prefilter_graph(sink, reject):
                     result = registration.register(
                         msims,
                         reg_channel_index=0,
@@ -6377,6 +6405,63 @@ class StitchingPipeline:
                         return_dict=True,
                     )
             params = list(result["params"])
+
+            # Extract the seams once, here: the guard below and the report have
+            # to be reading the same rows or the report cannot explain the
+            # decision.
+            seams = registration_report.extract_seams(
+                tiles=tiles,
+                voxel_size_um=voxel_size_um,
+                reg_dict=result,
+                prefilter_graph=sink.get("prefilter"),
+                rejected_edges=sink.get("rejected"),
+                quality_threshold=self.config.quality_threshold,
+                frame_extent_um=extent_um,
+            )
+            n_rejected = len(sink.get("rejected") or {})
+            if n_rejected:
+                self.logger.warning(
+                    f"  {n_rejected} seams passed the quality threshold but "
+                    f"proposed a shift the geometry forbids, and were dropped "
+                    f"before the global solve. A confident wrong correlation "
+                    f"peak scores WELL, so lowering the quality threshold makes "
+                    f"this worse, not better — see registration_seams.csv."
+                )
+            coverage = registration_report.mosaic_coverage(len(tiles), seams)
+            self.logger.info(f"  Registration coverage: {coverage.describe()}")
+
+            # Two independent questions, in order. First: is there enough
+            # agreement here to believe any of it? Second: does what we believe
+            # place every adjacent pair relative to its neighbour?
+            reason = self._untrustworthy_registration_reason(coverage)
+            if reason is None and not coverage.is_safe_to_apply:
+                # Geometry, not trust: bind the loose tiles to the mosaic so no
+                # seam tears, and carry on with the measurements that worked.
+                params, bound = self._bind_unconstrained_tiles(params, coverage)
+                if bound:
+                    coverage.bound_tiles = list(bound)
+                else:
+                    reason = self._unconstrained_coverage_reason(coverage, params)
+
+            if reason is not None:
+                self.logger.warning(f"  Registration NOT APPLIED: {reason}")
+                self._registration_report = registration_report.build_report(
+                    tiles=tiles,
+                    params=params,
+                    voxel_size_um=voxel_size_um,
+                    transform_key=mvs_io.METADATA_TRANSFORM_KEY,
+                    seams=seams,
+                    quality_threshold=self.config.quality_threshold,
+                    frame_extent_um=extent_um,
+                    settings=self._registration_settings(
+                        None, voxel_size_um, coverage
+                    ),
+                    applied=False,
+                    reason=reason,
+                    elapsed_s=time.time() - started,
+                )
+                return [], mvs_io.METADATA_TRANSFORM_KEY
+
             clamp = self._clamp_registration_shifts(params, tile_data, voxel_size_um)
             params = clamp.params
 
@@ -6403,11 +6488,12 @@ class StitchingPipeline:
                 voxel_size_um=voxel_size_um,
                 transform_key="registered",
                 clamp_records=clamp.records,
-                reg_dict=result,
-                prefilter_graph=sink.get("prefilter"),
+                seams=seams,
                 quality_threshold=self.config.quality_threshold,
                 frame_extent_um=extent_um,
-                settings=self._registration_settings(clamp, voxel_size_um),
+                settings=self._registration_settings(
+                    clamp, voxel_size_um, coverage
+                ),
                 z_refine=z_summary,
                 elapsed_s=time.time() - started,
             )
@@ -6432,6 +6518,38 @@ class StitchingPipeline:
     # Registration helpers
     # ------------------------------------------------------------------
 
+    def _apply_scope_profile(self, acquisition_dir) -> None:
+        """Overlay this microscope + objective's saved options onto the config.
+
+        Skipped when `scope_profile_source` is already set: the GUI resolves the
+        profile per queue item so the user can see and override the values
+        before starting, and re-applying here would undo that override.
+
+        This is the layer that makes the CLI honour a rig's tuning at all —
+        without it a headless run gets the dataclass defaults regardless of
+        which instrument produced the data.
+        """
+        if getattr(self.config, "scope_profile_source", ""):
+            return
+        try:
+            from flamingo_stitcher import scope_profiles
+
+            scope, objective, values, source = (
+                scope_profiles.resolve_for_acquisition(acquisition_dir)
+            )
+            applied, message = scope_profiles.describe_resolution(
+                scope, objective, values, source
+            )
+            self.logger.info(message)
+            if not applied:
+                return
+            self.config.scope_profile_source = source
+            for line in scope_profiles.apply_profile(self.config, values):
+                self.logger.info(f"  {line}")
+        except Exception as e:  # noqa: BLE001 - a preferences file must never
+            # stop a stitch; the defaults are always a working configuration.
+            self.logger.warning(f"Could not apply per-microscope options: {e}")
+
     def _frame_extent_um(self, tile_data, voxel_size_um) -> Dict[str, float]:
         """What one tile covers along each axis, in processing-frame µm."""
         try:
@@ -6454,9 +6572,11 @@ class StitchingPipeline:
         """
         if not extent_um:
             return None  # can't measure; let registration try rather than veto it
+        # Same falsy-zero trap as min_registered_seam_frac: 0.0 means "do not
+        # gate on overlap", and `or` would silently restore the default.
+        configured = getattr(self.config, "min_registration_overlap_frac", None)
         threshold = float(
-            getattr(self.config, "min_registration_overlap_frac", None)
-            or MIN_REGISTRATION_OVERLAP
+            MIN_REGISTRATION_OVERLAP if configured is None else configured
         )
         layout = tile_geometry.grid_overlap(
             tiles, extent_x_um=extent_um["x"], extent_y_um=extent_um["y"]
@@ -6654,19 +6774,231 @@ class StitchingPipeline:
             summary.median_abs_dz_um = ordered[len(ordered) // 2]
         return merged, summary
 
-    def _registration_settings(self, clamp, voxel_size_um) -> Dict[str, Any]:
-        return {
+    def _pairwise_shift_reject(self, tile_data, voxel_size_um):
+        """A predicate that throws out a pairwise shift the geometry forbids.
+
+        Applied inside `capture_prefilter_graph`, which multiview-stitcher calls
+        immediately before the global solve — so a bad edge never gets to move
+        the tiles it touches.
+
+        This is the same physical ceiling `_clamp_registration_shifts` applies,
+        moved earlier because earlier is where it works. The post-solve clamp can
+        only revert whole TILES, and a solved component is only meaningful whole:
+        reverting one member tears it from the rest. On the run that motivated
+        this, the clamp reverted 4 tiles out of an 8-tile component and broke
+        three seams that had genuinely been measured.
+
+        The bound catches what the quality threshold cannot. Quality here is a
+        Spearman rank correlation over the overlap, which stays high when an
+        elongated structure slides along its own axis — so a confident wrong peak
+        scores WELL. That run accepted a pairwise dx of -345.7 µm across a
+        156.7 µm overlap: at that shift the two tiles do not overlap at all, so
+        it cannot be a measurement of where they sit relative to each other.
+
+        Returns None when the bound cannot be sized, rather than guessing one.
+        """
+        try:
+            shp = tile_data[0][0].shape
+            nz, ny, nx = int(shp[-3]), int(shp[-2]), int(shp[-1])
+        except Exception:
+            return None
+        vx = float(voxel_size_um.get("x", 1.0))
+        vy = float(voxel_size_um.get("y", 1.0))
+        vz = float(voxel_size_um.get("z", 1.0))
+        bound_xy, source_xy = self._lateral_shift_bound(
+            [t for _v, t in tile_data], nx * vx, ny * vy, vx, vy
+        )
+        bound_z, source_z = self._axial_shift_bound(nz * vz, vz)
+        self.logger.info(
+            f"  Pairwise shift bounds: xy {bound_xy:.1f} µm ({source_xy}), "
+            f"z {bound_z:.1f} µm ({source_z}) — a seam proposing more than this "
+            f"is dropped before the global solve, not clamped after it."
+        )
+
+        def reject(_a, _b, data):
+            translation = registration_report.translation_from_param(
+                data.get("transform") if hasattr(data, "get") else None
+            )
+            if translation is None:
+                return None
+            dz, dy, dx = translation
+            lateral = max(abs(dy), abs(dx))
+            if lateral > bound_xy:
+                return (
+                    f"proposed a lateral shift of {lateral:.1f} µm, beyond the "
+                    f"{bound_xy:.1f} µm the geometry allows ({source_xy}); at "
+                    f"that shift these tiles no longer overlap"
+                )
+            if abs(dz) > bound_z:
+                return (
+                    f"proposed a Z shift of {abs(dz):.1f} µm, beyond the "
+                    f"{bound_z:.1f} µm bound ({source_z})"
+                )
+            return None
+
+        return reject
+
+    def _bind_unconstrained_tiles(self, params, coverage):
+        """Move tiles nothing measured WITH the mosaic, instead of past it.
+
+        multiview-stitcher resolves each connected component of the registration
+        graph independently and hands an edgeless component the identity. So a
+        tile with no registered seam keeps its stage position while the tiles
+        beside it move — and the seam between them opens by the whole of that
+        correction. On a real 4x7 run where the sample sat in the middle two
+        columns, that put 90-194 px steps into 14 of 45 seams that had no step
+        before registration.
+
+        The fix follows the same observation the clamp's consensus rests on: a
+        correction every tile shares slides the mosaic and opens no seam at all.
+        So an unconstrained tile is given the dominant component's consensus
+        shift rather than zero. Its own placement is still unmeasured — it just
+        stops being unmeasured in a way that tears its neighbours.
+
+        Returns ``(params, bound_indices)``.
+        """
+        import numpy as _np
+
+        if not coverage.components or coverage.is_safe_to_apply:
+            return params, []
+        dominant = set(coverage.components[0])
+        loose = [i for i in range(len(params)) if i not in dominant]
+        if not loose or len(dominant) < _MIN_TILES_FOR_CONSENSUS:
+            return params, []
+
+        cz, cy, cx = self._median_shift(params, sorted(dominant))
+        out = list(params)
+        bound = []
+        for index in loose:
+            param = out[index]
+            if not hasattr(param, "copy"):
+                continue
+            try:
+                moved = param.copy()
+                buf = moved.values if hasattr(moved, "values") else moved
+                mat = buf[0] if buf.ndim == 3 else buf
+                if not _np.allclose(mat[:3, :3], _np.eye(3), atol=1e-9):
+                    continue  # not a pure translation; leave it alone
+                mat[0, 3], mat[1, 3], mat[2, 3] = cz, cy, cx
+                out[index] = moved
+                bound.append(index)
+            except Exception:
+                continue
+        if bound:
+            self.logger.info(
+                f"  Registration: {len(bound)} tiles had no registered seam and "
+                f"were moved with the mosaic (consensus dz={cz:.1f} dy={cy:.1f} "
+                f"dx={cx:.1f} µm) rather than left behind. Their own placement "
+                f"is unmeasured — see the seam table."
+            )
+        return out, bound
+
+    def _untrustworthy_registration_reason(self, coverage) -> Optional[str]:
+        """Why this registration should not be believed at all, or None.
+
+        Distinct from the geometry problem `_bind_unconstrained_tiles` solves.
+        Binding makes a partly-registered mosaic *safe*; it cannot make it
+        *right*. When only a small fraction of seams registered, the few that
+        did are as likely to be a confident wrong peak as a measurement — and on
+        the run that motivated this, the surviving seams proposed lateral shifts
+        of up to 345 µm across a 157 µm overlap, which cannot be a measurement
+        of anything.
+
+        The fraction is a judgement about a sample and a scope, not a constant,
+        so it is configuration: `min_registered_seam_frac`.
+        """
+        # `or` would swallow a deliberate 0.0 — which is exactly the value that
+        # means "do not check this" — so fall back only on a genuinely absent
+        # setting.
+        configured = getattr(self.config, "min_registered_seam_frac", None)
+        threshold = float(
+            DEFAULT_MIN_REGISTERED_SEAM_FRAC if configured is None else configured
+        )
+        if threshold <= 0.0 or coverage.n_expected_seams <= 0:
+            return None
+        fraction = coverage.n_registered_seams / coverage.n_expected_seams
+        if fraction >= threshold:
+            return None
+        return (
+            f"{coverage.describe()} — {fraction * 100:.0f}% of seams, below the "
+            f"{threshold * 100:.0f}% needed to trust the result. With this "
+            f"little agreement the seams that did pass are as likely to be a "
+            f"confident wrong correlation peak as a measurement. The seam table "
+            f"gives a quality score for every pair: if the sample genuinely "
+            f"covers only part of the grid, either restrict the run to the "
+            f"tiles that contain it, or lower 'Minimum share of seams that must "
+            f"register' for this microscope in the Options tab."
+        )
+
+    def _unconstrained_coverage_reason(self, coverage, params) -> str:
+        """Why this registration was refused, with the damage it would have done.
+
+        A rule the user cannot check is a rule the user will switch off, so this
+        measures rather than asserts: for every adjacent pair whose two halves
+        landed in different components, the difference between their corrections
+        is exactly the step that pair's seam would have shown in the output.
+        """
+        worst = 0.0
+        for index_a, index_b in coverage.unconstrained:
+            a = registration_report.translation_from_param(
+                params[index_a] if index_a < len(params) else None
+            )
+            b = registration_report.translation_from_param(
+                params[index_b] if index_b < len(params) else None
+            )
+            if a is None or b is None:
+                continue
+            worst = max(worst, max(abs(x - y) for x, y in zip(a, b)))
+
+        reason = (
+            f"the registered seams do not connect the mosaic — "
+            f"{coverage.describe()}. multiview-stitcher solves each connected "
+            f"group independently, so nothing measured where those groups sit "
+            f"relative to each other"
+        )
+        if worst > 0.0:
+            reason += (
+                f"; applying this would have opened a step of up to "
+                f"{worst:.1f} µm at seams that are currently only off by stage "
+                f"placement error"
+            )
+        return (
+            reason + ". Tiles were placed by stage position instead. The seam "
+            "table shows which pairs had too little shared content to register."
+        )
+
+    def _registration_settings(
+        self, clamp, voxel_size_um, coverage=None
+    ) -> Dict[str, Any]:
+        settings = {
             "quality_threshold": self.config.quality_threshold,
             "registration_binning": dict(self.config.registration_binning),
             "upsample_factor": self.config.registration_upsample_factor,
             "voxel_z_um": float(voxel_size_um.get("z", 0.0)),
             "voxel_y_um": float(voxel_size_um.get("y", 0.0)),
             "voxel_x_um": float(voxel_size_um.get("x", 0.0)),
-            "bound_xy_um": clamp.bound_xy_um,
-            "bound_xy_source": clamp.source_xy,
-            "bound_z_um": clamp.bound_z_um,
-            "bound_z_source": clamp.source_z,
         }
+        if clamp is not None:
+            settings.update(
+                {
+                    "bound_xy_um": clamp.bound_xy_um,
+                    "bound_xy_source": clamp.source_xy,
+                    "bound_z_um": clamp.bound_z_um,
+                    "bound_z_source": clamp.source_z,
+                }
+            )
+        if coverage is not None:
+            settings.update(
+                {
+                    "seams_registered": coverage.n_registered_seams,
+                    "seams_expected": coverage.n_expected_seams,
+                    "tile_groups": len(coverage.components),
+                    "tiles_unconnected": coverage.n_isolated,
+                    "unconstrained_pairs": len(coverage.unconstrained),
+                    "tiles_bound_to_mosaic": len(coverage.bound_tiles),
+                }
+            )
+        return settings
 
     def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):
         """Revert corrections registration cannot plausibly have measured.
@@ -6691,6 +7023,11 @@ class StitchingPipeline:
         lateral correlation peak, so if one is garbage the peak is garbage. Z is
         independent, and is what the optional refinement pass measures on its
         own.
+
+        A clamped axis is reverted to the mosaic's **consensus** shift, not to
+        zero: zero means "this tile's stage position", which is the wrong answer
+        whenever the mosaic as a whole moved, and pulls the tile away from
+        neighbours that did move. See the comment at the revert itself.
 
         Returns a `ClampResult`: the (possibly clamped) params plus a per-tile
         record of what was seen and what was reverted, which the registration
@@ -6779,22 +7116,37 @@ class StitchingPipeline:
                 clamped.append(param)
                 continue
 
-            # Zero the offending components in place on a COPY, so the param
-            # keeps its exact type and coords (xr.DataArray for real MVS params,
-            # ndarray in tests) — a bare identity would drop the x_in/x_out
-            # coords that rebase_affine needs downstream.
+            # Revert to the mosaic's CONSENSUS, not to zero.
+            #
+            # Zero means "this tile's stage position", and that is only the
+            # right answer if the rest of the mosaic also stayed there. When the
+            # mosaic as a whole moved — which is exactly what the consensus
+            # measures — dropping one tile back to zero pulls it away from every
+            # neighbour and opens a seam by the size of the shared correction.
+            # That is the same mistake multiview-stitcher makes with an edgeless
+            # tile, and the one _bind_unconstrained_tiles exists to undo.
+            #
+            # What the clamp is entitled to reject is this tile's DISAGREEMENT
+            # with its neighbours, which is the part nothing measured. The
+            # shared part it keeps.
+            #
+            # Done on a COPY so the param keeps its exact type and coords
+            # (xr.DataArray for real MVS params, ndarray in tests) — a bare
+            # identity would drop the x_in/x_out coords rebase_affine needs.
             reverted = param.copy()
             buf = reverted.values if hasattr(reverted, "values") else reverted
             out = buf[0] if buf.ndim == 3 else buf
             if whole:
+                # A non-translational param cannot be split per axis, so there
+                # is no consensus to fall back to — only identity.
                 out[:3, :3] = _np.eye(3)
                 out[:3, 3] = 0.0
             else:
                 if clamp_z:
-                    out[0, 3] = 0.0
+                    out[0, 3] = ref_z
                 if clamp_xy:
-                    out[1, 3] = 0.0
-                    out[2, 3] = 0.0
+                    out[1, 3] = ref_y
+                    out[2, 3] = ref_x
             clamped.append(reverted)
 
         result = ClampResult(
@@ -6842,10 +7194,21 @@ class StitchingPipeline:
         if len(params) < _MIN_TILES_FOR_CONSENSUS:
             return (0.0, 0.0, 0.0)
 
+        return self._median_shift(params, range(len(params)))
+
+    def _median_shift(self, params, indices):
+        """Per-axis median translation over `indices`, as (dz, dy, dx) µm.
+
+        Median, not mean: the case this exists for is a handful of tiles flung
+        away by a garbage correlation peak, and they must not be able to move
+        the baseline they are judged against.
+        """
+        import numpy as _np
+
         shifts = []
-        for param in params:
+        for index in indices:
             try:
-                arr = _np.asarray(param)
+                arr = _np.asarray(params[index])
                 mat = arr[0] if arr.ndim == 3 else arr
                 shifts.append((float(mat[0, 3]), float(mat[1, 3]), float(mat[2, 3])))
             except Exception:

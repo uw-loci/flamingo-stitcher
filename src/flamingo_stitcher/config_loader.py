@@ -318,6 +318,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.max_registration_shift_z_um = float(reg["max_shift_z_um"])
     if reg.get("min_overlap_fraction") is not None:
         config_obj.min_registration_overlap_frac = float(reg["min_overlap_fraction"])
+    if reg.get("min_registered_seam_fraction") is not None:
+        config_obj.min_registered_seam_frac = float(reg["min_registered_seam_fraction"])
     if reg.get("upsample_factor") is not None:
         config_obj.registration_upsample_factor = int(reg["upsample_factor"])
     if reg.get("report") is not None:

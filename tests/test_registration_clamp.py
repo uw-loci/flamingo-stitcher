@@ -59,7 +59,10 @@ class TestLateralBound:
         params = _params([(0, 2, 3), (0, 5, 60), (0, 1, -4)])  # middle exceeds 20 µm
         out = pipe._clamp_registration_shifts(params, td, _VOXEL).params
         assert np.max(np.abs(_trans(out[0]))) == pytest.approx(3, abs=1e-6)  # kept
-        assert np.allclose(_trans(out[1]), 0.0)  # reverted to stage
+        # Reverted to the mosaic's consensus (per-axis median: y=2, x=3), not to
+        # zero. Zero is this tile's stage position, which is only where it
+        # belongs if the mosaic also stayed there.
+        assert _trans(out[1]) == pytest.approx([0.0, 2.0, 3.0], abs=1e-6)
         assert np.max(np.abs(_trans(out[2]))) == pytest.approx(4, abs=1e-6)  # kept
 
     def test_explicit_bound_overrides_auto(self):
@@ -265,9 +268,23 @@ class TestTheBoundIsRelativeToWhereTilesWerePlaced:
         shifts = [(0, 0, 60), (0, 0, 60), (0, 0, 400), (0, 0, 60), (0, 0, 60)]
         out = pipe._clamp_registration_shifts(_params(shifts), td, _VOXEL)
         assert out.records[2].clamped_xy is True
-        assert np.allclose(_trans(out.params[2]), 0.0)
+        # It lands on the consensus its neighbours share, NOT on zero. Reverting
+        # it to zero would put it 60 µm from every neighbour — opening exactly
+        # the seam that test_a_mosaic_wide_offset_is_not_clamped establishes a
+        # shared shift must not open.
+        assert _trans(out.params[2])[2] == pytest.approx(60, abs=1e-6)
         # ...and its well-behaved neighbours are untouched.
         assert _trans(out.params[0])[2] == pytest.approx(60, abs=1e-6)
+
+    def test_reverting_a_clamped_tile_does_not_tear_it_from_its_neighbours(self):
+        """The property the two assertions above are really about."""
+        pipe = StitchingPipeline(StitchingConfig())
+        td = _tile_data([0.0, 0.08, 0.16, 0.24, 0.32], [0.0] * 5)
+        shifts = [(0, 0, 60), (0, 0, 60), (0, 0, 400), (0, 0, 60), (0, 0, 60)]
+        out = pipe._clamp_registration_shifts(_params(shifts), td, _VOXEL)
+        placed = [_trans(p)[2] for p in out.params]
+        seams = [abs(placed[i] - placed[i + 1]) for i in range(len(placed) - 1)]
+        assert max(seams) == pytest.approx(0.0, abs=1e-6)
 
     def test_outliers_cannot_drag_the_baseline_they_are_judged_against(self):
         # Two bad tiles out of five: the median holds, so both are caught.

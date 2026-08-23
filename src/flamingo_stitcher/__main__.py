@@ -310,6 +310,19 @@ def build_parser() -> argparse.ArgumentParser:
         "overlap to derive a bound from.",
     )
     reg_group.add_argument(
+        "--min-registered-seams",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="Do not apply the registration unless at least this fraction of "
+        "expected seams actually registered (default 0.5). Below it, tiles are "
+        "placed by stage position: multiview-stitcher solves each connected "
+        "group of tiles independently, so a partly-registered mosaic slides "
+        "whole blocks past tiles that stayed put. Lower it for a sample that "
+        "only covers part of the grid; 0 disables the check. Usually better set "
+        "per microscope in the GUI's Options tab.",
+    )
+    reg_group.add_argument(
         "--min-reg-overlap",
         type=float,
         default=None,
@@ -747,6 +760,7 @@ def main():
         ("max_registration_shift_um", args.max_reg_shift),
         ("max_registration_shift_z_um", args.max_reg_shift_z),
         ("min_registration_overlap_frac", args.min_reg_overlap),
+        ("min_registered_seam_frac", args.min_registered_seams),
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),

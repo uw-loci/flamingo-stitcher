@@ -81,6 +81,21 @@ registration:
   # tiles are placed by stage position and the registration report says why.
   min_overlap_fraction: 0.05
 
+  # Fraction of the mosaic's expected seams that must actually register before
+  # the result is applied. Registration routinely succeeds on part of a mosaic
+  # and fails on the rest — a sample that covers only some of the grid does
+  # exactly that — and multiview-stitcher then solves each connected group of
+  # tiles INDEPENDENTLY, with nothing measuring where one group sits relative
+  # to another. Applying that slides whole blocks past tiles that stayed put.
+  #
+  # Above this fraction, tiles with no registered seam are moved with the
+  # mosaic (a shared shift opens no seam) instead of being left behind. Below
+  # it, the run is placed by stage position and the report says why.
+  #
+  # Raise it to demand more agreement; lower it for a sparse sample where only
+  # part of the grid can ever register. 0 disables the check entirely.
+  min_registered_seam_fraction: 0.5
+
   # Sub-pixel upsampling factor for phase correlation. multiview-stitcher
   # silently uses 10 for 2-D data and 2 for 3-D, so every 3-D registration
   # resolves shifts to about half a BINNED voxel — with binning z=2 that is one

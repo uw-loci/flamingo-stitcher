@@ -43,6 +43,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import io
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -52,7 +53,13 @@ import numpy as np
 from flamingo_stitcher import tile_geometry
 from flamingo_stitcher.border_qc import find_neighbor_pairs
 
+# `write_report` takes a logger so it can report into a run's log, but the
+# edge-rejection shim runs deep inside multiview-stitcher's call stack with no
+# such handle, and swallowing a failure there silently would hide a real one.
+logger = logging.getLogger(__name__)
+
 __all__ = [
+    "MosaicCoverage",
     "RegistrationReport",
     "SeamResult",
     "TileShift",
@@ -61,6 +68,7 @@ __all__ = [
     "TILE_CSV_HEADER",
     "STATUS_BELOW_QUALITY",
     "STATUS_DROPPED",
+    "STATUS_IMPLAUSIBLE_SHIFT",
     "STATUS_NOT_RUN",
     "STATUS_PRUNED",
     "STATUS_REGISTERED",
@@ -68,6 +76,7 @@ __all__ = [
     "capture_prefilter_graph",
     "extract_seams",
     "format_report_text",
+    "mosaic_coverage",
     "report_to_json",
     "seam_rows_csv",
     "skipped_report",
@@ -87,6 +96,7 @@ JSON_NAME = "registration_report.json"
 STATUS_REGISTERED = "registered"  # edge survived quality AND fed the global solve
 STATUS_PRUNED = "pruned"  # survived quality, dropped by edge pruning
 STATUS_BELOW_QUALITY = "below_quality"  # correlation below the threshold
+STATUS_IMPLAUSIBLE_SHIFT = "implausible_shift"  # passed quality, shift is not physical
 STATUS_DROPPED = "dropped"  # expected pair, no edge, reason unrecoverable
 STATUS_NOT_RUN = "not_run"  # registration skipped / gated off / failed
 
@@ -210,6 +220,11 @@ class ZRefineSummary:
 @dataclass
 class RegistrationReport:
     ran: bool = False
+    # Did registration's answer actually place the tiles? A run can measure
+    # perfectly well and still be refused — see `mosaic_coverage`. "ran and was
+    # applied", "ran and was refused" and "never ran" are three different
+    # findings and the report must not collapse them into two.
+    applied: bool = True
     reason: str = ""
     transform_key: str = ""
     tiles: List[TileShift] = field(default_factory=list)
@@ -302,8 +317,9 @@ def _graph_edges(graph) -> Dict[Tuple[int, int], Any]:
 
 
 @contextlib.contextmanager
-def capture_prefilter_graph(sink: dict):
-    """Capture the registration graph BEFORE the quality filter removes edges.
+def capture_prefilter_graph(sink: dict, reject=None):
+    """Capture the registration graph BEFORE the quality filter removes edges,
+    and optionally drop edges the caller judges physically impossible.
 
     ``register()`` applies ``post_registration_quality_threshold`` inside itself
     (``mv_graph.filter_edges``), so the graph it hands back contains only the
@@ -334,7 +350,32 @@ def capture_prefilter_graph(sink: dict):
             sink["prefilter"] = graph.copy()
         except Exception:
             pass
-        return original(graph, *args, **kwargs)
+        filtered = original(graph, *args, **kwargs)
+        if reject is None:
+            return filtered
+        # multiview-stitcher calls this immediately before groupwise_resolution
+        # (registration.py: "resolve global registration parameters from
+        # pairwise registrations"), so this is the last point at which an edge
+        # can be removed BEFORE it influences every tile in its component. That
+        # is the whole reason to reject here rather than clamp afterwards: the
+        # post-solve clamp can only revert whole tiles, and reverting one member
+        # of a solved component tears it away from the rest.
+        rejected = {}
+        try:
+            doomed = []
+            for a, b, data in list(filtered.edges(data=True)):
+                reason = reject(a, b, data)
+                if reason:
+                    rejected[_edge_key(a, b)] = reason
+                    doomed.append((a, b))
+            if doomed:
+                filtered = filtered.copy()
+                filtered.remove_edges_from(doomed)
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.debug("Pairwise shift rejection failed: %s", exc)
+            return filtered
+        sink["rejected"] = rejected
+        return filtered
 
     mv_graph.filter_edges = _shim
     try:
@@ -383,8 +424,16 @@ def build_tile_shifts(
     params: Sequence,
     voxel_size_um: Mapping[str, float],
     clamp_records: Optional[Sequence] = None,
+    applied: bool = True,
 ) -> List[TileShift]:
-    """Per-tile rows from the final params, index-aligned with `tiles`."""
+    """Per-tile rows from the final params, index-aligned with `tiles`.
+
+    With ``applied=False`` the params were computed and then refused, so the
+    tile sits at its stage position: the row reports a shift of zero and carries
+    the rejected proposal in ``shift_before_clamp_um``. Reporting the proposal
+    as though it had been applied would describe an output that was never
+    written.
+    """
     vz, vy, vx = (_voxel(voxel_size_um, a) for a in ("z", "y", "x"))
     by_index = {int(r.index): r for r in (clamp_records or []) if hasattr(r, "index")}
 
@@ -402,6 +451,9 @@ def build_tile_shifts(
         )
         if translation is None:
             row.note = "no registration param for this tile"
+        elif not applied:
+            row.shift_before_clamp_um = translation
+            row.note = "proposed but not applied; tile kept its stage position"
         else:
             row.dz_um, row.dy_um, row.dx_um = translation
             row.dz_frames = _in_voxels(row.dz_um, vz) or 0.0
@@ -434,6 +486,7 @@ def extract_seams(
     voxel_size_um: Mapping[str, float],
     reg_dict: Optional[Mapping[str, Any]] = None,
     prefilter_graph: Any = None,
+    rejected_edges: Optional[Mapping[Tuple[int, int], str]] = None,
     quality_threshold: Optional[float] = None,
     frame_extent_um: Optional[Mapping[str, float]] = None,
     ran: bool = True,
@@ -453,6 +506,7 @@ def extract_seams(
 
     surviving: Dict[Tuple[int, int], Any] = {}
     prefilter: Dict[Tuple[int, int], Any] = {}
+    rejected: Dict[Tuple[int, int], str] = {}
     used: set = set()
     # An EMPTY used_edges means the global solve used nothing — every edge was
     # pruned, which is a real and alarming finding. An ABSENT one means this MVS
@@ -483,6 +537,8 @@ def extract_seams(
                         except Exception:
                             continue
     prefilter = _graph_edges(prefilter_graph)
+    if ran and rejected_edges:
+        rejected = {_edge_key(a, b): str(r) for (a, b), r in rejected_edges.items()}
 
     rows: List[SeamResult] = []
     for index_a, index_b, axis in expected:
@@ -528,6 +584,17 @@ def extract_seams(
                 row.dy_px = _in_voxels(row.dy_um, vy)
                 row.dx_px = _in_voxels(row.dx_um, vx)
             row.residual_px = residuals.get(key)
+        elif key in rejected:
+            # It passed the quality filter; we threw it out because the shift it
+            # proposed is not one the geometry allows. Distinct from
+            # below_quality, and the distinction matters: a confident wrong peak
+            # scores WELL, so lowering the quality threshold makes this worse.
+            row.status = STATUS_IMPLAUSIBLE_SHIFT
+            data = prefilter.get(key)
+            row.quality = _as_float(
+                data.get("quality") if isinstance(data, Mapping) else None
+            )
+            row.note = rejected[key]
         elif key in prefilter:
             row.status = STATUS_BELOW_QUALITY
             data = prefilter[key]
@@ -548,6 +615,171 @@ def extract_seams(
     return rows
 
 
+@dataclass
+class MosaicCoverage:
+    """Which tiles the registered seams actually connect, and how.
+
+    multiview-stitcher resolves **each connected component of the registration
+    graph independently** (``param_resolution/__init__.py``: it loops over
+    ``nx.connected_components`` and calls the resolver per component), and gives
+    a component with no edges the identity transform. Nothing anywhere
+    constrains one component relative to another.
+
+    That is fine when the graph spans the mosaic and catastrophic when it does
+    not: every component is internally consistent and free-floating with respect
+    to its neighbours, so applying the result slides whole blocks of tiles past
+    tiles that stayed at their stage position. The seams *inside* a block
+    improve; every seam *between* blocks tears by the full size of the block's
+    correction. The output is worse than not registering at all, and the summary
+    line still reads like a successful run.
+
+    So this is checked before the params are used, not reported afterwards.
+    """
+
+    n_tiles: int = 0
+    n_expected_seams: int = 0
+    n_registered_seams: int = 0
+    # Every component, largest first, isolated tiles included as singletons.
+    components: List[List[int]] = field(default_factory=list)
+    # Component id per tile index, for asking which side of a seam is which.
+    component_of: List[int] = field(default_factory=list)
+    # Expected seams whose two tiles ended up in different components. These
+    # are the seams that tear: nothing measured their relative placement, so
+    # whatever the independent solves produced for them is arbitrary.
+    unconstrained: List[Tuple[int, int]] = field(default_factory=list)
+    # Tiles that had no registered seam and were moved with the mosaic rather
+    # than left at their stage position. Their placement is NOT measured.
+    bound_tiles: List[int] = field(default_factory=list)
+
+    @property
+    def spans_mosaic(self) -> bool:
+        """Do the registered seams tie every tile into one rigid body?"""
+        return (
+            self.n_tiles > 0
+            and len(self.components) == 1
+            and len(self.components[0]) == self.n_tiles
+        )
+
+    @property
+    def is_safe_to_apply(self) -> bool:
+        """Is every adjacent pair's relative placement actually constrained?
+
+        Deliberately weaker than :attr:`spans_mosaic`. A mosaic can register as
+        two components and still be safe, provided no *expected seam* crosses
+        between them — two islands of sample with a gap of empty tiles between
+        them never have to line up with each other, so sliding one relative to
+        the other tears nothing. What is never safe is an adjacent pair whose
+        two halves moved independently.
+        """
+        return self.n_tiles > 0 and not self.unconstrained
+
+    @property
+    def n_isolated(self) -> int:
+        """Tiles no registered seam touches. These keep their stage position."""
+        return sum(1 for c in self.components if len(c) == 1)
+
+    @property
+    def largest_component(self) -> int:
+        return len(self.components[0]) if self.components else 0
+
+    @property
+    def is_tree(self) -> bool:
+        """A spanning graph with no redundancy: one bad seam moves everything.
+
+        Not a failure — many honest mosaics register as a tree — but there is no
+        second path to disagree with any edge, so nothing can detect a bad one.
+        """
+        return self.spans_mosaic and self.n_registered_seams == self.n_tiles - 1
+
+    def describe(self) -> str:
+        """One line naming what is connected to what."""
+        if self.n_tiles == 0:
+            return "no tiles"
+        if self.spans_mosaic:
+            shape = " (a spanning tree: no redundant seam)" if self.is_tree else ""
+            return (
+                f"{self.n_registered_seams} of {self.n_expected_seams} seams "
+                f"registered, tying all {self.n_tiles} tiles into one "
+                f"group{shape}"
+            )
+        groups = [len(c) for c in self.components if len(c) > 1]
+        shape = []
+        if groups:
+            shape.append(
+                " + ".join(str(g) for g in groups)
+                + f" tiles in {len(groups)} disconnected group"
+                + ("s" if len(groups) > 1 else "")
+            )
+        if self.n_isolated:
+            shape.append(f"{self.n_isolated} tiles connected to nothing")
+        parts = [
+            f"{self.n_registered_seams} of {self.n_expected_seams} seams "
+            f"registered, leaving " + " and ".join(shape or ["nothing connected"])
+        ]
+        if self.unconstrained:
+            parts.append(
+                f"{len(self.unconstrained)} adjacent pairs have no measured "
+                f"relationship between their two halves"
+            )
+        return "; ".join(parts)
+
+
+def mosaic_coverage(n_tiles: int, seams: Sequence[SeamResult]) -> MosaicCoverage:
+    """Group tiles by the seams that were actually registered.
+
+    Derived from the seam rows rather than from the graph, so what the guard
+    decides and what the report shows the user can never disagree.
+
+    Union-find rather than networkx: this module stays importable without
+    multiview-stitcher, which is what makes it testable with plain objects.
+    """
+    n = max(0, int(n_tiles))
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    n_registered = 0
+    for seam in seams or []:
+        if getattr(seam, "status", None) != STATUS_REGISTERED:
+            continue
+        a, b = int(seam.index_a), int(seam.index_b)
+        if not (0 <= a < n and 0 <= b < n):
+            continue
+        n_registered += 1
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    groups: Dict[int, List[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    components = sorted(groups.values(), key=lambda c: (-len(c), c[0]))
+
+    component_of = [0] * n
+    for cid, members in enumerate(components):
+        for i in members:
+            component_of[i] = cid
+
+    unconstrained = []
+    for seam in seams or []:
+        a, b = int(seam.index_a), int(seam.index_b)
+        if 0 <= a < n and 0 <= b < n and component_of[a] != component_of[b]:
+            unconstrained.append((a, b))
+
+    return MosaicCoverage(
+        n_tiles=n,
+        n_expected_seams=len(seams or []),
+        n_registered_seams=n_registered,
+        components=components,
+        component_of=component_of,
+        unconstrained=unconstrained,
+    )
+
+
 def build_report(
     *,
     tiles: Sequence,
@@ -557,15 +789,26 @@ def build_report(
     clamp_records: Optional[Sequence] = None,
     reg_dict: Optional[Mapping[str, Any]] = None,
     prefilter_graph: Any = None,
+    rejected_edges: Optional[Mapping[Tuple[int, int], str]] = None,
     quality_threshold: Optional[float] = None,
     frame_extent_um: Optional[Mapping[str, float]] = None,
     settings: Optional[Dict[str, Any]] = None,
     z_refine: Optional[ZRefineSummary] = None,
     elapsed_s: float = 0.0,
+    applied: bool = True,
+    reason: str = "",
+    seams: Optional[Sequence[SeamResult]] = None,
 ) -> RegistrationReport:
-    """Assemble the full report. Never raises on malformed registration output."""
+    """Assemble the full report. Never raises on malformed registration output.
+
+    ``seams`` lets a caller that already extracted them (to decide whether to
+    apply the result at all) hand them straight in, so the guard and the report
+    are guaranteed to be looking at the same rows.
+    """
     report = RegistrationReport(
         ran=True,
+        applied=bool(applied),
+        reason=reason,
         transform_key=transform_key,
         settings=dict(settings or {}),
         z_refine=z_refine,
@@ -577,20 +820,25 @@ def build_report(
             params=params,
             voxel_size_um=voxel_size_um,
             clamp_records=clamp_records,
+            applied=applied,
         )
     except Exception as exc:  # pragma: no cover - defensive
         report.warnings.append(f"could not read per-tile shifts: {exc}")
-    try:
-        report.seams = extract_seams(
-            tiles=tiles,
-            voxel_size_um=voxel_size_um,
-            reg_dict=reg_dict,
-            prefilter_graph=prefilter_graph,
-            quality_threshold=quality_threshold,
-            frame_extent_um=frame_extent_um,
-        )
-    except Exception as exc:  # pragma: no cover - defensive
-        report.warnings.append(f"could not read seam results: {exc}")
+    if seams is not None:
+        report.seams = list(seams)
+    else:
+        try:
+            report.seams = extract_seams(
+                tiles=tiles,
+                voxel_size_um=voxel_size_um,
+                reg_dict=reg_dict,
+                prefilter_graph=prefilter_graph,
+                rejected_edges=rejected_edges,
+                quality_threshold=quality_threshold,
+                frame_extent_um=frame_extent_um,
+            )
+        except Exception as exc:  # pragma: no cover - defensive
+            report.warnings.append(f"could not read seam results: {exc}")
     if prefilter_graph is None and report.count(STATUS_DROPPED):
         report.warnings.append(
             "rejected seams have no quality score: the pre-filter graph could "
@@ -732,6 +980,16 @@ def _median(values: Sequence[float]) -> float:
     return float(ordered[len(ordered) // 2])
 
 
+def _wrapped(text: str, indent: str = "   ", width: int = 71) -> List[str]:
+    """`text` as report lines. A one-paragraph reason is unreadable at 71
+    columns, and the reason is the part someone has to act on."""
+    import textwrap
+
+    return textwrap.wrap(
+        text, width=width, initial_indent=indent, subsequent_indent=indent
+    ) or [indent.rstrip()]
+
+
 def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> str:
     rule = "=" * 71
     lines = [rule]
@@ -742,7 +1000,7 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
     if not report.ran:
         lines.append("")
         lines.append(" Registration DID NOT RUN for this stitch.")
-        lines.append(f"   Reason: {report.reason or 'not recorded'}")
+        lines.extend(_wrapped(f"Reason: {report.reason or 'not recorded'}"))
         lines.append(
             f"   {report.n_tiles} tiles were placed by stage position alone, and"
         )
@@ -752,6 +1010,21 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
         lines.append(rule)
         return "\n".join(lines)
 
+    if not report.applied:
+        lines.append("")
+        lines.append(" Registration RAN but its result was NOT APPLIED.")
+        lines.extend(_wrapped(f"Reason: {report.reason or 'not recorded'}"))
+        lines.append(
+            f"   {report.n_tiles} tiles were placed by stage position instead."
+        )
+        lines.append(
+            "   The seam table below is still a real measurement and is the"
+        )
+        lines.append(
+            "   evidence for why: read it before changing any setting."
+        )
+        lines.append("-" * 71)
+
     lines.append(
         f" Transform: {report.transform_key or 'n/a'}   "
         f"Tiles: {report.n_tiles}   Expected seams: {report.n_expected_pairs}"
@@ -760,6 +1033,7 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
         f" Seams: {report.count(STATUS_REGISTERED)} registered · "
         f"{report.count(STATUS_PRUNED)} pruned · "
         f"{report.count(STATUS_BELOW_QUALITY)} below quality · "
+        f"{report.count(STATUS_IMPLAUSIBLE_SHIFT)} implausible shift · "
         f"{report.count(STATUS_DROPPED)} no edge"
     )
     s = report.settings
@@ -769,11 +1043,17 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
             f"{s.get('voxel_y_um', 0):.3f} µm XY · {s.get('voxel_z_um', 0):.3f} µm Z"
             f"   Quality threshold: {s.get('quality_threshold', 0):g}"
         )
-        lines.append(
-            f" Clamp bounds: XY {s.get('bound_xy_um', 0):.1f} µm "
-            f"({s.get('bound_xy_source', '?')}) · "
-            f"Z {s.get('bound_z_um', 0):.1f} µm ({s.get('bound_z_source', '?')})"
-        )
+        if s.get("bound_xy_um") is not None:
+            lines.append(
+                f" Clamp bounds: XY {s.get('bound_xy_um', 0):.1f} µm "
+                f"({s.get('bound_xy_source', '?')}) · "
+                f"Z {s.get('bound_z_um', 0):.1f} µm ({s.get('bound_z_source', '?')})"
+            )
+        if s.get("seams_registered") is not None:
+            lines.append(
+                f" Tile groups: {s.get('tile_groups', '?')} "
+                f"({s.get('tiles_unconnected', 0)} tiles connected to nothing)"
+            )
     lines.append(f" Elapsed: {report.elapsed_s:.1f} s")
     lines.append("-" * 71)
 
@@ -795,7 +1075,24 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
             "    proposed value is in the *_before_clamp columns of the CSV."
         )
 
-    clean = [t for t in report.tiles if not t.any_clamped]
+    n_bound = int(s.get("tiles_bound_to_mosaic", 0) or 0) if s else 0
+    if n_bound:
+        lines.append(
+            f" ** {n_bound} of {report.n_tiles} tiles had NO registered seam."
+        )
+        lines.append(
+            "    They were moved with the mosaic — a shift every tile shares"
+        )
+        lines.append(
+            "    opens no seam — rather than left at their stage position while"
+        )
+        lines.append(
+            "    their neighbours moved. Their own placement is NOT measured."
+        )
+
+    # On a refused run every applied shift is zero by construction, so these
+    # statistics would say "median 0.0 µm" and read as a perfect registration.
+    clean = [t for t in report.tiles if not t.any_clamped] if report.applied else []
     if clean:
         lines.append(
             f" Net shift ({len(clean)} unclamped tiles):"
@@ -933,6 +1230,7 @@ def report_to_json(
         "version": REPORT_VERSION,
         "acquisition": acquisition,
         "ran": report.ran,
+        "applied": report.applied,
         "reason": report.reason,
         "transform_key": report.transform_key,
         "elapsed_s": round(report.elapsed_s, 3),
@@ -945,6 +1243,7 @@ def report_to_json(
                 STATUS_REGISTERED,
                 STATUS_PRUNED,
                 STATUS_BELOW_QUALITY,
+                STATUS_IMPLAUSIBLE_SHIFT,
                 STATUS_DROPPED,
                 STATUS_NOT_RUN,
             )
