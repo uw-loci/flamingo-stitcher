@@ -310,6 +310,22 @@ def build_parser() -> argparse.ArgumentParser:
         "overlap to derive a bound from.",
     )
     reg_group.add_argument(
+        "--z-content-crop",
+        dest="z_content_crop",
+        action="store_true",
+        default=None,
+        help="Register on the Z planes that contain something rather than the "
+        "whole stack (default on). Does not change the measured shift; it stops "
+        "empty planes diluting the seam quality score until good seams are "
+        "rejected, and reads far fewer planes.",
+    )
+    reg_group.add_argument(
+        "--no-z-content-crop",
+        dest="z_content_crop",
+        action="store_false",
+        help="Register on the whole Z stack.",
+    )
+    reg_group.add_argument(
         "--min-tile-structure",
         type=float,
         default=None,
@@ -772,6 +788,7 @@ def main():
         ("min_registration_overlap_frac", args.min_reg_overlap),
         ("min_registered_seam_frac", args.min_registered_seams),
         ("min_tile_structure", args.min_tile_structure),
+        ("registration_z_content_crop", args.z_content_crop),
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),

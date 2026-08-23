@@ -112,6 +112,21 @@ registration:
   # 1, below which there is nothing to register on anyway.
   min_tile_structure: 0.15
 
+  # Register on the Z planes that contain something, instead of the whole stack.
+  #
+  # This does NOT make the measured shift better. Measured on a two-tile phantom
+  # with independent per-tile noise, content occupying 25% / 10% / 5% of the
+  # stack: the recovered shift was exactly right in all three cases. What falls
+  # is the seam QUALITY score (0.72 / 0.52 / 0.43), because empty plane against
+  # empty plane is uncorrelated noise and the metric is a rank correlation over
+  # the whole overlap. At 5% content that lands on a 0.4 threshold and the seam
+  # is thrown away for a reason unrelated to its alignment. Cropping restores it
+  # (0.99 / 0.91 / 0.76) and reads a fraction of the planes.
+  #
+  # The band is found per tile from the stack's OWN empty planes rather than a
+  # constant, and no crop is applied when the stack has no distinct band.
+  z_content_crop: true
+
   # Sub-pixel upsampling factor for phase correlation. multiview-stitcher
   # silently uses 10 for 2-D data and 2 for 3-D, so every 3-D registration
   # resolves shifts to about half a BINNED voxel — with binning z=2 that is one
