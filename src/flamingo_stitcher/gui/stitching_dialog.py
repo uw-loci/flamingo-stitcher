@@ -358,6 +358,11 @@ class StitchingDialog(PersistentDialog):
         self._overwrite_policy = None
         self._batch_channels = None
         self._batch_results = []  # List of (path, success, error_msg)
+        # The store the last successful item ACTUALLY wrote, as reported by the
+        # worker. Not reconstructible from the acquisition name: the user may
+        # have answered "New folder" to a duplicate, so the run wrote somewhere
+        # the default naming does not point at.
+        self._last_success_output = None
         # Last classified pipeline step; drives step-aware OOM advice on failure.
         self._current_step_key = None
 
@@ -3581,6 +3586,7 @@ class StitchingDialog(PersistentDialog):
         self._batch_config = config
         self._batch_channels = self._parse_channels()
         self._batch_results = []
+        self._last_success_output = None
         # Fresh existing-output decision each batch (ask again per Run).
         self._overwrite_policy = None
 
@@ -4390,6 +4396,9 @@ class StitchingDialog(PersistentDialog):
             item["output_path"] = output_path
             self._batch_results.append((item["path"], True, None))
             self._update_queue_table()
+        # Outside the queue-index guard: this is what the run wrote, and the
+        # summary needs it whether or not the item is still addressable.
+        self._last_success_output = output_path
         self._log(f"\n\u2713 Completed: {Path(output_path).parent.name}")
 
         from flamingo_stitcher.gui._compat import get_notification_service
@@ -4566,6 +4575,30 @@ class StitchingDialog(PersistentDialog):
         if self._batch_running:
             self._advance_queue()
 
+    def _last_output_folder(self):
+        """Folder the last successful item wrote to, or None if none succeeded.
+
+        Both summary buttons key off this, and it is the path the worker
+        REPORTED -- never rebuilt from the acquisition name.
+
+        Rebuilding gave ``<output dir>/<acq>_stitched``, which is only the
+        DEFAULT location. When the user answers "New folder" to a duplicate, the
+        run writes to a uniquified folder beside it, and the default name still
+        names the older stitch that caused the prompt. "Open Output Folder" then
+        opened the previous result, and an existence check cannot catch that --
+        the default folder is there, it is just the wrong one. "Load Latest into
+        Sample View" was worse: it loaded the older stitch as if it were the run
+        that had just finished, and nothing on screen said so.
+
+        Lives in its own method so a test can exercise the choice. Inline in the
+        summary it sat behind a modal, and a test could only re-implement it --
+        which agrees with whatever the shipped code does.
+        """
+        if not self._last_success_output:
+            return None
+        # The worker reports the STORE; its parent is the run's own folder.
+        return str(Path(self._last_success_output).parent)
+
     def _on_batch_complete(self):
         """Handle completion of all queue items."""
         from flamingo_stitcher.gui._compat import get_notification_service
@@ -4648,15 +4681,7 @@ class StitchingDialog(PersistentDialog):
             msg.setIcon(QMessageBox.Information)
             msg.setText(f"All {total} acquisition(s) stitched successfully!")
 
-        # Find last successful output for "Load" option
-        last_success_path = None
-        for path, ok, _ in reversed(self._batch_results):
-            if ok:
-                acq_name = path.name
-                last_success_path = str(
-                    Path(self._output_dir_edit.text()) / f"{acq_name}_stitched"
-                )
-                break
+        last_success_path = self._last_output_folder()
 
         if last_success_path:
             # "Load … into Sample View" only makes sense when there's a viewer
