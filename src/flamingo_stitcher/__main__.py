@@ -382,6 +382,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Sub-plane upsampling for the Z-refine pass (default 10)",
     )
+    reg_group.add_argument(
+        "--no-z-snap",
+        dest="z_snap_to_plane",
+        action="store_false",
+        default=None,
+        help="Keep sub-plane Z shifts instead of snapping each tile to a whole "
+        "plane. Fusion interpolates linearly, so a tile placed between two "
+        "acquired planes is rebuilt from both across the whole XY field (a "
+        "half-plane shift keeps 51%% of a single plane's peak). Snapping is on "
+        "by default and costs at most half a plane of placement accuracy.",
+    )
+    reg_group.add_argument(
+        "--z-snap", dest="z_snap_to_plane", action="store_true", help=argparse.SUPPRESS
+    )
 
     # Multi-view (rotation)
     mv_group = parser.add_argument_group("Multi-view (rotation)")
@@ -792,6 +806,7 @@ def main():
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),
+        ("registration_z_snap_to_plane", args.z_snap_to_plane),
         ("registration_report_enabled", args.registration_report),
         ("registration_report_json", args.registration_report_json),
     ):

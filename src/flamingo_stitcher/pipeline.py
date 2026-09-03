@@ -71,6 +71,7 @@ SHAREABLE_CONFIG_FIELDS = (
     "registration_z_refine_range_um",
     "registration_z_refine_binning",
     "registration_z_refine_upsample",
+    "registration_z_snap_to_plane",
     "registration_report_enabled",
     "registration_report_json",
     "streaming_mode",
@@ -968,6 +969,26 @@ class StitchingConfig:
         default_factory=lambda: {"z": 1, "y": 4, "x": 4}
     )
     registration_z_refine_upsample: int = 10  # sub-plane; skimage's 2-D default
+
+    # Force every tile's Z placement onto the output plane grid, so a tile is
+    # never resampled BETWEEN two acquired planes.
+    #
+    # A Z step is 10 µm where a pixel is ~1 µm: a plane is the unit the data
+    # comes in, not a sample of a smooth axial signal. multiview-stitcher fuses
+    # with `interpolation_order=1`, so a sub-plane Z shift linear-interpolates
+    # each output plane from two acquired ones. Measured on a single-bright-plane
+    # phantom at a 10 µm step: a 0.96 µm shift leaves 91% of the peak and bleeds
+    # 12% into the neighbouring plane, 2.72 µm leaves 73%, and half a plane
+    # leaves 51% — one plane of data smeared across two, over the whole XY
+    # field, which is the plane people then analyse. A whole-plane shift is
+    # exact (100%, one plane), so snapping costs at most half a plane of
+    # PLACEMENT accuracy and buys back unresampled data.
+    #
+    # ON by default, and the Z refinement pass (upsample=10) makes sub-plane
+    # shifts on purpose, so it is the main thing this protects against. Turn it
+    # off only when axial placement accuracy finer than one plane matters more
+    # than keeping planes intact.
+    registration_z_snap_to_plane: bool = True
 
     # Write registration_report.csv / registration_seams.csv /
     # registration_report.txt into the output directory. ON by default, unlike
@@ -6545,6 +6566,10 @@ class StitchingPipeline:
                 index_map,
             )
 
+            # Snap BEFORE the report so the report describes the shifts that
+            # were actually applied, not the pre-snap measurement.
+            params = self._apply_z_snap(params, tile_data, voxel_size_um)
+
             self._registration_report = registration_report.build_report(
                 tiles=tiles,
                 params=params,
@@ -6560,6 +6585,7 @@ class StitchingPipeline:
                 z_refine=z_summary,
                 elapsed_s=time.time() - started,
             )
+            self._log_z_coverage(params, tile_data, voxel_size_um)
             self.logger.info("  Registration complete")
             return params, "registered"
 
@@ -7240,6 +7266,173 @@ class StitchingPipeline:
             if scored:
                 settings["tile_structure_range"] = [min(scored), max(scored)]
         return settings
+
+    def _snap_z_shifts_to_planes(self, params, tile_data, voxel_size_um):
+        """Put every tile's Z placement on the output plane grid.
+
+        multiview-stitcher fuses with ``interpolation_order=1``. A tile whose Z
+        origin does not land on the output grid is therefore linear-interpolated
+        between two acquired planes, and since the whole tile shifts together
+        that mixes two planes across the entire XY field. At a 10 µm Z step and
+        ~1 µm pixels a plane is the unit the data arrives in, so this is data
+        corruption, not resampling: a single-bright-plane phantom keeps 91% of
+        its peak at a 0.96 µm shift, 73% at 2.72 µm and 51% at half a plane,
+        while a whole-plane shift is exact.
+
+        Snapping the TOTAL Z origin (metadata + registration), not just the
+        registration delta: landing on the grid is what avoids interpolation,
+        and per-tile Z stacks can start off-grid on their own. The reference is
+        the lowest tile, which therefore never moves. Costs at most half a plane
+        of placement accuracy per tile.
+
+        Scope: this is exact for an ordinary XY mosaic, where the metadata
+        transform is a pure translation and the tile's own plane axis IS world
+        Z. For a ROTATED multi-view acquisition the tile's planes are not
+        parallel to world Z, so no Z translation can keep them on their own
+        grid — the rotation resamples every axis regardless. Snapping is
+        harmless there but does not make the same guarantee.
+
+        Returns ``(params, n_moved, max_correction_um)``; params are returned
+        untouched if anything here cannot be computed.
+        """
+        if not params or not tile_data:
+            return params, 0, 0.0
+        try:
+            vz = float(voxel_size_um.get("z", 0.0))
+            if vz <= 0:
+                return params, 0, 0.0
+            z_abs = []
+            for index, (_volume, tile_info) in enumerate(tile_data):
+                z_abs.append(
+                    float(tile_info.z_min_mm) * 1000.0
+                    + self._param_dz(params[index])
+                )
+        except Exception:
+            return params, 0, 0.0
+
+        z_ref = min(z_abs)
+        snapped, n_moved, worst = [], 0, 0.0
+        for index, param in enumerate(params):
+            z0 = z_abs[index] - self._param_dz(param)
+            planes = round((z_abs[index] - z_ref) / vz)
+            # Solve for the new dz directly rather than accumulating a
+            # correction onto the old one: (z_ref - z0) + planes*vz lands the
+            # tile on the grid exactly, where `dz + correction` leaves ~1e-12 um
+            # of float residue from cancelling two ~1.7e4 um absolute
+            # positions. The residue is physically nothing, but it means "on a
+            # whole plane" stops being checkable — and the whole point here is
+            # that it is.
+            new_dz = (z_ref - z0) + planes * vz
+            correction = new_dz - self._param_dz(param)
+            if abs(correction) < 1e-6:  # < 1 pm: already on the plane
+                snapped.append(param)
+                continue
+            # Same idiom as _merge_z_refinement: copy, then write through
+            # .values. Real params are xarray affines with a `t` dim, and this
+            # keeps the type, dims and coords without reconstructing them.
+            updated = param.copy()
+            buf = updated.values if hasattr(updated, "values") else updated
+            (buf[0] if buf.ndim == 3 else buf)[0, 3] = new_dz
+            snapped.append(updated)
+            n_moved += 1
+            worst = max(worst, abs(correction))
+        return snapped, n_moved, worst
+
+    @staticmethod
+    def _param_dz(param) -> float:
+        """The Z translation (µm) out of an affine, xarray-wrapped or bare."""
+        import numpy as _np
+
+        arr = _np.asarray(param)
+        return float((arr[0] if arr.ndim == 3 else arr)[0, 3])
+
+    def _apply_z_snap(self, params, tile_data, voxel_size_um):
+        """Snap (when enabled) and say what it cost, in the log."""
+        if not getattr(self.config, "registration_z_snap_to_plane", True):
+            self.logger.info(
+                "  Z snap OFF: tiles keep their sub-plane Z shifts, so tiles "
+                "shifted by a fraction of a plane are interpolated between two "
+                "acquired planes over the whole XY field."
+            )
+            return params
+        snapped, n_moved, worst = self._snap_z_shifts_to_planes(
+            params, tile_data, voxel_size_um
+        )
+        vz = float(voxel_size_um.get("z", 0.0) or 0.0)
+        if not n_moved:
+            self.logger.info(
+                "  Z snap: every tile already sits on a whole plane — no tile "
+                "is interpolated between planes."
+            )
+            return snapped
+        self.logger.info(
+            f"  Z snap: moved {n_moved}/{len(params)} tiles by up to "
+            f"{worst:.2f} µm (< half a {vz:.1f} µm plane) onto whole planes, so "
+            f"no tile is interpolated between two acquired planes. A sub-plane "
+            f"Z shift smears one plane across two across the whole XY field; "
+            f"snapping trades up to half a plane of placement accuracy for "
+            f"unresampled data. Turn off 'Snap Z shifts to whole planes' to "
+            f"keep the measured sub-plane shifts instead."
+        )
+        return snapped
+
+    def _log_z_coverage(self, params, tile_data, voxel_size_um) -> None:
+        """Report how much of the fused Z range every tile actually covers.
+
+        The fused stack is the **union** bounding box of the registered tiles
+        (multiview-stitcher ``mode="union"``). Registration shifts each tile in
+        Z, so the union is taller than any single tile: at the top and bottom of
+        the output only the tiles that were shifted that way have data, and the
+        rest fuse to background — ``fuse`` transforms with ``cval=np.nan`` and
+        finishes with ``np.nan_to_num``, so an uncovered voxel is a hard 0.
+
+        That is correct geometry, not a fusion fault (max fusion is a plain
+        ``np.nanmax`` and cannot return less than the dimmest covering tile),
+        but a black rectangle in the top plane reads exactly like a broken
+        stitch. Say up front which planes are fully covered so the ragged edge
+        is recognisable as an edge.
+        """
+        import numpy as _np
+
+        try:
+            vz = float(voxel_size_um.get("z", 1.0))
+            if vz <= 0 or not tile_data:
+                return
+            starts, ends = [], []
+            for index, (volume, tile_info) in enumerate(tile_data):
+                nz = int(_np.asarray(volume.shape)[-3])
+                z0 = float(tile_info.z_min_mm) * 1000.0
+                if params and index < len(params):
+                    arr = _np.asarray(params[index])
+                    mat = arr[0] if arr.ndim == 3 else arr
+                    z0 += float(mat[0, 3])
+                starts.append(z0)
+                ends.append(z0 + (nz - 1) * vz)
+        except Exception:
+            # A diagnostic must never be the reason a run dies.
+            return
+        if not starts:
+            return
+
+        union_planes = int(round((max(ends) - min(starts)) / vz)) + 1
+        lead = int(round((max(starts) - min(starts)) / vz))
+        trail = int(round((max(ends) - min(ends)) / vz))
+        covered = union_planes - lead - trail
+        if lead <= 0 and trail <= 0:
+            self.logger.info(
+                f"  Z coverage: all {union_planes} fused planes are covered by "
+                f"every tile"
+            )
+            return
+        self.logger.info(
+            f"  Z coverage: the fused stack is {union_planes} planes (the union "
+            f"of the registered tiles), but only planes {lead}-{lead + covered - 1} "
+            f"({covered}) are covered by every tile. The first {lead} and last "
+            f"{trail} are covered by only the tiles registration shifted that "
+            f"way; the rest of each of those planes is background (0), which "
+            f"looks like missing tiles. This is the edge of the volume, not a "
+            f"fusion artifact."
+        )
 
     def _clamp_registration_shifts(self, params, tile_data, voxel_size_um):
         """Revert corrections registration cannot plausibly have measured.
@@ -8191,6 +8384,8 @@ class StitchingPipeline:
                     list(params), tile_data, voxel_size_um
                 ).params
 
+                params = self._apply_z_snap(params, tile_data, voxel_size_um)
+
                 # Apply transforms
                 for msim, param in zip(msims, params):
                     msi_utils.set_affine_transform(
@@ -8201,6 +8396,7 @@ class StitchingPipeline:
                     )
 
                 fuse_transform_key = "registered"
+                self._log_z_coverage(params, tile_data, voxel_size_um)
                 self.logger.info("  Registration complete")
 
             except Exception as e:

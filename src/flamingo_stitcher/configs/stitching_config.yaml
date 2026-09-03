@@ -135,6 +135,23 @@ registration:
   # larger correlation matrix per tile pair and nothing else.
   upsample_factor: 0
 
+  # Never place a tile BETWEEN two acquired Z planes.
+  #
+  # Fusion interpolates linearly, so a tile whose Z origin misses the output
+  # plane grid is rebuilt from two acquired planes — across the whole XY field,
+  # since the tile shifts as a unit. A Z step is ~10 µm where a pixel is ~1 µm,
+  # so a plane is the unit the data arrives in, not a sample of a smooth axial
+  # signal. Measured on a single bright plane at a 10 µm step: 0.96 µm of shift
+  # keeps 91% of the peak, 2.72 µm keeps 73%, half a plane keeps 51%; a whole
+  # plane is exact.
+  #
+  # true snaps each tile's TOTAL Z origin (metadata + registration) to the grid:
+  # at most half a plane of placement accuracy, and no resampling. The z_refine
+  # pass below makes sub-plane shifts on purpose, so this is what keeps it
+  # honest. Set false only when axial placement finer than one plane matters
+  # more than keeping planes intact.
+  z_snap_to_plane: true
+
   # Dedicated second registration pass whose only job is Z.
   z_refine:
     # Off by default: it is a second full pairwise pass, roughly 2-3x the

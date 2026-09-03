@@ -108,7 +108,11 @@ class StitchingWorker(QThread):
                 f"Acquisition dir: {self._acq_dir}\n"
                 f"Output dir: {self._output_dir}\n"
                 f"Downsample: XY={self._config.downsample_xy}x Z={self._config.downsample_z}x\n"
-                f"Illumination fusion: {self._config.illumination_fusion}\n"
+                # "Separate" is not a fusion method: split_illumination leaves
+                # illumination_fusion at its unused default, so echoing that
+                # field alone claims the two light paths were combined when
+                # each one became its own output channel.
+                f"Illumination fusion: {'separate (each light path kept as its own output channel)' if self._config.split_illumination else self._config.illumination_fusion}\n"
                 f"Tile overlap fusion: {self._config.tile_overlap_fusion}\n"
                 f"Flat-field correction: {self._config.flat_field_correction}\n"
                 f"Camera X inverted: {self._config.camera_x_inverted}\n"

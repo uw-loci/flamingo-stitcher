@@ -31,6 +31,7 @@ NEW_FIELDS = [
     "registration_z_refine_range_um",
     "registration_z_refine_binning",
     "registration_z_refine_upsample",
+    "registration_z_snap_to_plane",
     "registration_report_enabled",
     "registration_report_json",
 ]
@@ -64,6 +65,9 @@ class TestYamlWiring:
             ("upsample_factor", "registration_upsample_factor", 8, 8),
             ("report", "registration_report_enabled", False, False),
             ("report_json", "registration_report_json", True, True),
+            # Off is the interesting direction: the default is on, so a
+            # config that means to keep sub-plane Z has to be able to say so.
+            ("z_snap_to_plane", "registration_z_snap_to_plane", False, False),
         ],
     )
     def test_a_top_level_registration_key_reaches_the_config(
@@ -101,6 +105,7 @@ class TestYamlWiring:
             "upsample_factor",
             "report",
             "report_json",
+            "z_snap_to_plane",
         ):
             assert key in reg, key
         for key in ("enabled", "range_um", "binning", "upsample_factor"):
@@ -182,7 +187,13 @@ class TestTheNativeTabDoesNotForgetSettings:
 
     @pytest.mark.parametrize(
         "key",
-        ["max_reg_shift_z", "z_refine", "z_refine_range_um", "registration_report"],
+        [
+            "max_reg_shift_z",
+            "z_refine",
+            "z_refine_range_um",
+            "z_snap_to_plane",
+            "registration_report",
+        ],
     )
     def test_the_new_registration_keys_are_persisted(self, key):
         assert key in _setting_keys(

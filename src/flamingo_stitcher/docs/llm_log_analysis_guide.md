@@ -41,7 +41,10 @@ The header echoes the settings and provenance. Lines worth checking first:
 
 - `Downsample: XY=?x Z=?x` — 1×/1× is full resolution (biggest, slowest).
 - `Illumination fusion: max|mean|leonardo` — combines the two light-sheet sides
-  **within** a tile (not tile-to-tile).
+  **within** a tile (not tile-to-tile). `separate (...)` instead means the sides
+  were NOT combined: each light path becomes its own output channel, so the
+  output has twice the channels and each one still carries that side's
+  illumination falloff across the mosaic.
 - `Tile overlap fusion: max|blend` — combines **adjacent tiles**. See [§7](#7-tile-overlap-fusion-max-vs-blend-and-why-seams-look-the-way-they-do).
 - `Flat-field correction: True|False` — BaSiC shading + baseline correction.
 - `Output format`, `Frame size (AOI)`, `Objective … → effective pixel ~X µm`.
@@ -147,6 +150,12 @@ does **not** help an I/O bottleneck.
   brighter tile. Good for sparse / sub-field-of-view samples (blend would dilute
   signal against a neighbour's background). Side effect: because `max` of two
   noisy backgrounds is biased upward, empty overlaps can read slightly **bright**.
+  A genuinely dimmer tile therefore shows up as a band **narrower than the tile**
+  with hard step edges — `max` hands both of that tile's overlaps to its brighter
+  neighbours. `max` can never return less than the dimmest tile covering a voxel
+  (it is a plain `np.nanmax`, and `fuse_field` builds blending weights only for a
+  fusion func that declares a `blending_weights` kwarg, which `max_fusion` does
+  not), so **a dark band is never `max` mixing something in** — it is a dim tile.
 - **`blend`** = cosine-weighted average, and the weights are **normalized to sum
   to 1** across overlapping tiles. So on truly identical tiles blend is
   mathematically flat (no seam). A **dim band with blend therefore means the two
@@ -167,6 +176,64 @@ how the mismatch is drawn. Fix hierarchy:
 3. **Per-tile intensity equalization from the overlaps** — the proper fix for a
    residual per-tile offset. *(Not built into the tool as of v0.7.1; if the user
    needs it, say so rather than implying a setting exists.)*
+
+## 7b. Black rectangles at the top or bottom of the stack — the ragged Z edge
+
+The fused stack is the **union** bounding box of the registered tiles
+(multiview-stitcher `mode="union"`). Registration shifts each tile in Z, so the
+union is taller than any one tile, and in the extra planes only the tiles shifted
+that way have data. multiview-stitcher transforms with `cval=np.nan` and ends
+`fuse_field` with `np.nan_to_num`, so an **uncovered voxel is a hard 0** — whole
+tile-shaped black rectangles, which read exactly like missing or failed tiles.
+
+The run tells you where the edge is:
+
+    Z coverage: the fused stack is 164 planes (the union of the registered
+    tiles), but only planes 4-159 (156) are covered by every tile. ...
+
+Check the viewed plane against that range **before** investigating anything else.
+The 2026-09-03 3x3 run looked broken at `z:162/164`; the tiles were 160 planes and
+registration spread them over 38.3 um (dz -26.0 .. +12.3 at a 10 um Z step), so
+planes 0-3 and 160-163 were partially covered and 162 was two planes into the
+ragged top. Cross-check against `|dz| ... max` in the registration report: a Z
+spread of N steps costs you ~N planes at each end.
+
+This is geometry, not fusion. It appears now because registration is on by
+default (v0.11.0); a skip-registration run leaves every tile at the same Z and
+has no ragged edge at all.
+
+## 7c. Sub-plane Z shifts blur the data (`Z snap` lines)
+
+Fusion uses `interpolation_order=1`. A tile whose Z origin does not land on the
+output plane grid is therefore **linear-interpolated from two acquired planes** —
+and the whole tile shifts together, so that mixes two planes across the entire XY
+field. At a 10 um Z step with ~1 um pixels a plane is the unit the data arrives
+in, so this is not benign resampling. Measured on a single-bright-plane phantom:
+
+| Z shift | lit planes out | peak retained |
+|---|---|---|
+| 0 | 1 | 100% |
+| 0.96 um | 2 | 91% |
+| 2.72 um | 2 | 73% |
+| 5.0 um (half plane) | 2 | 51% |
+| 10.0 um (whole plane) | 1 | 100% |
+
+The **Z refinement pass makes sub-plane shifts on purpose**
+(`registration_z_refine_upsample=10`), so `Z refinement: adjusted N/M tiles
+(|dz| median ...)` is a direct count of tiles that would be resampled.
+
+`registration_z_snap_to_plane` (**on by default**, GUI "Snap Z shifts to whole
+planes", CLI `--no-z-snap` to disable) puts every tile on the grid, so no tile is
+interpolated between planes. It snaps the TOTAL Z origin — metadata plus
+registration — because per-tile Z stacks can start off-grid on their own. Cost:
+at most half a plane of placement accuracy per tile. Look for:
+
+    Z snap: moved 8/9 tiles by up to 2.72 um (< half a 10.0 um plane) onto
+    whole planes, ...
+
+`Z snap OFF: tiles keep their sub-plane Z shifts` means someone disabled it — if
+the user is complaining about axial blur or lost intensity in single planes, that
+is the line to find.
 
 ## 8. Reading the Border-QC report
 
