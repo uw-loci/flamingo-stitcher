@@ -36,6 +36,12 @@ OVERALL_ETA_SEP = "   ·   "
 # agree" stops being true.
 DEFAULT_MIN_REGISTERED_SEAM_FRAC = 0.5
 
+# Minimum overlap strip, in REGISTRATION pixels, worth running phase correlation
+# on. Below this the correlation peak is dominated by noise and comes back
+# confidently wrong rather than failing; 16 px is the width at which the 7x7 run
+# on 2026-09-03 still scored seams above the quality threshold.
+MIN_REGISTRATION_OVERLAP_PX = 16
+
 
 # StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
 # block so a run's settings can be reloaded into the GUI ("Load Configuration",
@@ -872,6 +878,11 @@ class StitchingConfig:
     # Registration
     skip_registration: bool = False  # Use stage positions only (no phase correlation)
     reg_channel: int = 0  # Channel index to use for registration
+    # Against NATIVE tiles: "z=2, xy=4" means half the raw planes and a quarter
+    # of the raw pixels. Registration runs on the already-downsampled spill, so
+    # the pipeline discounts this by the downsample it has applied rather than
+    # binning on top of it (_effective_registration_binning) — at XY=8x the two
+    # multiplied to 32x and left a 15% overlap as a 9.6 px strip.
     registration_binning: Dict[str, int] = field(
         default_factory=lambda: {"z": 2, "y": 4, "x": 4}
     )
@@ -6469,7 +6480,9 @@ class StitchingPipeline:
                         reg_channel_index=0,
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
-                        registration_binning=self.config.registration_binning,
+                        registration_binning=self._effective_registration_binning(
+                            tile_data, tiles, extent_um
+                        ),
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=(
                             self.config.quality_threshold
@@ -6651,6 +6664,94 @@ class StitchingPipeline:
         except Exception:
             return {}
 
+    def _effective_registration_binning(
+        self, tile_data, tiles, extent_um, configured=None
+    ):
+        """``registration_binning`` discounted by the downsample already applied.
+
+        The config value is expressed against NATIVE tiles — "register at z=2,
+        xy=4" means half the raw planes and a quarter of the raw pixels, which
+        is how the defaults were tuned. But registration runs on the PREPROCESSED
+        spill, which the pipeline has already downsampled, so the two multiply.
+
+        At XY=8x downsample with the default xy=4 binning that is 32x: a 2048 px
+        frame becomes 64 px and a 15% overlap becomes a 9.6 px strip. Phase
+        correlation on ten pixels does not fail loudly, it returns a confident
+        wrong shift — on a 7x7 run it put 31 of 84 seams below the quality
+        threshold (0.12-0.34) and the mosaic was placed by stage position.
+
+        So the binning to ASK multiview-stitcher for is what is left after the
+        downsample: ``round(configured / already_applied)``, floored at 1. At
+        1x downsample nothing changes. The factor actually applied is measured
+        from the tile shape rather than read from the config, so "iso" XY and
+        any future resolution path are handled by construction.
+
+        Then a floor: if the overlap strip at the resulting resolution is still
+        under ``MIN_REGISTRATION_OVERLAP_PX``, the binning comes down further.
+        There is no point spending the time to measure something this coarse.
+        """
+        configured = dict(
+            self.config.registration_binning if configured is None else configured
+        )
+        if not tile_data:
+            return configured
+        try:
+            volume, tile_info = tile_data[0]
+            shape = volume.shape
+            applied = {
+                "z": (int(tile_info.n_planes) or 1) / max(1, int(shape[-3])),
+                "y": (int(tile_info.frame_height) or 1) / max(1, int(shape[-2])),
+                "x": (int(tile_info.frame_width) or 1) / max(1, int(shape[-1])),
+            }
+        except Exception:
+            return configured  # can't measure it; leave the setting alone
+
+        effective = {}
+        for axis, value in configured.items():
+            want = max(1, int(value or 1))
+            factor = applied.get(axis, 1.0) or 1.0
+            effective[axis] = max(1, int(round(want / factor)))
+
+        # Overlap floor. grid_overlap gives the MEASURED fraction per axis; the
+        # strip in registration pixels is that fraction of the binned frame.
+        note = ""
+        if extent_um and tiles:
+            try:
+                layout = tile_geometry.grid_overlap(
+                    tiles, extent_x_um=extent_um["x"], extent_y_um=extent_um["y"]
+                )
+                for axis, dim in (("x", -1), ("y", -2)):
+                    fraction = layout[axis].fraction
+                    if not fraction:
+                        continue
+                    binned = tile_data[0][0].shape[dim] / max(1, effective[axis])
+                    strip = fraction * binned
+                    while effective[axis] > 1 and strip < MIN_REGISTRATION_OVERLAP_PX:
+                        effective[axis] -= 1
+                        strip = fraction * (
+                            tile_data[0][0].shape[dim] / max(1, effective[axis])
+                        )
+                    if strip < MIN_REGISTRATION_OVERLAP_PX:
+                        note = (
+                            f" The {axis.upper()} overlap is only {strip:.0f} px "
+                            f"even unbinned — lower the XY downsample if the "
+                            f"seams come back below the quality threshold."
+                        )
+            except Exception:
+                pass
+
+        if effective != configured:
+            self.logger.info(
+                f"  Registration binning {dict(configured)} -> {effective}: the "
+                f"tiles are already downsampled "
+                f"(z={applied['z']:.0f}x y={applied['y']:.0f}x x={applied['x']:.0f}x), "
+                f"and binning again on top of that multiplies. The configured "
+                f"value is against native tiles.{note}"
+            )
+        elif note:
+            self.logger.warning(f"  Registration overlap is thin.{note}")
+        return effective
+
     def _registration_overlap_gate(self, tiles, extent_um) -> Optional[str]:
         """Reason to skip registration entirely, or None to proceed.
 
@@ -6771,8 +6872,14 @@ class StitchingPipeline:
                     # Start from pass 1's (clamped) placement, so what comes
                     # back is the residual rather than a competing absolute.
                     transform_key="registered",
-                    registration_binning=dict(
-                        self.config.registration_z_refine_binning
+                    # Discounted the same way as the main pass: this
+                    # binning is against native tiles too, and the spill it
+                    # runs on is already downsampled.
+                    registration_binning=self._effective_registration_binning(
+                        tile_data,
+                        [ti for _v, ti in tile_data],
+                        self._frame_extent_um(tile_data, voxel_size_um),
+                        configured=self.config.registration_z_refine_binning,
                     ),
                     post_registration_do_quality_filter=True,
                     post_registration_quality_threshold=self.config.quality_threshold,
@@ -8366,7 +8473,11 @@ class StitchingPipeline:
                         reg_channel_index=0,
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
-                        registration_binning=self.config.registration_binning,
+                        registration_binning=self._effective_registration_binning(
+                            tile_data,
+                            [ti for _v, ti in tile_data],
+                            self._frame_extent_um(tile_data, voxel_size_um),
+                        ),
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=self.config.quality_threshold,
                         # Global optimization with iterative edge pruning —

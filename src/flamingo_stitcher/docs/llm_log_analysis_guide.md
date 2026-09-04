@@ -235,6 +235,44 @@ at most half a plane of placement accuracy per tile. Look for:
 the user is complaining about axial blur or lost intensity in single planes, that
 is the line to find.
 
+## 7d. Downsample x registration binning (`Registration binning ... ->` lines)
+
+`registration_binning` (default `z=2, y=4, x=4`) is expressed against NATIVE
+tiles, but registration runs on the already-downsampled spill. Before v0.11.4 the
+two MULTIPLIED. At `Downsample: XY=8x` the default xy=4 meant registering at 32x:
+a 2048 px frame became 64 px and a 15% overlap became a **9.6 px strip**. Phase
+correlation on ten pixels returns a confident wrong shift rather than failing.
+
+That is what a run looks like when it happens — all from one 7x7 log:
+
+    Downsample: XY=8x Z=1x
+    Seams: 37 registered · 16 pruned · 31 below quality
+    ... below_quality  quality 0.12 / 0.14 / 0.18 / 0.19 / 0.20 / 0.33 / 0.34
+    Registration NOT APPLIED: ... 44% of seams, below the 50% needed
+
+Many seams *just* below a 0.4 quality threshold, on a heavily downsampled run,
+is this — not a bad sample. Compare against a 2x run of the same specimen, which
+registered 11 of 12 seams.
+
+The pipeline now discounts the binning by the downsample already applied and says
+so; the factor is measured from the tile shape, not read from the config, so
+"iso" XY is handled too:
+
+    Registration binning {'z': 2, 'y': 4, 'x': 4} -> {'z': 2, 'y': 1, 'x': 1}:
+    the tiles are already downsampled (z=1x y=8x x=8x), and binning again on
+    top of that multiplies. ...
+
+There is also a floor: if the overlap strip would still be under 16 registration
+pixels the binning comes down further, and if even unbinned is too thin the run
+warns and names the number. A warning there means **lower the XY downsample** —
+no binning setting can recover overlap the downsample already threw away.
+
+**Note on `pruned`.** It does NOT mean the seam failed: `STATUS_PRUNED` is
+"survived quality, dropped by edge pruning" — measured fine (0.89-0.95 in the run
+above), then dropped by the global optimiser as redundant. `mosaic_coverage`
+still counts pruned seams in the denominator of the coverage gate, so 37/84 = 44%
+where 37/68 = 54% would have passed. Read the gate percentage with that in mind.
+
 ## 8. Reading the Border-QC report
 
 If enabled, the QC prints flagged seams worst-first. Each line looks like:
