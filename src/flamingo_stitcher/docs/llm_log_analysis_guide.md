@@ -254,18 +254,27 @@ Many seams *just* below a 0.4 quality threshold, on a heavily downsampled run,
 is this — not a bad sample. Compare against a 2x run of the same specimen, which
 registered 11 of 12 seams.
 
-The pipeline now discounts the binning by the downsample already applied and says
-so; the factor is measured from the tile shape, not read from the config, so
-"iso" XY is handled too:
+The pipeline now picks the binning from the OVERLAP STRIP: bin as hard as the
+configured value allows while keeping ~32 registration pixels of overlap. The
+configured value stays a ceiling, so this never registers on more pixels than the
+setting asks for.
+
+    ds= 1x  strip 307 px  ->  bin 4 (capped)  ->  77 px
+    ds= 2x  strip 154 px  ->  bin 4 (capped)  ->  38 px
+    ds= 4x  strip  77 px  ->  bin 2           ->  38 px
+    ds= 8x  strip  38 px  ->  bin 1           ->  38 px
+
+Binning purely by the downsample would be wrong in the other direction: at 2x it
+would leave a 77 px strip where 38 px already registered 11 of 12 seams — 4x the
+registration cost for margin the evidence says is not needed.
 
     Registration binning {'z': 2, 'y': 4, 'x': 4} -> {'z': 2, 'y': 1, 'x': 1}:
-    the tiles are already downsampled (z=1x y=8x x=8x), and binning again on
-    top of that multiplies. ...
+    binned to keep about 32 px of tile overlap to correlate on. ...
 
-There is also a floor: if the overlap strip would still be under 16 registration
-pixels the binning comes down further, and if even unbinned is too thin the run
-warns and names the number. A warning there means **lower the XY downsample** —
-no binning setting can recover overlap the downsample already threw away.
+If even unbinned is under 16 px the run warns and names the number. That means
+**lower the XY downsample** — no binning setting can recover overlap the
+downsample already threw away. Z has no overlap to measure on an XY mosaic, so
+its binning is simply discounted by the Z downsample already applied.
 
 **Note on `pruned`.** It does NOT mean the seam failed: `STATUS_PRUNED` is
 "survived quality, dropped by edge pruning" — measured fine (0.89-0.95 in the run

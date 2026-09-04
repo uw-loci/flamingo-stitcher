@@ -42,6 +42,12 @@ DEFAULT_MIN_REGISTERED_SEAM_FRAC = 0.5
 # on 2026-09-03 still scored seams above the quality threshold.
 MIN_REGISTRATION_OVERLAP_PX = 16
 
+# Overlap strip, in REGISTRATION pixels, to aim for when choosing binning. The
+# 3x3 run that registered 11 of 12 seams had 38 px; the 7x7 that registered
+# nothing had 9.6. 32 sits just under the width that is known to work, so the
+# binning stays as coarse (and registration as cheap) as the evidence allows.
+REGISTRATION_OVERLAP_TARGET_PX = 32
+
 
 # StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
 # block so a run's settings can be reloaded into the GUI ("Load Configuration",
@@ -6667,28 +6673,40 @@ class StitchingPipeline:
     def _effective_registration_binning(
         self, tile_data, tiles, extent_um, configured=None
     ):
-        """``registration_binning`` discounted by the downsample already applied.
+        """Binning that keeps a usable overlap strip, rather than one that
+        multiplies with the downsample already applied.
 
-        The config value is expressed against NATIVE tiles — "register at z=2,
-        xy=4" means half the raw planes and a quarter of the raw pixels, which
-        is how the defaults were tuned. But registration runs on the PREPROCESSED
-        spill, which the pipeline has already downsampled, so the two multiply.
+        ``registration_binning`` is written against NATIVE tiles — "z=2, xy=4"
+        means half the raw planes and a quarter of the raw pixels. Registration
+        runs on the PREPROCESSED spill, which the pipeline has already
+        downsampled, so applying it as-is compounds the two. At XY=8x the
+        default xy=4 registered at 32x: a 2048 px frame became 64 px and a 15%
+        overlap became a 9.6 px strip, and phase correlation on ten pixels
+        returns a confident wrong shift rather than failing.
 
-        At XY=8x downsample with the default xy=4 binning that is 32x: a 2048 px
-        frame becomes 64 px and a 15% overlap becomes a 9.6 px strip. Phase
-        correlation on ten pixels does not fail loudly, it returns a confident
-        wrong shift — on a 7x7 run it put 31 of 84 seams below the quality
-        threshold (0.12-0.34) and the mosaic was placed by stage position.
+        What actually limits X/Y is the width of the overlap strip in
+        registration pixels, so that is what gets solved for: bin as hard as the
+        configured value allows while keeping the strip at
+        ``REGISTRATION_OVERLAP_TARGET_PX``. Binning purely by the downsample
+        would be just as wrong in the other direction — at XY=2x it leaves a
+        76.8 px strip where 38.4 px already registered 11 of 12 seams, i.e. 4x
+        the registration cost for margin nobody needs.
 
-        So the binning to ASK multiview-stitcher for is what is left after the
-        downsample: ``round(configured / already_applied)``, floored at 1. At
-        1x downsample nothing changes. The factor actually applied is measured
-        from the tile shape rather than read from the config, so "iso" XY and
-        any future resolution path are handled by construction.
+            ds= 1x  strip 307 px  ->  bin 4 (capped)  ->  77 px
+            ds= 2x  strip 154 px  ->  bin 4 (capped)  ->  38 px
+            ds= 4x  strip  77 px  ->  bin 2           ->  38 px
+            ds= 8x  strip  38 px  ->  bin 1           ->  38 px
 
-        Then a floor: if the overlap strip at the resulting resolution is still
-        under ``MIN_REGISTRATION_OVERLAP_PX``, the binning comes down further.
-        There is no point spending the time to measure something this coarse.
+        The configured value stays the ceiling, so this never registers on MORE
+        pixels than the setting asks for — it only declines to throw away
+        overlap that is already thin.
+
+        Z gets the other rule: an XY mosaic has no Z overlap to measure, so its
+        binning is simply discounted by the Z downsample already applied.
+
+        The applied factor is measured from the tile shape rather than read from
+        the config, so "iso" XY and any future resolution path are handled by
+        construction.
         """
         configured = dict(
             self.config.registration_binning if configured is None else configured
@@ -6698,58 +6716,70 @@ class StitchingPipeline:
         try:
             volume, tile_info = tile_data[0]
             shape = volume.shape
-            applied = {
-                "z": (int(tile_info.n_planes) or 1) / max(1, int(shape[-3])),
-                "y": (int(tile_info.frame_height) or 1) / max(1, int(shape[-2])),
-                "x": (int(tile_info.frame_width) or 1) / max(1, int(shape[-1])),
-            }
+            applied_z = (int(tile_info.n_planes) or 1) / max(1, int(shape[-3]))
         except Exception:
             return configured  # can't measure it; leave the setting alone
 
-        effective = {}
-        for axis, value in configured.items():
-            want = max(1, int(value or 1))
-            factor = applied.get(axis, 1.0) or 1.0
-            effective[axis] = max(1, int(round(want / factor)))
+        effective = dict(configured)
+        if "z" in effective:
+            want = max(1, int(effective["z"] or 1))
+            effective["z"] = max(1, int(round(want / (applied_z or 1.0))))
 
-        # Overlap floor. grid_overlap gives the MEASURED fraction per axis; the
-        # strip in registration pixels is that fraction of the binned frame.
-        note = ""
+        thin = ""
+        fractions = {}
         if extent_um and tiles:
             try:
                 layout = tile_geometry.grid_overlap(
                     tiles, extent_x_um=extent_um["x"], extent_y_um=extent_um["y"]
                 )
-                for axis, dim in (("x", -1), ("y", -2)):
-                    fraction = layout[axis].fraction
-                    if not fraction:
-                        continue
-                    binned = tile_data[0][0].shape[dim] / max(1, effective[axis])
-                    strip = fraction * binned
-                    while effective[axis] > 1 and strip < MIN_REGISTRATION_OVERLAP_PX:
-                        effective[axis] -= 1
-                        strip = fraction * (
-                            tile_data[0][0].shape[dim] / max(1, effective[axis])
-                        )
-                    if strip < MIN_REGISTRATION_OVERLAP_PX:
-                        note = (
-                            f" The {axis.upper()} overlap is only {strip:.0f} px "
-                            f"even unbinned — lower the XY downsample if the "
-                            f"seams come back below the quality threshold."
-                        )
+                fractions = {
+                    axis: layout[axis].fraction
+                    for axis in ("x", "y")
+                    if layout[axis].fraction
+                }
             except Exception:
-                pass
+                fractions = {}
+
+        for axis, dim in (("x", -1), ("y", -2)):
+            if axis not in effective:
+                continue
+            fraction = fractions.get(axis)
+            if not fraction:
+                # No measurable pitch (a single row or column). Fall back to
+                # discounting the downsample: still better than compounding.
+                applied = (
+                    int(getattr(tile_info, "frame_width" if axis == "x" else "frame_height", 0)) or 1
+                ) / max(1, int(shape[dim]))
+                effective[axis] = max(
+                    1, int(round(max(1, int(effective[axis] or 1)) / (applied or 1.0)))
+                )
+                continue
+            strip = fraction * int(shape[dim])
+            effective[axis] = max(
+                1,
+                min(
+                    max(1, int(configured.get(axis, 1) or 1)),
+                    int(strip // REGISTRATION_OVERLAP_TARGET_PX),
+                ),
+            )
+            final = strip / effective[axis]
+            if final < MIN_REGISTRATION_OVERLAP_PX:
+                thin = (
+                    f" The {axis.upper()} overlap is only {final:.0f} px even "
+                    f"unbinned — lower the XY downsample if the seams come back "
+                    f"below the quality threshold."
+                )
 
         if effective != configured:
             self.logger.info(
-                f"  Registration binning {dict(configured)} -> {effective}: the "
-                f"tiles are already downsampled "
-                f"(z={applied['z']:.0f}x y={applied['y']:.0f}x x={applied['x']:.0f}x), "
-                f"and binning again on top of that multiplies. The configured "
-                f"value is against native tiles.{note}"
+                f"  Registration binning {dict(configured)} -> {effective}: "
+                f"binned to keep about {REGISTRATION_OVERLAP_TARGET_PX} px of "
+                f"tile overlap to correlate on. The configured value is against "
+                f"native tiles, and these are already downsampled, so applying "
+                f"it as-is would multiply.{thin}"
             )
-        elif note:
-            self.logger.warning(f"  Registration overlap is thin.{note}")
+        elif thin:
+            self.logger.warning(f"  Registration overlap is thin.{thin}")
         return effective
 
     def _registration_overlap_gate(self, tiles, extent_um) -> Optional[str]:

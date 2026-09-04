@@ -24,6 +24,7 @@ import pytest
 
 from flamingo_stitcher.pipeline import (  # noqa: E402
     MIN_REGISTRATION_OVERLAP_PX,
+    REGISTRATION_OVERLAP_TARGET_PX,
     StitchingConfig,
     StitchingPipeline,
 )
@@ -83,10 +84,29 @@ class TestItStopsMultiplying:
         out = _binning(StitchingConfig(), 8)
         assert out["x"] == 1 and out["y"] == 1
 
-    def test_a_partial_downsample_uses_what_is_left(self):
-        """XY=2x with xy=4 configured leaves 2x to apply."""
+    def test_the_case_that_already_worked_is_not_made_more_expensive(self):
+        """XY=2x kept binning 4 and registered 11 of 12 seams at a 38 px strip.
+
+        Discounting purely by the downsample would drop it to 2 and register on
+        4x the pixels for margin the evidence says is not needed. The configured
+        value is a CEILING, not a target to climb back down from.
+        """
         out = _binning(StitchingConfig(), 2)
-        assert out["x"] == 2 and out["y"] == 2
+        assert out["x"] == 4 and out["y"] == 4
+        assert 0.15 * (NATIVE / 2) / out["x"] == pytest.approx(38.4)
+
+    def test_a_middling_downsample_bins_as_hard_as_the_strip_allows(self):
+        out = _binning(StitchingConfig(), 4)
+        assert out["x"] == 2
+        assert 0.15 * (NATIVE / 4) / out["x"] == pytest.approx(38.4)
+
+    def test_the_configured_value_is_never_exceeded(self):
+        """More binning than asked for would register on fewer pixels than the
+        setting allows, which is the user's call, not ours."""
+        cfg = StitchingConfig(registration_binning={"z": 2, "y": 2, "x": 2})
+        for ds in (1, 2, 4, 8):
+            out = _binning(cfg, ds)
+            assert out["x"] <= 2 and out["y"] <= 2, (ds, out)
 
     def test_z_is_discounted_on_its_own_axis(self):
         out = _binning(StitchingConfig(), 1, downsample_z=2)
@@ -109,11 +129,16 @@ class TestTheOverlapFloor:
         strip = 0.15 * (NATIVE / 8) / out["x"]
         assert strip >= MIN_REGISTRATION_OVERLAP_PX, f"{strip:.1f} px"
 
-    def test_binning_comes_down_when_the_strip_is_still_thin(self):
-        """A heavier downsample must not be re-binned into uselessness."""
+    def test_a_larger_configured_binning_is_still_held_to_the_strip(self):
         out = _binning(StitchingConfig(registration_binning={"z": 2, "y": 8, "x": 8}), 4)
         strip = 0.15 * (NATIVE / 4) / out["x"]
         assert strip >= MIN_REGISTRATION_OVERLAP_PX, f"{strip:.1f} px with {out}"
+
+    def test_every_downsample_lands_at_or_above_the_target_when_it_can(self):
+        for ds in (1, 2, 4, 8):
+            out = _binning(StitchingConfig(), ds)
+            strip = 0.15 * (NATIVE / ds) / out["x"]
+            assert strip >= REGISTRATION_OVERLAP_TARGET_PX, (ds, out, strip)
 
     def test_it_warns_when_even_unbinned_is_too_thin(self, caplog):
         out = _binning(StitchingConfig(), 32, caplog=caplog)
