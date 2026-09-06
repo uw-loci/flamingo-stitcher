@@ -330,6 +330,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.registration_report_enabled = bool(reg["report"])
     if reg.get("report_json") is not None:
         config_obj.registration_report_json = bool(reg["report_json"])
+    if reg.get("approach") is not None:
+        config_obj.stitching_approach = str(reg["approach"])
     if reg.get("z_snap_to_plane") is not None:
         config_obj.registration_z_snap_to_plane = bool(reg["z_snap_to_plane"])
     zref = reg.get("z_refine", {})

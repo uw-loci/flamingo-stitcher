@@ -32,6 +32,7 @@ NEW_FIELDS = [
     "registration_z_refine_binning",
     "registration_z_refine_upsample",
     "registration_z_snap_to_plane",
+    "stitching_approach",
     "registration_report_enabled",
     "registration_report_json",
 ]
@@ -68,6 +69,7 @@ class TestYamlWiring:
             # Off is the interesting direction: the default is on, so a
             # config that means to keep sub-plane Z has to be able to say so.
             ("z_snap_to_plane", "registration_z_snap_to_plane", False, False),
+            ("approach", "stitching_approach", "center_xy", "center_xy"),
         ],
     )
     def test_a_top_level_registration_key_reaches_the_config(
@@ -106,6 +108,7 @@ class TestYamlWiring:
             "report",
             "report_json",
             "z_snap_to_plane",
+            "approach",
         ):
             assert key in reg, key
         for key in ("enabled", "range_um", "binning", "upsample_factor"):
@@ -192,6 +195,7 @@ class TestTheNativeTabDoesNotForgetSettings:
             "z_refine",
             "z_refine_range_um",
             "z_snap_to_plane",
+            "stitching_approach",
             "registration_report",
         ],
     )

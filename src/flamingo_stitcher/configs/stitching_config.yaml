@@ -135,6 +135,24 @@ registration:
   # larger correlation matrix per tile pair and nothing else.
   upsample_factor: 0
 
+  # How the mosaic is assembled from the measured seams.
+  #
+  # "default"   — multiview-stitcher's own behaviour: each connected group of
+  #               tiles is solved independently, and a tile with no registered
+  #               seam keeps its raw stage position while its neighbours move.
+  # "center_xy" — anchor the solve at the centre-most tile (so error piles up
+  #               outward from the middle of the sample) and then carry every
+  #               tile outside the registered core to the mean correction of its
+  #               adjacent placed tiles. Built for a rectangular collection
+  #               around a round sample, where the empty rim can never register:
+  #               it keeps that rim's overlap instead of tearing it, and the
+  #               registered-seam guard stops being the deciding factor.
+  #
+  # Both solve all seams at once. Neither places tiles one at a time — that is
+  # what makes an L of neighbours unsatisfiable, and is why BigStitcher
+  # optimises globally and drops irreconcilable links instead.
+  approach: default
+
   # Never place a tile BETWEEN two acquired Z planes.
   #
   # Fusion interpolates linearly, so a tile whose Z origin misses the output

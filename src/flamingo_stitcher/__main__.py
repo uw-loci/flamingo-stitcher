@@ -383,6 +383,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sub-plane upsampling for the Z-refine pass (default 10)",
     )
     reg_group.add_argument(
+        "--approach",
+        choices=("default", "center_xy"),
+        default=None,
+        help="How the mosaic is assembled. 'default' solves each connected "
+        "group of tiles on its own and leaves an unregistered tile at its stage "
+        "position. 'center_xy' anchors the solve at the centre-most tile and "
+        "carries every tile outside the registered core to its neighbours' mean "
+        "correction, so an empty rim keeps its overlap instead of tearing.",
+    )
+    reg_group.add_argument(
         "--no-z-snap",
         dest="z_snap_to_plane",
         action="store_false",
@@ -807,6 +817,7 @@ def main():
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),
         ("registration_z_snap_to_plane", args.z_snap_to_plane),
+        ("stitching_approach", args.approach),
         ("registration_report_enabled", args.registration_report),
         ("registration_report_json", args.registration_report_json),
     ):

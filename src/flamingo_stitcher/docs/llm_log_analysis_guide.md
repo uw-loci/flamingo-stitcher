@@ -282,6 +282,58 @@ above), then dropped by the global optimiser as redundant. `mosaic_coverage`
 still counts pruned seams in the denominator of the coverage gate, so 37/84 = 44%
 where 37/68 = 54% would have passed. Read the gate percentage with that in mind.
 
+## 7e. Approach: Default vs Center XY Start
+
+`Approach:` (config `registration.approach`, CLI `--approach`) chooses how the
+mosaic is assembled from the seams that registered.
+
+**`default`** is multiview-stitcher's behaviour: each connected component of the
+seam graph is solved independently, and a tile with NO registered seam keeps its
+raw stage position while its neighbours move. `_bind_unconstrained_tiles` then
+gives each stranded component the mosaic's MEDIAN correction so nothing tears —
+but a median ignores where a tile sits, so on a mosaic whose corrections vary
+across the grid a rim tile still opens a gap against the tiles it touches.
+
+**`center_xy`** ("Center XY Start") is for a rectangular collection around a
+round sample — a default single-workflow acquisition, where the rim of empty
+tiles can never register:
+
+1. The solve is ANCHORED at the centre-most tile (`reference_view`), so error
+   accumulates outward from the middle of the sample rather than from whichever
+   view the solver picked. Look for `Anchoring the solve at the centre tile ...`.
+2. Every tile outside the registered core is CARRIED to the mean correction of
+   its adjacent placed tiles, spreading one ring per pass, so it keeps exactly
+   the overlap the stage gave it and no black gap opens:
+
+       Centre-out: 9 of 25 tiles placed by registration; 16 carried by their
+       neighbours (2 pass(es), largest move 10.0 um)
+
+3. The seam-fraction guard is REPLACED, not dropped. An unregisterable rim is
+   the expected shape of this data, and the tearing that guard prevents is what
+   carrying removes. Carried and orphan counts are logged either way.
+
+Both approaches solve every seam SIMULTANEOUSLY. Neither places tiles one at a
+time, and that is deliberate: a greedy outward walk commits each tile from
+whichever neighbour it visited first, so a tile whose left and bottom neighbours
+disagree can never satisfy both. BigStitcher's answer to that is to optimise all
+links at once and drop the worst link when its residual exceeds tolerance (only
+when removing it keeps the graph connected), and multiview-stitcher implements
+the same thing as `global_optimization`.
+
+Tiles where the disagreement survives the solve are named, non-fatally:
+
+    ERROR   not able to resolve all overlaps for tile X004 Y001 — 2 registered
+    seams, worst residual 9.2 um (tolerance 3.5 um). ...
+
+`X### Y###` comes from the flat filename's grid index; folder-layout
+(multi-acquisition) tiles have no index and are named by stage position instead.
+A tile with only ONE registered seam is never reported — there is nothing for it
+to disagree with. The tolerance is `global_opt_abs_tol`.
+
+**Units trap:** the seam CSV's `residual_px` column is in MICROMETRES, not
+pixels — it comes straight from multiview-stitcher's `edge_residuals`, which are
+physical units. The name is wrong; the numbers are µm.
+
 ## 8. Reading the Border-QC report
 
 If enabled, the QC prints flagged seams worst-first. Each line looks like:

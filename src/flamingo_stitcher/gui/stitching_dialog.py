@@ -1274,6 +1274,30 @@ class StitchingDialog(PersistentDialog):
         reg_layout.addWidget(self._z_refine_range_label, 2, 2)
         reg_layout.addWidget(self._z_refine_range_spin, 2, 3)
 
+        reg_layout.addWidget(QLabel("Approach:"), 4, 0)
+        self._approach_combo = QComboBox()
+        self._approach_combo.addItem("Default", "default")
+        self._approach_combo.addItem("Center XY Start", "center_xy")
+        self._approach_combo.setToolTip(
+            "How the mosaic is assembled from the measured seams.\n\n"
+            "Default — multiview-stitcher's own behaviour: each connected group\n"
+            "of tiles is solved on its own, and a tile with no registered seam\n"
+            "keeps its raw stage position while its neighbours move. On a\n"
+            "rectangular collection around a round sample the empty rim can\n"
+            "never register, so it both tears its seam with the mosaic and\n"
+            "drags the registered-seam share under the trust guard.\n\n"
+            "Center XY Start — anchors the solve at the centre-most tile, so\n"
+            "error accumulates outward from the middle of the sample, and then\n"
+            "CARRIES every tile outside the registered core to the mean\n"
+            "correction of its adjacent placed tiles. A carried tile keeps the\n"
+            "overlap the stage gave it, so no black gap opens between any pair,\n"
+            "and the seam-share guard is not the deciding factor.\n\n"
+            "Both solve all seams simultaneously — neither places tiles one at\n"
+            "a time, which is what would make an L of neighbours impossible to\n"
+            "satisfy. Tiles whose seams still disagree are logged as ERROR."
+        )
+        reg_layout.addWidget(self._approach_combo, 4, 1, 1, 3)
+
         self._z_snap_cb = QCheckBox("Snap Z shifts to whole planes")
         self._z_snap_cb.setChecked(True)
         self._z_snap_cb.setToolTip(
@@ -2601,6 +2625,7 @@ class StitchingDialog(PersistentDialog):
         self._z_refine_range_label.setEnabled(not checked)
         self._z_refine_range_spin.setEnabled(not checked)
         self._z_snap_cb.setEnabled(not checked)
+        self._approach_combo.setEnabled(not checked)
 
     def _on_downsample_xy_changed(self, _index: int):
         """Grey out Z combo when XY is iso (iso overrides both factors)."""
@@ -3116,6 +3141,7 @@ class StitchingDialog(PersistentDialog):
         config.max_registration_shift_z_um = float(self._max_reg_shift_z_spin.value())
         config.registration_z_refine = self._z_refine_cb.isChecked()
         config.registration_z_snap_to_plane = self._z_snap_cb.isChecked()
+        config.stitching_approach = self._approach_combo.currentData()
         config.registration_z_refine_range_um = float(self._z_refine_range_spin.value())
         config.registration_report_enabled = self._reg_report_cb.isChecked()
         config.border_qc_enabled = self._border_qc_cb.isChecked()
@@ -3328,6 +3354,11 @@ class StitchingDialog(PersistentDialog):
         # illumination-fusion combo, not a checkbox — a loaded config that split
         # the light paths should select it (overriding the illumination_fusion
         # method applied above, which is unused/ignored when splitting).
+        if has("stitching_approach"):
+            applied += self._set_combo_by_data(
+                self._approach_combo, str(cfg["stitching_approach"])
+            )
+
         if has("split_illumination") and bool(cfg["split_illumination"]):
             applied += self._set_combo_by_data(self._fusion_combo, "separate")
 
@@ -5464,6 +5495,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
+        s.setValue("stitching_approach", self._approach_combo.currentData())
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -5644,6 +5676,9 @@ class StitchingDialog(PersistentDialog):
         # Default TRUE: a run that has never seen this setting must not
         # silently keep sub-plane Z shifts.
         self._z_snap_cb.setChecked(s.value("z_snap_to_plane", True, type=bool))
+        self._set_combo_by_data(
+            self._approach_combo, s.value("stitching_approach", "default", type=str)
+        )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)
         )
@@ -5778,6 +5813,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
+        s.setValue("stitching_approach", self._approach_combo.currentData())
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -5957,6 +5993,9 @@ class NativeStitchingDialog(StitchingDialog):
         # Default TRUE: a run that has never seen this setting must not
         # silently keep sub-plane Z shifts.
         self._z_snap_cb.setChecked(s.value("z_snap_to_plane", True, type=bool))
+        self._set_combo_by_data(
+            self._approach_combo, s.value("stitching_approach", "default", type=str)
+        )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)
         )

@@ -19,7 +19,12 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
-from flamingo_stitcher import registration_report, tile_content, tile_geometry
+from flamingo_stitcher import (
+    center_out,
+    registration_report,
+    tile_content,
+    tile_geometry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -69,6 +74,7 @@ SHAREABLE_CONFIG_FIELDS = (
     "downsample_xy",
     "downsample_z",
     "skip_registration",
+    "stitching_approach",
     "registration_binning",
     "quality_threshold",
     "max_registration_shift_um",
@@ -882,6 +888,15 @@ class StitchingConfig:
     frame_height: Optional[int] = None
 
     # Registration
+    # How the mosaic is assembled. "default" is multiview-stitcher's own
+    # behaviour: one simultaneous solve per connected component of the seam
+    # graph, each with its own arbitrary gauge, and anything edgeless left at
+    # its raw stage position. "center_xy" anchors the solve at the centre-most
+    # tile and then CARRIES every tile outside the registered core to its
+    # neighbours' mean correction (see center_out.py) — for a round sample on a
+    # rectangular grid, where the empty rim can never register and otherwise
+    # both tears its seam with the core and sinks the seam-fraction guard.
+    stitching_approach: str = "default"  # "default" | "center_xy"
     skip_registration: bool = False  # Use stage positions only (no phase correlation)
     reg_channel: int = 0  # Channel index to use for registration
     # Against NATIVE tiles: "z=2, xy=4" means half the raw planes and a quarter
@@ -6496,10 +6511,9 @@ class StitchingPipeline:
                         pairwise_reg_func_kwargs=self._pairwise_reg_kwargs(
                             self.config.registration_upsample_factor
                         ),
-                        groupwise_resolution_kwargs={
-                            "abs_tol": self.config.global_opt_abs_tol,
-                            "rel_tol": self.config.global_opt_rel_tol,
-                        },
+                        groupwise_resolution_kwargs=self._groupwise_kwargs(
+                            tiles, index_map
+                        ),
                         return_dict=True,
                     )
             params = self._expand_to_all_tiles(
@@ -6535,15 +6549,30 @@ class StitchingPipeline:
             # Two independent questions, in order. First: is there enough
             # agreement here to believe any of it? Second: does what we believe
             # place every adjacent pair relative to its neighbour?
-            reason = self._untrustworthy_registration_reason(coverage)
-            if reason is None and not coverage.is_safe_to_apply:
-                # Geometry, not trust: bind the loose tiles to the mosaic so no
-                # seam tears, and carry on with the measurements that worked.
-                params, bound = self._bind_unconstrained_tiles(params, coverage)
-                if bound:
-                    coverage.bound_tiles = list(bound)
-                else:
-                    reason = self._unconstrained_coverage_reason(coverage, params)
+            if self._center_out_approach():
+                # A rectangular collection around a round sample has a rim that
+                # can never register, so "few seams registered" is the expected
+                # shape of this data rather than evidence the run cannot be
+                # trusted — and the tearing the seam-fraction guard exists to
+                # prevent is precisely what carrying removes. Replaced, not
+                # dropped: every carried tile is counted in the log and report.
+                reason = None
+                params, carry = self._carry_deferred_tiles(params, tiles, coverage)
+                if carry is not None:
+                    coverage.bound_tiles = list(carry.carried) + list(carry.orphans)
+            else:
+                reason = self._untrustworthy_registration_reason(coverage)
+                if reason is None and not coverage.is_safe_to_apply:
+                    # Geometry, not trust: bind the loose tiles to the mosaic so
+                    # no seam tears, and carry on with what worked.
+                    params, bound = self._bind_unconstrained_tiles(params, coverage)
+                    if bound:
+                        coverage.bound_tiles = list(bound)
+                    else:
+                        reason = self._unconstrained_coverage_reason(
+                            coverage, params
+                        )
+            self._log_tension_alerts(seams, tiles)
 
             if reason is not None:
                 self.logger.warning(f"  Registration NOT APPLIED: {reason}")
@@ -7197,6 +7226,111 @@ class StitchingPipeline:
             return None
 
         return reject
+
+    def _center_out_approach(self) -> bool:
+        """True when the run assembles from the middle outward (`center_xy`)."""
+        return str(
+            getattr(self.config, "stitching_approach", "default") or "default"
+        ).strip().lower() in ("center_xy", "center xy", "center_xy_start")
+
+    def _groupwise_kwargs(self, tiles, index_map):
+        """Solver kwargs, with the gauge anchored at the centre for `center_xy`.
+
+        Anchoring is how "start in the middle and build outward" is expressed
+        WITHOUT placing tiles one at a time. The solve stays simultaneous — a
+        greedy walk would commit each tile from whichever neighbour it happened
+        to visit first, so a tile whose left and bottom neighbours disagree
+        could never satisfy both (see center_out for why BigStitcher does not do
+        that either). What the anchor changes is where the residual error piles
+        up: outward from the sample's middle, rather than outward from whichever
+        view the solver picked as its own reference.
+        """
+        kwargs = {
+            "abs_tol": self.config.global_opt_abs_tol,
+            "rel_tol": self.config.global_opt_rel_tol,
+        }
+        if not self._center_out_approach():
+            return kwargs
+        centre = center_out.centre_tile_index(list(tiles or []))
+        if centre is None:
+            return kwargs
+        # Solver nodes are POSITIONS in the (possibly held-out) subset that was
+        # registered, not tile indices. Translate, and drop the anchor entirely
+        # if the centre tile was one of the ones held out.
+        if index_map:
+            try:
+                node = list(index_map).index(centre)
+            except ValueError:
+                self.logger.info(
+                    "  Centre tile was held out of the registration, so the "
+                    "solve keeps its own reference view."
+                )
+                return kwargs
+        else:
+            node = centre
+        kwargs["reference_view"] = node
+        self.logger.info(
+            f"  Anchoring the solve at the centre tile "
+            f"{center_out.tile_label(tiles[centre], centre)} — corrections "
+            f"accumulate outward from the middle of the sample."
+        )
+        return kwargs
+
+    def _carry_deferred_tiles(self, params, tiles, coverage):
+        """Place every tile outside the registered core at its neighbours' mean.
+
+        The `default` approach hands each stranded component the mosaic's
+        MEDIAN correction, which keeps it from tearing but ignores where that
+        tile actually sits: on a mosaic whose corrections vary across the grid,
+        a rim tile still opens a gap against the specific neighbours it touches.
+        Carrying uses those neighbours instead, so the tile keeps exactly the
+        overlap the stage gave it and no black gap appears between any pair.
+        """
+        if not params or not coverage.components:
+            return params, None
+        core = coverage.components[0]
+        if len(core) >= len(tiles):
+            self.logger.info(
+                "  Centre-out: every tile registered — nothing to carry."
+            )
+            return params, None
+        try:
+            from .border_qc import find_neighbor_pairs
+
+            pairs = find_neighbor_pairs(tiles, include_z=False)
+        except Exception:
+            pairs = []
+        carry = center_out.carry_deferred_tiles(
+            params, len(tiles), core, pairs
+        )
+        self.logger.info(f"  Centre-out: {carry.describe(len(tiles))}")
+        if carry.orphans:
+            self.logger.warning(
+                f"  {len(carry.orphans)} tile(s) touch nothing that registered, "
+                f"so they moved with the mosaic as a whole. Their own placement "
+                f"is still unmeasured."
+            )
+        return carry.params, carry
+
+    def _log_tension_alerts(self, seams, tiles) -> None:
+        """ERROR per tile whose seams cannot all be satisfied. Never fatal.
+
+        The solve already did the best it could — this says which tiles paid for
+        it, so a doubled cell in the output can be traced to a named tile
+        instead of being hunted for.
+        """
+        try:
+            tolerance = float(
+                getattr(self.config, "global_opt_abs_tol", None)
+                or center_out.DEFAULT_TENSION_UM
+            )
+            messages = center_out.tension_alerts(
+                seams, list(tiles or []), tolerance_um=tolerance
+            )
+        except Exception:
+            return
+        for message in messages:
+            self.logger.error(f"  {message}")
 
     def _bind_unconstrained_tiles(self, params, coverage):
         """Move tiles nothing measured WITH the mosaic, instead of past it.
@@ -8515,10 +8649,9 @@ class StitchingPipeline:
                         # 2019).  Edges with residuals above abs_tol are
                         # removed (preserving graph connectivity) and the
                         # optimization re-runs.
-                        groupwise_resolution_kwargs={
-                            "abs_tol": self.config.global_opt_abs_tol,
-                            "rel_tol": self.config.global_opt_rel_tol,
-                        },
+                        groupwise_resolution_kwargs=self._groupwise_kwargs(
+                            [ti for _v, ti in tile_data], None
+                        ),
                     )
 
                 params = self._clamp_registration_shifts(
