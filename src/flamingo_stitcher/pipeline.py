@@ -75,6 +75,7 @@ SHAREABLE_CONFIG_FIELDS = (
     "downsample_z",
     "skip_registration",
     "stitching_approach",
+    "verbose_alignment_log",
     "registration_binning",
     "quality_threshold",
     "max_registration_shift_um",
@@ -897,6 +898,16 @@ class StitchingConfig:
     # rectangular grid, where the empty rim can never register and otherwise
     # both tears its seam with the core and sinks the seam-fraction guard.
     stitching_approach: str = "default"  # "default" | "center_xy"
+    # Log every tile's placement and every seam's measurement, in full.
+    #
+    # The summary report elides — five worst corrections, ten unused seams,
+    # "... and 32 more (see registration_seams.csv)" — which is the right length
+    # for a run that worked and the wrong one for a run that did not. Three runs
+    # in a row were diagnosed only by opening the CSVs, and the CSVs sit on the
+    # acquisition machine while the log is what gets shared. ON by default: it
+    # costs one line per tile and per adjacent pair, and the alternative is
+    # discovering after a 17-hour run that the evidence was truncated.
+    verbose_alignment_log: bool = True
     skip_registration: bool = False  # Use stage positions only (no phase correlation)
     reg_channel: int = 0  # Channel index to use for registration
     # Against NATIVE tiles: "z=2, xy=4" means half the raw planes and a quarter
@@ -3798,6 +3809,8 @@ class StitchingPipeline:
         # preview, streaming) while the report is written at the metadata step,
         # long after the params have been consumed by fusion.
         self._registration_report = None
+        self._alignment_carry = None
+        self._alignment_tiles = []
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -4100,6 +4113,13 @@ class StitchingPipeline:
             report, acquisition=acq_name
         ).splitlines():
             self.logger.info(line)
+        if getattr(self.config, "verbose_alignment_log", True):
+            for line in registration_report.format_verbose_alignment(
+                report,
+                labels=self._tile_labels(),
+                placement=self._tile_placement(),
+            ):
+                self.logger.info(line)
         for path in written.values():
             self.logger.info(f"  Wrote {path}")
 
@@ -6422,6 +6442,9 @@ class StitchingPipeline:
         self.logger.info(f"  Built {len(msims)} multiscale spatial images")
 
         tiles = [ti for _v, ti in tile_data]
+        # Kept so the verbose alignment tables can name tiles the way the
+        # operator does, long after tile_data has gone out of scope.
+        self._alignment_tiles = list(tiles)
         extent_um = self._frame_extent_um(tile_data, voxel_size_um)
 
         if len(msims) <= 1:
@@ -7227,6 +7250,32 @@ class StitchingPipeline:
 
         return reject
 
+    def _tile_labels(self):
+        """index -> ``X### Y###``, so the tables name tiles the way the
+        operator does. Every row would otherwise repeat the acquisition folder
+        name, which is identical for all 49 of them."""
+        try:
+            return {
+                index: center_out.tile_label(tile, index)
+                for index, tile in enumerate(self._alignment_tiles or [])
+            }
+        except Exception:
+            return {}
+
+    def _tile_placement(self):
+        """index -> how the tile got where it is: registered, carried (with the
+        ring it was reached in), or moved with the mosaic."""
+        carry = self._alignment_carry
+        if carry is None:
+            return {}
+        out = {index: "registered" for index in carry.core}
+        for index in carry.carried:
+            ring = carry.provenance.get(index, (0, []))[0]
+            out[index] = f"carried r{ring}"
+        for index in carry.orphans:
+            out[index] = "no neighbour"
+        return out
+
     def _center_out_approach(self) -> bool:
         """True when the run assembles from the middle outward (`center_xy`)."""
         return str(
@@ -7303,6 +7352,7 @@ class StitchingPipeline:
         carry = center_out.carry_deferred_tiles(
             params, len(tiles), core, pairs
         )
+        self._alignment_carry = carry
         self.logger.info(f"  Centre-out: {carry.describe(len(tiles))}")
         if carry.orphans:
             self.logger.warning(

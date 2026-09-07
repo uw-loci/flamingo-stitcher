@@ -1298,6 +1298,19 @@ class StitchingDialog(PersistentDialog):
         )
         reg_layout.addWidget(self._approach_combo, 4, 1, 1, 3)
 
+        self._verbose_align_cb = QCheckBox("Verbose alignment log")
+        self._verbose_align_cb.setChecked(True)
+        self._verbose_align_cb.setToolTip(
+            "Log every tile's placement and every seam's measurement, in full.\n\n"
+            "The summary report elides — five worst corrections, ten unused\n"
+            "seams, '... and 32 more (see registration_seams.csv)'. That is the\n"
+            "right length for a run that worked and the wrong length for one\n"
+            "that did not, and the CSVs live on this machine while the log is\n"
+            "what gets shared.\n\n"
+            "Costs one line per tile and one per adjacent pair."
+        )
+        reg_layout.addWidget(self._verbose_align_cb, 5, 0, 1, 4)
+
         self._z_snap_cb = QCheckBox("Snap Z shifts to whole planes")
         self._z_snap_cb.setChecked(True)
         self._z_snap_cb.setToolTip(
@@ -3142,6 +3155,7 @@ class StitchingDialog(PersistentDialog):
         config.registration_z_refine = self._z_refine_cb.isChecked()
         config.registration_z_snap_to_plane = self._z_snap_cb.isChecked()
         config.stitching_approach = self._approach_combo.currentData()
+        config.verbose_alignment_log = self._verbose_align_cb.isChecked()
         config.registration_z_refine_range_um = float(self._z_refine_range_spin.value())
         config.registration_report_enabled = self._reg_report_cb.isChecked()
         config.border_qc_enabled = self._border_qc_cb.isChecked()
@@ -3343,6 +3357,7 @@ class StitchingDialog(PersistentDialog):
             ("border_qc_enabled", self._border_qc_cb),
             ("registration_z_refine", self._z_refine_cb),
             ("registration_z_snap_to_plane", self._z_snap_cb),
+            ("verbose_alignment_log", self._verbose_align_cb),
             ("registration_report_enabled", self._reg_report_cb),
         ]
         for name, cb in check_fields:
@@ -5496,6 +5511,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
+        s.setValue("verbose_alignment", self._verbose_align_cb.isChecked())
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -5679,6 +5695,9 @@ class StitchingDialog(PersistentDialog):
         self._set_combo_by_data(
             self._approach_combo, s.value("stitching_approach", "default", type=str)
         )
+        self._verbose_align_cb.setChecked(
+            s.value("verbose_alignment", True, type=bool)
+        )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)
         )
@@ -5814,6 +5833,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
+        s.setValue("verbose_alignment", self._verbose_align_cb.isChecked())
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -5995,6 +6015,9 @@ class NativeStitchingDialog(StitchingDialog):
         self._z_snap_cb.setChecked(s.value("z_snap_to_plane", True, type=bool))
         self._set_combo_by_data(
             self._approach_combo, s.value("stitching_approach", "default", type=str)
+        )
+        self._verbose_align_cb.setChecked(
+            s.value("verbose_alignment", True, type=bool)
         )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)

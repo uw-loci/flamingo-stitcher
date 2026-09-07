@@ -153,6 +153,15 @@ registration:
   # optimises globally and drops irreconcilable links instead.
   approach: default
 
+  # Log every tile's placement and every seam's measurement, in full.
+  #
+  # The summary report elides (five worst corrections, ten unused seams,
+  # "... and N more"), which is the right length for a run that worked and the
+  # wrong one for a run that needs explaining — and the CSVs stay on the
+  # acquisition machine while the log is what gets shared. One line per tile and
+  # per adjacent pair.
+  verbose_alignment_log: true
+
   # Never place a tile BETWEEN two acquired Z planes.
   #
   # Fusion interpolates linearly, so a tile whose Z origin misses the output

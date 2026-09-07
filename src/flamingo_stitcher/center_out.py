@@ -124,6 +124,10 @@ class CarryResult:
     orphans: List[int] = field(default_factory=list)
     rounds: int = 0
     max_step_um: float = 0.0
+    # index -> (ring, [neighbour indices it was averaged from]). The ring says
+    # how far from registered ground a tile sits, which is the honest measure of
+    # how much its placement is worth.
+    provenance: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
 
     def describe(self, n_tiles: int) -> str:
         parts = [
@@ -194,8 +198,10 @@ def carry_deferred_tiles(
         result.rounds += 1
         updates: Dict[int, np.ndarray] = {}
         for index in ring:
-            sources = [translations[j] for j in adjacency[index] & placed]
+            from_indices = sorted(adjacency[index] & placed)
+            sources = [translations[j] for j in from_indices]
             updates[index] = np.mean(np.stack(sources, axis=0), axis=0)
+            result.provenance[index] = (result.rounds, from_indices)
         for index, value in updates.items():
             if index < len(result.params):
                 before = _translation(result.params[index])
@@ -219,6 +225,7 @@ def carry_deferred_tiles(
             axis=0,
         )
         for index in pending:
+            result.provenance[index] = (0, [])
             if index < len(result.params):
                 result.params[index] = _with_translation(
                     result.params[index], consensus

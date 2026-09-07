@@ -83,6 +83,7 @@ __all__ = [
     "skipped_report",
     "tile_rows_csv",
     "translation_from_param",
+    "format_verbose_alignment",
     "write_report",
 ]
 
@@ -1339,6 +1340,104 @@ def report_to_json(
 # Writing
 # ---------------------------------------------------------------------------
 
+
+
+def format_verbose_alignment(
+    report: RegistrationReport,
+    *,
+    labels: Optional[Mapping[int, str]] = None,
+    placement: Optional[Mapping[int, str]] = None,
+) -> List[str]:
+    """Every tile's placement and every seam's measurement, in full.
+
+    ``format_report_text`` summarises: five worst corrections, ten unused seams,
+    "... and 32 more (see registration_seams.csv)". That is the right length for
+    a run that worked. It is the wrong length for one that did not — three runs
+    in a row this week were diagnosed only by opening the CSVs, and the CSVs are
+    on the acquisition machine while the log is what gets pasted into a chat.
+
+    So this renders the same rows the CSVs carry, into the log, with nothing
+    elided. ``labels`` overrides the tile name per index (the grid label
+    ``X### Y###`` reads better than a repeated acquisition folder name);
+    ``placement`` adds how each tile got where it is, for the approaches that
+    place some tiles without registering them.
+
+    Note the residual column is ``residual_um``: multiview-stitcher's
+    ``edge_residuals`` are in physical units, and the CSV column calling them
+    ``residual_px`` is a misnomer kept for compatibility.
+    """
+
+    def _name(index: int, fallback: str) -> str:
+        if labels and index in labels:
+            return str(labels[index])
+        return fallback
+
+    def _num(value, spec: str = "8.2f") -> str:
+        try:
+            if value is None:
+                return " " * int(spec.split(".")[0])
+            return format(float(value), spec)
+        except (TypeError, ValueError):
+            return " " * int(spec.split(".")[0])
+
+    lines: List[str] = []
+    lines.append("=" * 71)
+    lines.append(" VERBOSE ALIGNMENT — every tile, every seam")
+    lines.append("=" * 71)
+
+    lines.append("")
+    lines.append(f" TILE PLACEMENT ({len(report.tiles)} tiles)")
+    header = (
+        f"  {'tile':<14} {'stage X':>8} {'stage Y':>8} "
+        f"{'dz µm':>8} {'dy µm':>8} {'dx µm':>8} "
+        f"{'dz fr':>7} {'dy px':>7} {'dx px':>7}  {'how':<10} note"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for tile in report.tiles:
+        how = (placement or {}).get(tile.index, "registered")
+        clamps = "".join(
+            axis
+            for axis, flag in (
+                ("Z", tile.clamped_z), ("Y", tile.clamped_y), ("X", tile.clamped_x)
+            )
+            if flag
+        )
+        note = tile.note or ""
+        if clamps:
+            # A clamped axis was NOT measured — say so on the row itself, not
+            # only in a legend nobody scrolls back to.
+            note = f"clamped {clamps} (kept stage position); {note}".rstrip("; ")
+        lines.append(
+            f"  {_name(tile.index, tile.name)[:14]:<14} "
+            f"{_num(tile.x_mm, '8.3f')} {_num(tile.y_mm, '8.3f')} "
+            f"{_num(tile.dz_um)} {_num(tile.dy_um)} {_num(tile.dx_um)} "
+            f"{_num(tile.dz_frames, '7.2f')} {_num(tile.dy_px, '7.2f')} "
+            f"{_num(tile.dx_px, '7.2f')}  {how:<10} {note}"
+        )
+
+    lines.append("")
+    lines.append(f" SEAM MEASUREMENTS ({len(report.seams)} adjacent pairs)")
+    header = (
+        f"  {'tile A':<14} {'tile B':<14} {'axis':<6} {'status':<18} "
+        f"{'qual':>6} {'dz µm':>8} {'dy µm':>8} {'dx µm':>8} "
+        f"{'resid µm':>9} {'ovl':>5}  note"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for seam in report.seams:
+        overlap = seam.overlap_frac
+        overlap_text = f"{overlap * 100:4.0f}%" if overlap is not None else "    -"
+        lines.append(
+            f"  {_name(seam.index_a, seam.tile_a)[:14]:<14} "
+            f"{_name(seam.index_b, seam.tile_b)[:14]:<14} "
+            f"{(seam.axis or ''):<6} {(seam.status or ''):<18} "
+            f"{_num(seam.quality, '6.2f')} "
+            f"{_num(seam.dz_um)} {_num(seam.dy_um)} {_num(seam.dx_um)} "
+            f"{_num(seam.residual_px, '9.2f')} {overlap_text}  {seam.note or ''}"
+        )
+    lines.append("=" * 71)
+    return lines
 
 def write_report(
     output_dir,

@@ -334,6 +334,38 @@ to disagree with. The tolerance is `global_opt_abs_tol`.
 pixels — it comes straight from multiview-stitcher's `edge_residuals`, which are
 physical units. The name is wrong; the numbers are µm.
 
+## 7f. The verbose alignment tables
+
+On by default (`registration.verbose_alignment_log`, GUI "Verbose alignment
+log", CLI `--no-verbose-alignment` to suppress). Two tables, after the summary
+report, with NOTHING elided — the summary shows five worst corrections and ten
+unused seams and then says "... and N more (see registration_seams.csv)", which
+is the wrong length exactly when a run needs explaining.
+
+    TILE PLACEMENT (25 tiles)
+      tile            stage X  stage Y    dz µm    dy µm    dx µm   dz fr   dy px   dx px  how        note
+      X001 Y001         0.100    0.100    10.00    -1.00     7.00    2.00   -0.50    3.50  registered
+      X000 Y000         0.000    0.000    10.00    -1.00     7.00    2.00   -0.50    3.50  carried r2
+
+    SEAM MEASUREMENTS (40 adjacent pairs)
+      tile A         tile B         axis   status               qual    dz µm    dy µm    dx µm  resid µm   ovl  note
+      X002 Y001      X003 Y001      x      registered           0.58    10.00    -5.00     3.00      0.00   14%
+      X001 Y001      X002 Y001      x      below_quality       -0.10                                        22%  below quality threshold 0.4
+
+How to read them:
+
+- **`how`** is where the placement came from: `registered`, `carried rN` (N is
+  how many rings out from registered ground — bigger means less evidence), or
+  `no neighbour` (moved with the mosaic, placement unmeasured). Only the
+  `center_xy` approach produces the carried/no-neighbour values.
+- **A clamped axis says so on its own row** (`clamped ZX (kept stage position)`).
+  A clamped axis was NOT measured — do not read its dz/dy/dx as a shift.
+- **`resid µm` is micrometres.** The seam CSV column is named `residual_px`,
+  which is a misnomer: multiview-stitcher's `edge_residuals` are physical units.
+- **`status`** is the seam's fate — see §7e for why `pruned` is not a failure.
+- A whole column of `no_content` down one edge of the grid is an empty rim, not
+  a registration problem. That is what `center_xy` exists for.
+
 ## 8. Reading the Border-QC report
 
 If enabled, the QC prints flagged seams worst-first. Each line looks like:

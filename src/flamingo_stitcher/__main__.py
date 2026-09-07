@@ -383,6 +383,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sub-plane upsampling for the Z-refine pass (default 10)",
     )
     reg_group.add_argument(
+        "--no-verbose-alignment",
+        dest="verbose_alignment_log",
+        action="store_false",
+        default=None,
+        help="Do not log the full per-tile placement and per-seam measurement "
+        "tables. They are on by default: the summary report elides, and the "
+        "CSVs are not what gets shared when a run needs explaining.",
+    )
+    reg_group.add_argument(
+        "--verbose-alignment",
+        dest="verbose_alignment_log",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    reg_group.add_argument(
         "--approach",
         choices=("default", "center_xy"),
         default=None,
@@ -818,6 +833,7 @@ def main():
         ("registration_z_refine_upsample", args.z_refine_upsample),
         ("registration_z_snap_to_plane", args.z_snap_to_plane),
         ("stitching_approach", args.approach),
+        ("verbose_alignment_log", args.verbose_alignment_log),
         ("registration_report_enabled", args.registration_report),
         ("registration_report_json", args.registration_report_json),
     ):
