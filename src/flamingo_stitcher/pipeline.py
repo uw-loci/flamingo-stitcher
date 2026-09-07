@@ -22,6 +22,7 @@ import numpy as np
 from flamingo_stitcher import (
     center_out,
     registration_report,
+    stage_geometry,
     tile_content,
     tile_geometry,
 )
@@ -52,6 +53,12 @@ MIN_REGISTRATION_OVERLAP_PX = 16
 # nothing had 9.6. 32 sits just under the width that is known to work, so the
 # binning stays as coarse (and registration as cheap) as the evidence allows.
 REGISTRATION_OVERLAP_TARGET_PX = 32
+
+# The Z step the default registration binning was tuned at. `z: 2` was chosen
+# against 10 µm planes, i.e. "register at ~20 µm effective Z" — so at a 2.5 µm
+# step the same NUMBER means a quarter of the physical resolution and four times
+# the correlated volume. The intent is physical; the binning is derived from it.
+REFERENCE_Z_STEP_UM = 10.0
 
 
 # StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
@@ -3812,6 +3819,7 @@ class StitchingPipeline:
         self._verbose_alignment_logged = False
         self._alignment_carry = None
         self._alignment_tiles = []
+        self._alignment_extent_um = None
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -6441,6 +6449,7 @@ class StitchingPipeline:
         # operator does, long after tile_data has gone out of scope.
         self._alignment_tiles = list(tiles)
         extent_um = self._frame_extent_um(tile_data, voxel_size_um)
+        self._alignment_extent_um = extent_um
 
         if len(msims) <= 1:
             self._registration_report = registration_report.skipped_report(
@@ -6520,7 +6529,7 @@ class StitchingPipeline:
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
                         registration_binning=self._effective_registration_binning(
-                            tile_data, tiles, extent_um
+                            tile_data, tiles, extent_um, voxel_size_um=voxel_size_um
                         ),
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=(
@@ -6719,7 +6728,7 @@ class StitchingPipeline:
             return {}
 
     def _effective_registration_binning(
-        self, tile_data, tiles, extent_um, configured=None
+        self, tile_data, tiles, extent_um, configured=None, voxel_size_um=None
     ):
         """Binning that keeps a usable overlap strip, rather than one that
         multiplies with the downsample already applied.
@@ -6771,7 +6780,18 @@ class StitchingPipeline:
         effective = dict(configured)
         if "z" in effective:
             want = max(1, int(effective["z"] or 1))
-            effective["z"] = max(1, int(round(want / (applied_z or 1.0))))
+            # Physical target, not a raw factor: `want` planes at the reference
+            # step is the Z resolution being asked for, so the binning is
+            # whatever reaches it on THIS acquisition's voxel. voxel_size_um is
+            # post-downsample, so this covers the Z downsample too and must not
+            # also divide by applied_z.
+            z_voxel = float((voxel_size_um or {}).get("z", 0.0) or 0.0)
+            if z_voxel > 0:
+                effective["z"] = max(
+                    1, int(round(want * REFERENCE_Z_STEP_UM / z_voxel))
+                )
+            else:
+                effective["z"] = max(1, int(round(want / (applied_z or 1.0))))
 
         thin = ""
         fractions = {}
@@ -6958,6 +6978,7 @@ class StitchingPipeline:
                         [ti for _v, ti in tile_data],
                         self._frame_extent_um(tile_data, voxel_size_um),
                         configured=self.config.registration_z_refine_binning,
+                        voxel_size_um=voxel_size_um,
                     ),
                     post_registration_do_quality_filter=True,
                     post_registration_quality_threshold=self.config.quality_threshold,
@@ -7275,6 +7296,36 @@ class StitchingPipeline:
             return
         for line in lines:
             self.logger.info(line)
+        self._log_stage_geometry(report)
+
+    def _log_stage_geometry(self, report) -> None:
+        """Regress the corrections against grid position and report the fit.
+
+        Measurement only — nothing is applied. A per-step disagreement between
+        stage and image is a calibration property if it repeats across
+        acquisitions, and a property of this sample if it does not, and one run
+        cannot tell those apart. Reporting it every run is what makes the
+        comparison possible.
+        """
+        try:
+            tiles = list(self._alignment_tiles or [])
+            if not tiles or report is None:
+                return
+            carry = self._alignment_carry
+            placed = sorted(carry.core) if carry is not None else None
+            pitch = {
+                axis: tile_geometry.median_pitch_um(tiles, axis)
+                for axis in ("x", "y")
+            }
+            geometry = stage_geometry.measure(
+                tiles, report.tiles, placed=placed, pitch_um=pitch
+            )
+            for line in stage_geometry.format_report(
+                geometry, frame_extent_um=self._alignment_extent_um
+            ):
+                self.logger.info(line)
+        except Exception as exc:  # a measurement must never fail a run
+            self.logger.warning(f"  Stage geometry not measured: {exc}")
 
     def _tile_labels(self):
         """index -> ``X### Y###``, so the tables name tiles the way the
@@ -8717,6 +8768,7 @@ class StitchingPipeline:
                             tile_data,
                             [ti for _v, ti in tile_data],
                             self._frame_extent_um(tile_data, voxel_size_um),
+                            voxel_size_um=voxel_size_um,
                         ),
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=self.config.quality_threshold,

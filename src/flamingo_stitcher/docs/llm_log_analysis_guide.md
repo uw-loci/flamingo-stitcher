@@ -380,6 +380,57 @@ How to read them:
 - A whole column of `no_content` down one edge of the grid is an empty rim, not
   a registration problem. That is what `center_xy` exists for.
 
+## 7g. STAGE GEOMETRY — measured, never applied
+
+Printed with the verbose alignment tables. Regresses each tile's registration
+correction against its grid position, so a per-step disagreement between where
+the stage went and where the image says it went shows up as a slope:
+
+    correction   vs      µm/step  % of pitch     R²   RMS µm  verdict
+    dy           row      -30.16      -1.65%   0.98     6.94  systematic
+    dx           row      +18.11      +0.99%   0.83    15.24  systematic
+    dz           col      +13.37      +0.73%   0.68    13.82  systematic
+    dx           col       +7.97      +0.44%   0.11    34.45  scattered
+    Implied Y overlap  16.4% (the layout assumes 15.0%)
+
+How to read it:
+
+- **`R²` decides, not the slope.** Below 0.5 the row says `scattered` and the
+  slope means nothing. On the 2026-09-06 7x7, reading ONE ROW of the tile table
+  suggested a clean 0.60% X scale error; fitted over all 34 registered tiles,
+  dx-vs-col came out at R² 0.11. A slope through scatter is not a finding.
+- **`dy` vs `row` / `dx` vs `col`** are scale (pitch) errors — the stage step and
+  the image disagree about how far a tile moved.
+- **`dx` vs `row` / `dy` vs `col`** are shear — the grid is not square to the
+  camera.
+- **`dz` vs col/row** is tilt — the stage is not level across the mosaic.
+- Carried tiles are excluded: a carried tile's correction IS its neighbours'
+  average, so including it would fit the model to its own output.
+
+**Nothing is applied.** One acquisition cannot separate a stage property from a
+sample-shaped effect. The numbers have to reproduce across several runs on the
+SAME microscope before anyone corrects with them — a model fitted to one slice
+and applied to the next is how registration made a mosaic worse in v0.11.2.
+
+If it does reproduce, it is worth fixing at the source: 1.65% of a 1823 µm pitch
+is ~400 px of drift across a 14x14 grid, and registration currently spends hours
+per run rediscovering it.
+
+## 7h. Registration binning follows the physical Z step
+
+`registration_binning`'s `z` is a physical target, not a raw factor: `z: 2` was
+tuned against 10 µm planes and means "register at ~20 µm effective Z". The
+binning is derived from that against the acquisition's own voxel, because the
+same number at a finer step would silently multiply the cost:
+
+    10.0 µm step, z bin 2 -> 20.0 µm effective,  321 planes correlated  1.0x
+     2.5 µm step, z bin 2 ->  5.0 µm effective, 1286 planes correlated  4.0x
+     2.5 µm step, z bin 8 -> 20.0 µm effective,  321 planes correlated  1.0x
+
+A 4x-finer Z sampling would otherwise turn an 8h48m registration into ~35 hours
+for axial resolution nobody asked for. `voxel_size_um` is already
+post-downsample, so the Z downsample is counted once, here — not again.
+
 ## 8. Reading the Border-QC report
 
 If enabled, the QC prints flagged seams worst-first. Each line looks like:

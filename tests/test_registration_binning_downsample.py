@@ -63,15 +63,21 @@ def _extent(downsample_xy):
     return {"x": NATIVE * 1.0475, "y": NATIVE * 1.0475, "z": PLANES * 10.0}
 
 
-def _binning(config, downsample_xy, downsample_z=1, caplog=None):
+def _binning(config, downsample_xy, downsample_z=1, caplog=None, z_um=10.0):
     pipe = StitchingPipeline(config)
     td = _tile_data(downsample_xy, downsample_z)
     tiles = [ti for _v, ti in td]
     ctx = caplog.at_level(logging.INFO, logger=pipe.logger.name) if caplog else None
     if ctx:
         with ctx:
-            return pipe._effective_registration_binning(td, tiles, _extent(downsample_xy))
-    return pipe._effective_registration_binning(td, tiles, _extent(downsample_xy))
+            return pipe._effective_registration_binning(
+        td, tiles, _extent(downsample_xy),
+        voxel_size_um={"z": z_um * downsample_z, "y": 1.0475, "x": 1.0475},
+    )
+    return pipe._effective_registration_binning(
+        td, tiles, _extent(downsample_xy),
+        voxel_size_um={"z": z_um * downsample_z, "y": 1.0475, "x": 1.0475},
+    )
 
 
 class TestItStopsMultiplying:
@@ -177,3 +183,31 @@ class TestDoesNotKillTheRun:
         td = _tile_data(8)
         out = pipe._effective_registration_binning(td, [ti for _v, ti in td], None)
         assert out["x"] == 1
+
+
+class TestZBinningFollowsThePhysicalStep:
+    """`z: 2` was tuned at a 10 um step — it means "~20 um effective Z".
+
+    A 2.5 um acquisition (the 4x-in-Z runs) would otherwise correlate four times
+    the volume for a quarter of the physical resolution nobody asked for,
+    turning an 8h48m registration into ~35 hours.
+    """
+
+    def test_the_reference_step_is_unchanged(self):
+        assert _binning(StitchingConfig(), 1, z_um=10.0)["z"] == 2
+
+    def test_a_finer_step_bins_harder_to_hold_the_same_resolution(self):
+        assert _binning(StitchingConfig(), 1, z_um=2.5)["z"] == 8
+
+    def test_every_step_lands_on_the_same_effective_resolution(self):
+        for z_um in (1.0, 2.0, 2.5, 5.0, 10.0):
+            b = _binning(StitchingConfig(), 1, z_um=z_um)["z"]
+            assert z_um * b == pytest.approx(20.0, rel=0.25), (z_um, b)
+
+    def test_a_coarse_step_never_bins_below_one(self):
+        assert _binning(StitchingConfig(), 1, z_um=40.0)["z"] == 1
+
+    def test_the_z_downsample_is_counted_once(self):
+        """voxel_size_um is already post-downsample, so dividing by the applied
+        factor as well would double-count it."""
+        assert _binning(StitchingConfig(), 1, downsample_z=2, z_um=10.0)["z"] == 1
