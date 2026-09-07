@@ -3809,6 +3809,7 @@ class StitchingPipeline:
         # preview, streaming) while the report is written at the metadata step,
         # long after the params have been consumed by fusion.
         self._registration_report = None
+        self._verbose_alignment_logged = False
         self._alignment_carry = None
         self._alignment_tiles = []
         # Streaming-mode flat-field models {ch_id: model}. Populated by
@@ -4113,13 +4114,7 @@ class StitchingPipeline:
             report, acquisition=acq_name
         ).splitlines():
             self.logger.info(line)
-        if getattr(self.config, "verbose_alignment_log", True):
-            for line in registration_report.format_verbose_alignment(
-                report,
-                labels=self._tile_labels(),
-                placement=self._tile_placement(),
-            ):
-                self.logger.info(line)
+        self._log_verbose_alignment(report)
         for path in written.values():
             self.logger.info(f"  Wrote {path}")
 
@@ -6658,6 +6653,7 @@ class StitchingPipeline:
             )
             self._log_z_coverage(params, tile_data, voxel_size_um)
             self.logger.info("  Registration complete")
+            self._log_verbose_alignment()
             return params, "registered"
 
         except Exception as e:
@@ -7249,6 +7245,36 @@ class StitchingPipeline:
             return None
 
         return reject
+
+    def _log_verbose_alignment(self, report=None) -> None:
+        """Print the full alignment tables — once, and as early as possible.
+
+        These are written for someone deciding whether a run is worth its
+        remaining hours. Emitting them with the rest of the report means
+        emitting them after Step 6: on the 49-tile run of 2026-09-06 that put
+        the alignment evidence at hour 17, eight hours after the fuse it should
+        have informed. So registration calls this the moment it has an answer,
+        and the end-of-run report skips it if it already went out.
+        """
+        if not getattr(self.config, "verbose_alignment_log", True):
+            return
+        if getattr(self, "_verbose_alignment_logged", False):
+            return
+        report = report if report is not None else self._registration_report
+        if report is None:
+            return
+        self._verbose_alignment_logged = True
+        try:
+            lines = registration_report.format_verbose_alignment(
+                report,
+                labels=self._tile_labels(),
+                placement=self._tile_placement(),
+            )
+        except Exception as exc:  # evidence must never fail a run
+            self.logger.warning(f"  Verbose alignment tables skipped: {exc}")
+            return
+        for line in lines:
+            self.logger.info(line)
 
     def _tile_labels(self):
         """index -> ``X### Y###``, so the tables name tiles the way the

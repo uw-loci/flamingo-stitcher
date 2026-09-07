@@ -171,47 +171,72 @@ class TestCarryingTheRim:
 
 
 class TestTensionAlerts:
-    """The L-shape: left and bottom neighbours disagree about one tile."""
+    """The L-shape: a tile whose overlaps cannot all be honoured."""
 
     @staticmethod
-    def _seam(a, b, residual, status="registered"):
+    def _seam(a, b, residual=None, status="registered"):
         return SimpleNamespace(
             index_a=a, index_b=b, residual_px=residual, status=status
         )
 
-    def test_a_tile_whose_seams_disagree_is_named(self):
+    def test_a_tile_that_lost_a_measured_overlap_is_named(self):
+        """The signal that actually occurs. multiview-stitcher's global
+        optimisation loops until max residual < abs_tol, dropping the worst
+        edge each round, so a kept edge is under tolerance BY CONSTRUCTION —
+        thresholding kept edges cannot fire. The real 7x7 had 11 pruned seams
+        and 1 implausible, and the residual test printed nothing."""
         tiles = _grid()
-        seams = [self._seam(10, 11, 0.4), self._seam(11, 18, 9.2)]
+        seams = [self._seam(10, 11), self._seam(11, 18, status="pruned")]
         messages = center_out.tension_alerts(seams, tiles, tolerance_um=3.5)
         assert len(messages) == 1
         assert "not able to resolve all overlaps for tile" in messages[0]
         assert "X004 Y001" in messages[0]  # tile 11 = col 4, row 1
+
+    def test_an_implausible_shift_counts_as_a_lost_overlap(self):
+        tiles = _grid()
+        seams = [
+            self._seam(10, 11),
+            self._seam(11, 18, status="implausible_shift"),
+        ]
+        assert len(center_out.tension_alerts(seams, tiles)) == 1
+
+    def test_a_tile_with_no_registered_seam_is_not_in_tension(self):
+        """Nothing was honoured for it, so nothing was traded off — that is the
+        rim, and carrying handles it."""
+        tiles = _grid()
+        seams = [self._seam(10, 11, status="pruned")]
+        assert center_out.tension_alerts(seams, tiles) == []
+
+    def test_a_tile_whose_overlaps_were_all_honoured_is_silent(self):
+        tiles = _grid()
+        seams = [self._seam(10, 11), self._seam(11, 18)]
+        assert center_out.tension_alerts(seams, tiles, tolerance_um=3.5) == []
+
+    def test_a_large_residual_still_triggers_for_solvers_that_do_not_prune(self):
+        """shortest_paths returns whatever the path gives, with no tolerance
+        loop, so the residual test can still catch something there."""
+        tiles = _grid()
+        seams = [self._seam(10, 11, 0.4), self._seam(11, 18, 9.2)]
+        messages = center_out.tension_alerts(seams, tiles, tolerance_um=3.5)
+        assert len(messages) == 1
         assert "9.2" in messages[0]
 
     def test_one_seam_is_never_a_disagreement(self):
-        """With a single neighbour there is nothing to be inconsistent with."""
         tiles = _grid()
-        seams = [self._seam(10, 11, 99.0)]
-        assert center_out.tension_alerts(seams, tiles, tolerance_um=3.5) == []
+        assert center_out.tension_alerts(
+            [self._seam(10, 11, 99.0)], tiles, tolerance_um=3.5
+        ) == []
 
-    def test_seams_within_tolerance_are_silent(self):
+    def test_below_quality_is_not_a_lost_overlap(self):
+        """It was never measured, so there was nothing to honour."""
         tiles = _grid()
-        seams = [self._seam(10, 11, 0.4), self._seam(11, 18, 1.1)]
-        assert center_out.tension_alerts(seams, tiles, tolerance_um=3.5) == []
-
-    def test_unregistered_seams_do_not_count(self):
-        tiles = _grid()
-        seams = [
-            self._seam(10, 11, 40.0, status="below_quality"),
-            self._seam(11, 18, 40.0, status="pruned"),
-        ]
-        assert center_out.tension_alerts(seams, tiles, tolerance_um=3.5) == []
+        seams = [self._seam(10, 11), self._seam(11, 18, status="below_quality")]
+        assert center_out.tension_alerts(seams, tiles) == []
 
     def test_multi_acquisition_tiles_are_named_by_position(self):
-        """Folder-layout tiles have no grid index; position is their identity."""
         tiles = _grid(indexed=False)
-        seams = [self._seam(10, 11, 0.4), self._seam(11, 18, 9.2)]
-        messages = center_out.tension_alerts(seams, tiles, tolerance_um=3.5)
+        seams = [self._seam(10, 11), self._seam(11, 18, status="pruned")]
+        messages = center_out.tension_alerts(seams, tiles)
         assert len(messages) == 1
         assert "X=" in messages[0] and "Y=" in messages[0]
 

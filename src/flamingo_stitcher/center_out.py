@@ -240,49 +240,87 @@ def tension_alerts(
     tolerance_um: float = DEFAULT_TENSION_UM,
     label_fn: Optional[Callable[[object, int], str]] = None,
 ) -> List[str]:
-    """One message per tile whose registered seams cannot all be satisfied.
+    """One message per tile whose overlaps could not all be honoured.
 
-    A tile with a single seam has nothing to disagree with, so it is never
-    reported — the residual there is a property of that one measurement, not a
-    conflict. Two or more, and a residual over tolerance means the solve had to
-    choose: this is the L-shape case, where satisfying the left neighbour puts
-    the bottom one out of register.
+    The obvious test — "a registered seam with a big residual" — cannot fire.
+    multiview-stitcher's global optimisation loops until
+    ``max_residuals[-1] < abs_tol`` (global_optimization.py:423), dropping the
+    worst edge each round, so EVERY surviving edge is under that tolerance by
+    construction. Thresholding kept edges at abs_tol is thresholding at the
+    number the solver already guaranteed. The first real run proved it: 11
+    pruned seams, 1 implausible, and not one alert.
 
-    Returns the messages rather than logging them, so the caller decides the
-    level and the tests can read them.
+    Tension shows up as a seam that was MEASURED and then not used. A tile with
+    at least one registered seam and at least one measured-but-unused seam is
+    exactly "we know where this tile sits relative to that neighbour, and the
+    placement we chose does not honour it" — the L-shape, in the data.
+
+    The residual test is kept as a second trigger for solvers that do not prune
+    to a tolerance (shortest_paths returns whatever the path gives), where it
+    can still catch something.
+
+    Returns the messages rather than logging them, so the caller picks the level
+    and the tests can read them.
     """
     label_fn = label_fn or tile_label
-    per_tile: Dict[int, List[float]] = {}
+    # Measured, then discarded by the solve. STATUS_PRUNED survived the quality
+    # filter and lost to edge pruning; implausible_shift passed quality and was
+    # refused on geometry. Both mean: this overlap was measurable and is not
+    # reflected in where the tile ended up.
+    unused_measured = ("pruned", "implausible_shift")
+
+    # Counted separately from the residuals: a registered seam whose residual
+    # the solver did not report still counts as an overlap that WAS honoured.
+    kept: Dict[int, int] = {}
+    residuals: Dict[int, List[float]] = {}
+    dropped: Dict[int, int] = {}
     for seam in seams or []:
-        if getattr(seam, "status", None) != "registered":
-            continue
-        residual = getattr(seam, "residual_px", None)  # micrometres, see module doc
-        if residual is None:
-            continue
-        try:
-            residual = float(residual)
-        except (TypeError, ValueError):
-            continue
-        for index in (getattr(seam, "index_a", None), getattr(seam, "index_b", None)):
-            if index is None:
-                continue
-            per_tile.setdefault(int(index), []).append(residual)
+        status = getattr(seam, "status", None)
+        indices = [
+            index
+            for index in (
+                getattr(seam, "index_a", None), getattr(seam, "index_b", None)
+            )
+            if index is not None
+        ]
+        if status == "registered":
+            residual = getattr(seam, "residual_px", None)  # µm, see module doc
+            try:
+                residual = float(residual) if residual is not None else None
+            except (TypeError, ValueError):
+                residual = None
+            for index in indices:
+                kept[int(index)] = kept.get(int(index), 0) + 1
+                if residual is not None:
+                    residuals.setdefault(int(index), []).append(residual)
+        elif status in unused_measured:
+            for index in indices:
+                dropped[int(index)] = dropped.get(int(index), 0) + 1
 
     messages: List[str] = []
-    for index in sorted(per_tile):
-        residuals = per_tile[index]
-        if len(residuals) < 2:
+    for index in sorted(set(kept) | set(dropped)):
+        n_kept = kept.get(index, 0)
+        n_dropped = dropped.get(index, 0)
+        seen = residuals.get(index, [])
+        worst = max(seen) if seen else None
+
+        by_drop = n_kept >= 1 and n_dropped >= 1
+        by_residual = len(seen) >= 2 and worst is not None and worst > tolerance_um
+        if not (by_drop or by_residual):
             continue
-        worst = max(residuals)
-        if worst <= tolerance_um:
-            continue
+
         tile = tiles[index] if 0 <= index < len(tiles) else None
         label = label_fn(tile, index) if tile is not None else f"tile {index}"
+        detail = (
+            f"{n_dropped} of its measured overlaps could not be honoured "
+            f"alongside the {n_kept} that were"
+            if by_drop
+            else f"worst residual {worst:.1f} µm over {len(seen)} seams "
+            f"(tolerance {tolerance_um:.1f} µm)"
+        )
         messages.append(
-            f"not able to resolve all overlaps for tile {label} — "
-            f"{len(residuals)} registered seams, worst residual {worst:.1f} µm "
-            f"(tolerance {tolerance_um:.1f} µm). Its neighbours disagree about "
-            f"where it goes; the solve satisfied them as far as it could and "
-            f"this tile carries the remainder."
+            f"not able to resolve all overlaps for tile {label} — {detail}. "
+            f"Its neighbours disagree about where it goes; the solve satisfied "
+            f"them as far as it could and this tile carries the remainder."
         )
     return messages

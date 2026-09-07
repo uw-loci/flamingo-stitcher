@@ -320,15 +320,25 @@ links at once and drop the worst link when its residual exceeds tolerance (only
 when removing it keeps the graph connected), and multiview-stitcher implements
 the same thing as `global_optimization`.
 
-Tiles where the disagreement survives the solve are named, non-fatally:
+Tiles whose overlaps could not all be honoured are named, non-fatally:
 
-    ERROR   not able to resolve all overlaps for tile X004 Y001 — 2 registered
-    seams, worst residual 9.2 um (tolerance 3.5 um). ...
+    ERROR   not able to resolve all overlaps for tile X004 Y001 — 1 of its
+    measured overlaps could not be honoured alongside the 2 that were. ...
+
+The trigger is a tile with at least one REGISTERED seam and at least one
+MEASURED-BUT-UNUSED one (`pruned` or `implausible_shift`). It is deliberately
+not "a registered seam with a large residual": `global_optimization` loops until
+`max_residuals[-1] < abs_tol`, dropping the worst edge each round
+(global_optimization.py:423), so every surviving edge is under that tolerance BY
+CONSTRUCTION and thresholding kept edges cannot fire. The 49-tile run of
+2026-09-06 had 11 pruned seams and 1 implausible and printed nothing under the
+old rule. A residual test is kept as a second trigger for `shortest_paths`,
+which has no such tolerance loop.
 
 `X### Y###` comes from the flat filename's grid index; folder-layout
 (multi-acquisition) tiles have no index and are named by stage position instead.
-A tile with only ONE registered seam is never reported — there is nothing for it
-to disagree with. The tolerance is `global_opt_abs_tol`.
+A tile with no registered seam is never reported — nothing was honoured for it,
+so nothing was traded off; that is the rim, and carrying handles it.
 
 **Units trap:** the seam CSV's `residual_px` column is in MICROMETRES, not
 pixels — it comes straight from multiview-stitcher's `edge_residuals`, which are
@@ -337,8 +347,12 @@ physical units. The name is wrong; the numbers are µm.
 ## 7f. The verbose alignment tables
 
 On by default (`registration.verbose_alignment_log`, GUI "Verbose alignment
-log", CLI `--no-verbose-alignment` to suppress). Two tables, after the summary
-report, with NOTHING elided — the summary shows five worst corrections and ten
+log", CLI `--no-verbose-alignment` to suppress). Two tables, printed the moment
+REGISTRATION finishes — before fusion, not with the end-of-run report, because
+these are written for someone deciding whether a run is worth its remaining
+hours. (On the 2026-09-06 run, emitting them with the report would have put the
+evidence at hour 17, eight hours after the fuse it should have informed.)
+Nothing is elided — the summary shows five worst corrections and ten
 unused seams and then says "... and N more (see registration_seams.csv)", which
 is the wrong length exactly when a run needs explaining.
 
