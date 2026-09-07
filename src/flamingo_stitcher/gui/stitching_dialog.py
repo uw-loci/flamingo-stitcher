@@ -2532,11 +2532,34 @@ class StitchingDialog(PersistentDialog):
         self._log_group.setVisible(checked)
         self._log_toggle.setText(("▼ " if checked else "▶ ") + "Log")
 
-    # The Log pane is entirely user-controlled: its open/closed state is
-    # persisted (QSettings "log_expanded", default closed) and restored on
-    # launch. A run no longer force-opens it — auto-opening pushed the always-
-    # visible Progress section off small screens and overrode the remembered
-    # preference. Progress is shown by the phase pills below regardless.
+    def _focus_log_for_run(self):
+        """Hand the window over to the log once a run starts.
+
+        Before a run the screen belongs to the settings; once the run is going
+        those settings are locked anyway and what matters is the output. So the
+        log opens and the Processing Options pane closes.
+
+        Closing Processing Options is not decoration — it is what makes the
+        auto-open safe. Opening the log used to push the always-visible
+        Progress section off small screens (dbe3d43 removed the auto-open for
+        exactly that reason, and because it overrode a remembered preference).
+        The remembered preference is gone now: the pane always starts closed.
+        And taking the log's height back from the settings pane instead of from
+        the bottom of the window keeps Progress where it was.
+
+        Both panes stay user-controlled — this sets a starting point for the
+        run, it does not hold them there. Re-opening Processing Options to
+        queue more work works exactly as before.
+        """
+        self._proc_toggle.setChecked(False)
+        self._log_toggle.setChecked(True)
+        # One resize after both, so the window is not sized against a
+        # half-applied state.
+        self.updateGeometry()
+        if self.layout() is not None:
+            self.layout().activate()
+        self.resize(self.width(), self.sizeHint().height())
+
 
     def _set_config_controls_enabled(self, enabled: bool):
         """Enable/disable every config control as a unit for run locking.
@@ -3642,6 +3665,9 @@ class StitchingDialog(PersistentDialog):
         # risky for any queue item. User must accept to proceed.
         if not self._confirm_resource_headroom(pending, config):
             return
+
+        # Past every pre-flight: this run is definitely starting.
+        self._focus_log_for_run()
 
         self._log_text.clear()
         self._reset_step_progress()
@@ -5515,7 +5541,6 @@ class StitchingDialog(PersistentDialog):
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
-        s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
         s.setValue("bg_zero_expanded", self._bg_zero_panel.expanded())
         s.setValue(
@@ -5707,7 +5732,9 @@ class StitchingDialog(PersistentDialog):
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
-        self._log_toggle.setChecked(s.value("log_expanded", False, type=bool))
+        # Always closed for a new run: the settings get the window until
+        # there is output worth reading. _focus_log_for_run opens it.
+        self._log_toggle.setChecked(False)
 
         bg_zero_enabled = s.value("bg_zero_enabled", False, type=bool)
         self._bg_zero_panel.set_enabled_state(bg_zero_enabled)
@@ -5837,7 +5864,6 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
-        s.setValue("log_expanded", self._log_toggle.isChecked())
         s.setValue("bg_zero_enabled", self._bg_zero_panel.is_enabled())
         s.setValue("bg_zero_expanded", self._bg_zero_panel.expanded())
         s.setValue(
@@ -6028,7 +6054,9 @@ class NativeStitchingDialog(StitchingDialog):
 
         proc_expanded = s.value("proc_options_expanded", False, type=bool)
         self._proc_toggle.setChecked(proc_expanded)
-        self._log_toggle.setChecked(s.value("log_expanded", False, type=bool))
+        # Always closed for a new run: the settings get the window until
+        # there is output worth reading. _focus_log_for_run opens it.
+        self._log_toggle.setChecked(False)
 
         bg_zero_enabled = s.value("bg_zero_enabled", False, type=bool)
         self._bg_zero_panel.set_enabled_state(bg_zero_enabled)
