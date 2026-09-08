@@ -83,6 +83,16 @@ SHAREABLE_CONFIG_FIELDS = (
     "skip_registration",
     "stitching_approach",
     "verbose_alignment_log",
+    "fusion_superblock_target_gb",
+    "fusion_superblock_chunks",
+    "max_memory_gb",
+    "resource_guard_enabled",
+    "resource_guard_ram_fraction",
+    "resource_guard_disk_fraction",
+    "auto_output_chunksize",
+    "destripe_output_axis",
+    "deconvolution_fast",
+    "deconvolution_psf_path",
     "registration_binning",
     "quality_threshold",
     "max_registration_shift_um",
@@ -5374,7 +5384,8 @@ class StitchingPipeline:
                         f"×{superblock}-chunk regions to bound streaming fuse "
                         f"memory (target ~"
                         f"{float(self.config.fusion_superblock_target_gb):g} "
-                        f"GB/region). Set 'Fusion super-block chunks' to override."
+                        f"GB/region). Change with 'Fusion region size' in Processing "
+                        f"Options, --fusion-region-gb, or memory.fusion_region_gb."
                     )
 
                 # Both names always exist so the shared cleanup below can `del`

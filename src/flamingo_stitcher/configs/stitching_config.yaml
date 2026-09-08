@@ -250,6 +250,10 @@ illumination_fusion: "max"
 # Output format
 # ============================================================
 output:
+  # Let the writer size output chunks from the final grid rather than using the
+  # configured chunk size verbatim. Keeps a fused block near one tile pitch, so
+  # a heavy downsample still saves memory.
+  auto_chunksize: true
   # Output file format.
   # "ome-zarr-sharded" — Zarr v3 + OME-NGFF v0.5 with sharding (napari)
   # "ome-zarr-v2"      — Zarr v2 + OME-NGFF v0.4 (Fiji/QuPath/BDV/napari)
@@ -351,6 +355,9 @@ pyramid:
 # Preprocessing: destriping
 # ============================================================
 destripe:
+  # Stripe direction in the OUTPUT frame: "horizontal" or "vertical". Derived
+  # from tile orientation when left alone; set it when the derivation is wrong.
+  output_axis: horizontal
   # PyStripe wavelet decomposition parameters.
   # These control which spatial frequency bands of stripe artifacts
   # are removed. The filter operates per-plane in the Fourier domain.
@@ -400,6 +407,14 @@ flat_field:
 # Deconvolution
 # ============================================================
 deconvolution:
+  # Deconvolve the downsampled, already-fused tile instead of at native
+  # resolution — faster, and a quality trade-off, like destripe's `fast`.
+  fast: false
+
+  # A measured PSF file to use instead of the generated one below. null =
+  # generate from the psf: parameters. Until v0.12.2 there was no way to supply
+  # one without editing Python.
+  psf_path: null
   # Deconvolution engine.
   # "pycudadecon" — GPU-accelerated Richardson-Lucy (CUDA required)
   # "redlionfish" — CPU/GPU Richardson-Lucy via scikit-image
@@ -474,6 +489,25 @@ memory:
   # true  — always use streaming (low memory, may be slower)
   # false — always use in-memory (fast, requires data to fit in RAM)
   streaming_mode: null
+
+  # How much of the output is fused at a time, when streaming (GB).
+  #
+  # The whole-output fuse lets dask's threaded scheduler hold far more than
+  # n_workers blocks in flight — 127 GB on a 623 GB output — which the memory
+  # estimate does not model. Fusing in regions bounds that, at the cost of
+  # re-fusing each region's boundary: a 49-tile run fused in 81 regions.
+  #
+  # 4 was chosen against a machine that ran out of memory. On a large-RAM
+  # system a bigger region should be faster; by how much has NOT been measured.
+  # 0 restores the unbounded whole-output path.
+  fusion_region_gb: 4.0
+
+  # Explicit region size in output chunks per axis, overriding the GB target
+  # above. 0 = derive from fusion_region_gb.
+  fusion_superblock_chunks: 0
+
+  # Hard ceiling on the in-memory path, GB. null = derive from system RAM.
+  max_memory_gb: null
 
   # Auto-streaming threshold: fraction of system RAM.
   # If estimated peak memory exceeds this fraction of total RAM,
@@ -557,3 +591,16 @@ isolated_timeouts:
   # Timeout for Leonardo illumination fusion (seconds).
   # Very large volumes may exceed the default 20 minutes.
   leonardo_fusion: 1200
+
+
+# Pre-flight refusal when a run would not fit. This is what decides whether a
+# long run is allowed to START, rather than dying on disk hours in — so the
+# fractions are the margin you are willing to run against, not a tuning knob.
+resource_guard:
+  enabled: true
+  # Refuse when projected peak RAM exceeds this share of what is available.
+  ram_fraction: 0.95
+  # Refuse when output + scratch exceeds this share of free disk. A 4x-in-Z
+  # run at ~2.5 TB against 3230 GB free is a 78% fill: inside 0.95, but with
+  # no room for a second queued acquisition.
+  disk_fraction: 0.95

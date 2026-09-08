@@ -448,6 +448,35 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
     mem = cfg.get("memory", {})
     if mem.get("streaming_mode") is not None:
         config_obj.streaming_mode = mem["streaming_mode"]
+    # 0.0 means "whole output", a real choice, so test for presence.
+    if mem.get("fusion_region_gb") is not None:
+        config_obj.fusion_superblock_target_gb = float(mem["fusion_region_gb"])
+    if mem.get("fusion_superblock_chunks") is not None:
+        config_obj.fusion_superblock_chunks = int(mem["fusion_superblock_chunks"])
+    if mem.get("max_memory_gb") is not None:
+        config_obj.max_memory_gb = float(mem["max_memory_gb"])
+
+    guard = cfg.get("resource_guard", {}) or {}
+    if guard.get("enabled") is not None:
+        config_obj.resource_guard_enabled = bool(guard["enabled"])
+    if guard.get("ram_fraction") is not None:
+        config_obj.resource_guard_ram_fraction = float(guard["ram_fraction"])
+    if guard.get("disk_fraction") is not None:
+        config_obj.resource_guard_disk_fraction = float(guard["disk_fraction"])
+
+    out = cfg.get("output", {}) or {}
+    if out.get("auto_chunksize") is not None:
+        config_obj.auto_output_chunksize = bool(out["auto_chunksize"])
+
+    dstr = cfg.get("destripe", {}) or {}
+    if dstr.get("output_axis") is not None:
+        config_obj.destripe_output_axis = str(dstr["output_axis"])
+
+    dec = cfg.get("deconvolution", {}) or {}
+    if dec.get("fast") is not None:
+        config_obj.deconvolution_fast = bool(dec["fast"])
+    if dec.get("psf_path") is not None:
+        config_obj.deconvolution_psf_path = str(dec["psf_path"])
 
     # Hardware config for optics-dependent defaults
     hw = get_hardware_config()

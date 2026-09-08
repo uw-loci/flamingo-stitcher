@@ -383,6 +383,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sub-plane upsampling for the Z-refine pass (default 10)",
     )
     reg_group.add_argument(
+        "--fusion-region-gb",
+        type=float,
+        default=None,
+        metavar="GB",
+        help="How much output to fuse at a time when streaming (default 4). "
+        "Regions bound the fuse graph's memory, but each one re-fuses its "
+        "boundary, so a large mosaic pays that overhead many times (a 49-tile "
+        "run fused in 81 regions). 0 restores the unbounded whole-output path.",
+    )
+    reg_group.add_argument(
         "--no-verbose-alignment",
         dest="verbose_alignment_log",
         action="store_false",
@@ -834,6 +844,7 @@ def main():
         ("registration_z_snap_to_plane", args.z_snap_to_plane),
         ("stitching_approach", args.approach),
         ("verbose_alignment_log", args.verbose_alignment_log),
+        ("fusion_superblock_target_gb", args.fusion_region_gb),
         ("registration_report_enabled", args.registration_report),
         ("registration_report_json", args.registration_report_json),
     ):

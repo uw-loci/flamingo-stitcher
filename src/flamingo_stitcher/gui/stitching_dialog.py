@@ -1369,6 +1369,31 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._chunk_size_combo, 5, 1, 1, 3)
 
+        # Proc Row 6: how much output is fused at a time when streaming.
+        proc_layout.addWidget(QLabel("Fusion region size:"), 6, 0)
+        self._fusion_region_combo = QComboBox()
+        for _label, _gb in (
+            ("Auto \u2014 ~4 GB regions (default)", 4.0),
+            ("Auto \u2014 ~8 GB regions", 8.0),
+            ("Auto \u2014 ~16 GB regions", 16.0),
+            ("Auto \u2014 ~32 GB regions", 32.0),
+            ("Whole output (no regions)", 0.0),
+        ):
+            self._fusion_region_combo.addItem(_label, _gb)
+        self._fusion_region_combo.setToolTip(
+            "How much of the output is fused at a time, when streaming.\n\n"
+            "The whole-output fuse lets dask's threaded scheduler hold far\n"
+            "more than n_workers blocks in flight \u2014 127 GB on a 623 GB\n"
+            "output \u2014 which the memory estimate does not model. Fusing in\n"
+            "regions bounds that, at the cost of re-fusing each region's\n"
+            "boundary: a 49-tile run fused in 81 regions.\n\n"
+            "The ~4 GB default was chosen against a machine that ran out of\n"
+            "memory. On a large-RAM system a bigger region should be faster;\n"
+            "by how much has NOT been measured. 'Whole output' restores the\n"
+            "unbounded path and can use far more RAM than the estimate says."
+        )
+        proc_layout.addWidget(self._fusion_region_combo, 6, 1, 1, 3)
+
         # Proc Row 5: Tile-border artifact QC (diagnostic)
         self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
         self._border_qc_cb.setToolTip(
@@ -3191,6 +3216,11 @@ class StitchingDialog(PersistentDialog):
         chunk = self._chunk_size_combo.currentData()
         if chunk:
             config.output_chunksize = dict(chunk)
+        # 0.0 is a real choice here ("whole output"), so `is not None` rather
+        # than truthiness — `if region:` would silently drop it.
+        region_gb = self._fusion_region_combo.currentData()
+        if region_gb is not None:
+            config.fusion_superblock_target_gb = float(region_gb)
 
         # Tile orientation is resolved PER acquisition at run time (by each
         # item's own microscope name), not one choice for the whole batch.
@@ -3357,6 +3387,7 @@ class StitchingDialog(PersistentDialog):
             ("downsample_z", self._downsample_z_combo),
             ("streaming_mode", self._streaming_combo),
             ("output_chunksize", self._chunk_size_combo),
+            ("fusion_superblock_target_gb", self._fusion_region_combo),
             ("border_qc_mode", self._border_qc_mode_combo),
         ]
         for name, combo in combo_fields:
@@ -5538,6 +5569,9 @@ class StitchingDialog(PersistentDialog):
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
         s.setValue("verbose_alignment", self._verbose_align_cb.isChecked())
+        s.setValue(
+            "fusion_region_gb", float(self._fusion_region_combo.currentData())
+        )
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -5723,6 +5757,9 @@ class StitchingDialog(PersistentDialog):
         self._verbose_align_cb.setChecked(
             s.value("verbose_alignment", True, type=bool)
         )
+        self._set_combo_by_data(
+            self._fusion_region_combo, s.value("fusion_region_gb", 4.0, type=float)
+        )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)
         )
@@ -5861,6 +5898,9 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
         s.setValue("verbose_alignment", self._verbose_align_cb.isChecked())
+        s.setValue(
+            "fusion_region_gb", float(self._fusion_region_combo.currentData())
+        )
         s.setValue("z_refine_range_um", self._z_refine_range_spin.value())
         s.setValue("registration_report", self._reg_report_cb.isChecked())
         s.setValue("proc_options_expanded", self._proc_toggle.isChecked())
@@ -6044,6 +6084,9 @@ class NativeStitchingDialog(StitchingDialog):
         )
         self._verbose_align_cb.setChecked(
             s.value("verbose_alignment", True, type=bool)
+        )
+        self._set_combo_by_data(
+            self._fusion_region_combo, s.value("fusion_region_gb", 4.0, type=float)
         )
         self._z_refine_range_spin.setValue(
             s.value("z_refine_range_um", 40.0, type=float)
