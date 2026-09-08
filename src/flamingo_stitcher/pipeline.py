@@ -5138,12 +5138,33 @@ class StitchingPipeline:
             # Keep the ref-channel spill for reuse in the fusion loop (C1):
             # re-materialising it there would preprocess + write N tiles a second
             # time (a full redundant pass, worst with deconvolution on).
-            reg_reuse_ch = ref_ch
-            reg_reuse_data = ref_tile_data
-            reg_reuse_dir = reg_tmp_dir
-            self.logger.info(
-                "  Registration complete; reusing ref-channel spill for fusion"
-            )
+            # The spill holds ILLUMINATION-FUSED tiles (side = None). A unit
+            # only reuses a spill whose side matches, so when the run splits the
+            # light paths the fusion loop asks for side 0 and side 1 and this
+            # spill stands in for neither — it would sit untouched until the end
+            # of the run holding a full copy of every tile. On the 2026-09-06
+            # 7x7 that is 246 GB of dead scratch, and the estimate does not
+            # count it: the run needed ~880 GB against a stated ~620 GB. At the
+            # 4x-in-Z sizes it is 984 GB, and 3520 GB against 3230 GB free is a
+            # run that dies on disk hours in. Drop it now rather than reserve
+            # space for something nothing can use.
+            _sides = list(getattr(tiles[0], "illumination_sides", []) or [])
+            if getattr(self.config, "split_illumination", False) and len(_sides) > 1:
+                del ref_tile_data
+                gc.collect()
+                shutil.rmtree(reg_tmp_dir, ignore_errors=True)
+                self.logger.info(
+                    "  Registration complete; dropped the reference spill "
+                    "(it holds fused illumination, and every fusion unit wants "
+                    "a single side, so nothing can reuse it)"
+                )
+            else:
+                reg_reuse_ch = ref_ch
+                reg_reuse_data = ref_tile_data
+                reg_reuse_dir = reg_tmp_dir
+                self.logger.info(
+                    "  Registration complete; reusing ref-channel spill for fusion"
+                )
 
         if self._cancelled_fn():
             if reg_reuse_dir is not None:
@@ -6261,7 +6282,21 @@ class StitchingPipeline:
             )
             return 1
 
-        return max(1, min(4, int(ram_cap), n_tiles or 1))
+        chosen = max(1, min(4, int(ram_cap), n_tiles or 1))
+        if chosen < min(4, n_tiles or 1):
+            # On the 2026-09-06 run this silently dropped 4 -> 1 between the two
+            # illumination sides and tripled that pass (147.9s -> 537.7s). The
+            # cause is not visible from "(1 worker)": `available` collapses once
+            # the fused memmap fills the page cache, and the cap reads that as
+            # memory pressure. Say the numbers so the next person can tell a
+            # real shortage from a page cache.
+            self.logger.info(
+                f"  Preprocess workers: {chosen} (RAM cap — {avail_bytes / 1024**3:.0f} GB "
+                f"available, {per_worker / 1024**3:.1f} GB per worker). A large "
+                f"fused memmap in the page cache depresses 'available'; set "
+                f"preprocess_workers to override."
+            )
+        return chosen
 
     def _pick_fuse_workers(self, darr) -> int:
         """Choose a safe dask thread-pool size for the fused-memmap store.
