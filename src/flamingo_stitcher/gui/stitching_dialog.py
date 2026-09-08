@@ -1394,7 +1394,7 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._fusion_region_combo, 6, 1, 1, 3)
 
-        # Proc Row 5: Tile-border artifact QC (diagnostic)
+        # Proc Row 7: Tile-border artifact QC (diagnostic)
         self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
         self._border_qc_cb.setToolTip(
             "After preprocessing, scan neighboring-tile seams for sharp\n"
@@ -1404,9 +1404,9 @@ class StitchingDialog(PersistentDialog):
             "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
             "single-pixel steps."
         )
-        proc_layout.addWidget(self._border_qc_cb, 6, 0)
+        proc_layout.addWidget(self._border_qc_cb, 7, 0)
         self._border_qc_label = QLabel("QC detail:")
-        proc_layout.addWidget(self._border_qc_label, 6, 1)
+        proc_layout.addWidget(self._border_qc_label, 7, 1)
         self._border_qc_mode_combo = QComboBox()
         self._border_qc_mode_combo.addItem("MIP length (fast)", "mip")
         self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
@@ -1416,7 +1416,7 @@ class StitchingDialog(PersistentDialog):
             "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
             "Pairs only: just the list of offending tile pairs."
         )
-        proc_layout.addWidget(self._border_qc_mode_combo, 6, 2)
+        proc_layout.addWidget(self._border_qc_mode_combo, 7, 2)
 
         self._reg_report_cb = QCheckBox("Registration report")
         self._reg_report_cb.setChecked(True)
@@ -1431,12 +1431,12 @@ class StitchingDialog(PersistentDialog):
             "Stays on even with Skip registration — the report then says the tiles\n"
             "were never registered, which is the thing worth knowing."
         )
-        proc_layout.addWidget(self._reg_report_cb, 6, 3)
+        proc_layout.addWidget(self._reg_report_cb, 7, 3)
 
         # Proc Row 6: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 7, 0, 1, 4)
+        proc_layout.addWidget(legend, 8, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
