@@ -326,6 +326,38 @@ def build_parser() -> argparse.ArgumentParser:
         help="Register on the whole Z stack.",
     )
     reg_group.add_argument(
+        "--auto-reg-channel",
+        dest="auto_reg_channel",
+        action="store_true",
+        default=None,
+        help="Choose the registration channel by measured structure rather "
+        "than by channel number (default on). Registration runs on ONE channel "
+        "for hours, and the lowest channel ID is as likely to be the sparse "
+        "marker as the dense one.",
+    )
+    reg_group.add_argument(
+        "--no-auto-reg-channel",
+        dest="auto_reg_channel",
+        action="store_false",
+        help="Register on --reg-channel verbatim.",
+    )
+    reg_group.add_argument(
+        "--seam-content-gate",
+        dest="seam_content_gate",
+        action="store_true",
+        default=None,
+        help="Skip seams whose shared strip has no structure on either side "
+        "(default on). Both tiles can be full of sample while the strip they "
+        "share is empty medium; phase correlation there returns a confident "
+        "peak drawn from noise. Reported as 'empty_overlap', not as a failure.",
+    )
+    reg_group.add_argument(
+        "--no-seam-content-gate",
+        dest="seam_content_gate",
+        action="store_false",
+        help="Attempt every overlapping pair, however empty the overlap.",
+    )
+    reg_group.add_argument(
         "--min-tile-structure",
         type=float,
         default=None,
@@ -838,6 +870,8 @@ def main():
         ("min_registered_seam_frac", args.min_registered_seams),
         ("min_tile_structure", args.min_tile_structure),
         ("registration_z_content_crop", args.z_content_crop),
+        ("registration_channel_auto", args.auto_reg_channel),
+        ("registration_seam_content_gate", args.seam_content_gate),
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),
         ("registration_z_refine_upsample", args.z_refine_upsample),

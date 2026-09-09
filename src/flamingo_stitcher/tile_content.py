@@ -77,7 +77,12 @@ DEFAULT_MIN_STRUCTURE = 0.15
 # Cap on the voxels actually measured. A structure ratio is a global statistic;
 # it does not get meaningfully better with more than a few million samples, and
 # this runs once per tile before anything else happens.
-_MAX_SAMPLE_VOXELS = 4_000_000
+_MAX_SAMPLE_VOXELS = 8_000_000
+
+# Planes to keep when a stack is too big to measure whole. Deriving the Z
+# stride from the voxel budget alone is what collapsed a real 643 x 2048 x 2048
+# tile to plane 0 (see _subsample) -- one plane already fills any sane budget.
+_MIN_SAMPLE_PLANES = 16
 
 
 # Lateral stride target for the per-plane profile. Every plane is kept (that
@@ -104,6 +109,44 @@ _MIN_PROFILE_SEPARATION = 0.08
 _PROFILE_BAND_FRACTION = 0.25
 
 
+# Width of the edge band scored for seam gating, as a fraction of the tile.
+# Deliberately >= a typical tile overlap: the band must CONTAIN the shared
+# strip, and being too wide only makes the gate more permissive, which is the
+# safe direction (attempting a seam costs time, wrongly skipping one costs a
+# measurement that cannot be recovered).
+DEFAULT_EDGE_FRACTION = 0.2
+
+
+@dataclass
+class EdgeContent:
+    """Structure in each lateral edge band of a tile.
+
+    A tile can have plenty of structure somewhere and nothing at all in the
+    strip it shares with one particular neighbour -- the sample ends partway
+    across the mosaic. The whole-tile score cannot see that, so it lets a seam
+    through whose overlap is pure medium on one or both sides. This is what the
+    seam gate reads.
+
+    `None` for a band means "could not measure", which is treated as content --
+    the same convention as `TileContent`, and for the same reason.
+    """
+
+    x_low: Optional[float] = None
+    x_high: Optional[float] = None
+    y_low: Optional[float] = None
+    y_high: Optional[float] = None
+
+    def at(self, axis: str, high: bool) -> Optional[float]:
+        """Score for the `axis` band on the high or low side."""
+        return getattr(self, f"{axis}_{'high' if high else 'low'}", None)
+
+    def has_content(
+        self, axis: str, high: bool, min_structure: float = DEFAULT_MIN_STRUCTURE
+    ) -> bool:
+        score = self.at(axis, high)
+        return True if score is None else score >= float(min_structure)
+
+
 @dataclass
 class TileContent:
     """One tile's structure score and the verdict drawn from it."""
@@ -112,6 +155,7 @@ class TileContent:
     structure: Optional[float] = None
     has_content: bool = True
     note: str = ""
+    edges: Optional[EdgeContent] = None
 
     @property
     def measured(self) -> bool:
@@ -119,36 +163,60 @@ class TileContent:
 
 
 def _subsample(volume: np.ndarray) -> np.ndarray:
-    """A strided view small enough to measure quickly, without loading more."""
+    """A small view of `volume`, sampled without materializing the whole thing.
+
+    Z is sampled by COUNT, never by a stride derived from the voxel budget.
+    That stride collapsed a real 643 x 2048 x 2048 tile to a SINGLE plane --
+    plane 0, because one 2048^2 plane already fills the budget on its own. In a
+    light-sheet stack plane 0 is empty medium, so every score described the
+    medium instead of the tile: on the 2026-09-08 7x7 that put all 49 tiles in a
+    0.20-0.89 band just above the featureless floor, and the content gate was
+    deciding on a plane containing nothing. Keeping _MIN_SAMPLE_PLANES spread
+    across the stack costs a coarser lateral stride and answers the question
+    that was actually asked.
+
+    Slicing happens BEFORE any materialization, so a dask/memmap-backed tile
+    yields ~30 MB rather than a 5.4 GB resident copy per tile (times the
+    preprocess workers).
+    """
     try:
         size = int(volume.size)
     except Exception:
         return volume
-    if size <= _MAX_SAMPLE_VOXELS or volume.ndim != 3:
+    try:
+        if size <= _MAX_SAMPLE_VOXELS or volume.ndim != 3:
+            return volume
+        n_planes = int(volume.shape[0])
+    except Exception:
         return volume
-    # Stride Z first: planes are the cheapest axis to skip and the one with the
-    # most redundancy in a light-sheet stack.
-    step_z = max(1, int(np.ceil(size / _MAX_SAMPLE_VOXELS)))
-    out = volume[::step_z]
+    keep = min(n_planes, _MIN_SAMPLE_PLANES)
+    if keep < n_planes:
+        idx = np.unique(np.linspace(0, n_planes - 1, keep).astype(int))
+        try:
+            out = volume[idx]
+        except Exception:
+            # Anything that cannot take a fancy index falls back to a stride
+            # that still spans the stack.
+            out = volume[:: max(1, n_planes // keep)]
+    else:
+        out = volume
     if out.size > _MAX_SAMPLE_VOXELS:
         lateral = int(np.ceil(np.sqrt(out.size / _MAX_SAMPLE_VOXELS)))
         out = out[:, ::lateral, ::lateral]
     return out
 
 
-def structure_score(volume) -> Optional[float]:
-    """`std(smoothed) / std(raw)` in [0, 1], or None if it cannot be measured.
+def _structure_ratio(data: np.ndarray) -> Optional[float]:
+    """The ratio itself, on an array that is already resident and sampled.
 
-    Returns None rather than a number whenever the answer would be meaningless
-    -- an empty array, a perfectly flat one, non-finite data. A caller must not
-    be able to mistake "could not measure" for "measured, and it is low".
+    Split out so one read of a tile can answer several questions -- the whole
+    tile AND each of its edges -- instead of re-reading it per question.
     """
     try:
         from scipy import ndimage
     except Exception:  # pragma: no cover - scipy is a hard dependency
         return None
     try:
-        data = np.asarray(_subsample(np.asarray(volume)), dtype=np.float32)
         if data.size < 8:
             return None
         finite = np.isfinite(data)
@@ -158,7 +226,7 @@ def structure_score(volume) -> Optional[float]:
             data = np.where(finite, data, np.nanmedian(data[finite]))
         raw = float(data.std())
         if not np.isfinite(raw) or raw <= 0.0:
-            # A perfectly constant tile. Genuinely no structure, and the ratio
+            # A perfectly constant region. Genuinely no structure, and the ratio
             # is 0/0 -- report the verdict directly rather than divide.
             return 0.0
         smoothed = ndimage.gaussian_filter(data, sigma=_SMOOTH_SIGMA)
@@ -167,12 +235,75 @@ def structure_score(volume) -> Optional[float]:
             return None
         return max(0.0, min(1.0, score))
     except Exception as exc:  # noqa: BLE001 - never fail a run over a heuristic
-        logger.debug("Could not score tile structure: %s", exc)
+        logger.debug("Could not score structure: %s", exc)
         return None
 
 
+def _resident_sample(volume) -> Optional[np.ndarray]:
+    """`volume` subsampled and materialized as float32, or None."""
+    try:
+        return np.asarray(_subsample(volume), dtype=np.float32)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("Could not sample volume: %s", exc)
+        return None
+
+
+def structure_score(volume) -> Optional[float]:
+    """`std(smoothed) / std(raw)` in [0, 1], or None if it cannot be measured.
+
+    Returns None rather than a number whenever the answer would be meaningless
+    -- an empty array, a perfectly flat one, non-finite data. A caller must not
+    be able to mistake "could not measure" for "measured, and it is low".
+    """
+    data = _resident_sample(volume)
+    if data is None:
+        return None
+    return _structure_ratio(data)
+
+
+def _edges_from_sample(
+    data: np.ndarray, fraction: float = DEFAULT_EDGE_FRACTION
+) -> Optional[EdgeContent]:
+    """Score the four lateral edge bands of an already-resident sample.
+
+    Costs four gaussian filters over ~a fifth of an already-read sample each,
+    so this rides along with the whole-tile score for no extra I/O -- which is
+    the point. Probing each seam's overlap separately would read a comparable
+    volume to the registration it is meant to save.
+    """
+    try:
+        if data.ndim != 3:
+            return None
+        _, height, width = data.shape
+        frac = min(0.5, max(0.01, float(fraction)))
+        n_y = max(2, int(round(height * frac)))
+        n_x = max(2, int(round(width * frac)))
+        return EdgeContent(
+            x_low=_structure_ratio(data[:, :, :n_x]),
+            x_high=_structure_ratio(data[:, :, -n_x:]),
+            y_low=_structure_ratio(data[:, :n_y, :]),
+            y_high=_structure_ratio(data[:, -n_y:, :]),
+        )
+    except Exception as exc:  # noqa: BLE001 - a heuristic must not fail a run
+        logger.debug("Could not score tile edges: %s", exc)
+        return None
+
+
+def edge_structure(
+    volume, *, fraction: float = DEFAULT_EDGE_FRACTION
+) -> Optional[EdgeContent]:
+    """Edge-band structure for one tile, or None if it cannot be measured."""
+    data = _resident_sample(volume)
+    if data is None:
+        return None
+    return _edges_from_sample(data, fraction)
+
+
 def score_tiles(
-    volumes: Sequence, *, min_structure: float = DEFAULT_MIN_STRUCTURE
+    volumes: Sequence,
+    *,
+    min_structure: float = DEFAULT_MIN_STRUCTURE,
+    edge_fraction: Optional[float] = None,
 ) -> List[TileContent]:
     """Score every tile and mark the ones with nothing to register against.
 
@@ -182,7 +313,14 @@ def score_tiles(
     """
     results: List[TileContent] = []
     for index, volume in enumerate(volumes):
-        score = structure_score(volume)
+        # ONE read per tile, then every measure comes off that resident sample.
+        data = _resident_sample(volume)
+        score = None if data is None else _structure_ratio(data)
+        edges = (
+            _edges_from_sample(data, edge_fraction)
+            if (edge_fraction is not None and data is not None)
+            else None
+        )
         if score is None:
             results.append(
                 TileContent(
@@ -190,6 +328,7 @@ def score_tiles(
                     structure=None,
                     has_content=True,
                     note="structure could not be measured; kept in the registration",
+                    edges=edges,
                 )
             )
             continue
@@ -199,6 +338,7 @@ def score_tiles(
                 index=index,
                 structure=score,
                 has_content=has_content,
+                edges=edges,
                 note=(
                     ""
                     if has_content

@@ -36,7 +36,23 @@ registration:
 
   # Channel index used for registration (0-based).
   # Registration is computed on this channel and applied to all others.
+  # Only consulted when channel_auto is false.
   channel: 0
+
+  # Choose the registration channel by measured structure instead of by number.
+  # Registration runs on ONE channel and costs hours; the lowest channel ID is
+  # as likely to be a sparse marker as the dense channel, and registering on
+  # the sparse one spends the whole budget on the worst available evidence.
+  # A few tiles of each channel are scored and the densest wins; the choice and
+  # every channel's score go into the run log.
+  channel_auto: true
+
+  # Skip a seam whose SHARED STRIP has no structure on either side, even when
+  # both tiles have plenty elsewhere — the sample ends partway across the
+  # mosaic. Phase correlation on such a strip does not fail loudly; it returns
+  # a confident peak drawn from noise. Gated seams are reported as
+  # `empty_overlap` (never attempted) rather than counted as failures.
+  seam_content_gate: true
 
   # Downsampling factors for phase-correlation registration.
   # Higher values = faster but less precise.

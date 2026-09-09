@@ -21,6 +21,7 @@ from typing import Any, Dict, Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDoubleSpinBox,
     QFormLayout,
@@ -31,6 +32,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
 )
@@ -47,7 +49,10 @@ class OptionsPanel(QWidget):
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self._spins: Dict[str, QDoubleSpinBox] = {}
+        # Keyed by field; the widget type follows the tunable's `kind`, so read
+        # and write go through _widget_value/_set_widget_value rather than
+        # assuming a spin box.
+        self._spins: Dict[str, QWidget] = {}
         self._loading = False
         self._build()
         self._reload_scopes()
@@ -163,14 +168,44 @@ class OptionsPanel(QWidget):
 
         install_wheel_guard(self)
 
+    @staticmethod
+    def _widget_value(widget):
+        """The control's value, whatever kind of control it is."""
+        if isinstance(widget, QCheckBox):
+            return widget.isChecked()
+        return widget.value()
+
+    @staticmethod
+    def _set_widget_value(widget, value) -> None:
+        if isinstance(widget, QCheckBox):
+            widget.setChecked(bool(value))
+        elif isinstance(widget, QSpinBox):
+            widget.setValue(int(round(float(value))))
+        else:
+            widget.setValue(float(value))
+
     def _control_for(self, tunable: scope_profiles.Tunable):
-        """(label widget, control+help widget) for one tunable."""
-        spin = QDoubleSpinBox()
-        spin.setRange(tunable.minimum, tunable.maximum)
-        spin.setSingleStep(tunable.step)
-        spin.setDecimals(tunable.decimals)
-        if tunable.suffix:
-            spin.setSuffix(tunable.suffix)
+        """(label widget, control+help widget) for one tunable.
+
+        The control follows `kind`. Rendering a bool as a 0.00-1.00 spin box --
+        which is what a single QDoubleSpinBox for everything produces -- reads
+        as a broken control rather than a choice.
+        """
+        if tunable.kind == "bool":
+            spin = QCheckBox()
+        elif tunable.kind == "int":
+            spin = QSpinBox()
+            spin.setRange(int(tunable.minimum), int(tunable.maximum))
+            spin.setSingleStep(max(1, int(tunable.step)))
+            if tunable.suffix:
+                spin.setSuffix(tunable.suffix)
+        else:
+            spin = QDoubleSpinBox()
+            spin.setRange(tunable.minimum, tunable.maximum)
+            spin.setSingleStep(tunable.step)
+            spin.setDecimals(tunable.decimals)
+            if tunable.suffix:
+                spin.setSuffix(tunable.suffix)
         spin.setToolTip(tunable.help)
         # Wheel events reach the scroll area unless the box is focused; see
         # install_wheel_guard at the end of _build.
@@ -284,7 +319,7 @@ class OptionsPanel(QWidget):
         self._loading = True
         try:
             for field, spin in self._spins.items():
-                spin.setValue(float(merged.get(field, 0.0)))
+                self._set_widget_value(spin, merged.get(field, 0.0))
         finally:
             self._loading = False
 
@@ -307,7 +342,10 @@ class OptionsPanel(QWidget):
         self._status.clear()
 
     def _collect(self) -> Dict[str, Any]:
-        return {field: spin.value() for field, spin in self._spins.items()}
+        return {
+            field: self._widget_value(spin)
+            for field, spin in self._spins.items()
+        }
 
     # ------------------------------------------------------------------ #
     # Actions
@@ -317,7 +355,7 @@ class OptionsPanel(QWidget):
         self._loading = True
         try:
             for field, value in self._defaults().items():
-                self._spins[field].setValue(float(value))
+                self._set_widget_value(self._spins[field], value)
         finally:
             self._loading = False
         self._status.setText("Defaults loaded — press Save to keep them.")

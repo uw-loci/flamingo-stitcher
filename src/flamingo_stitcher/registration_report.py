@@ -100,6 +100,10 @@ STATUS_PRUNED = "pruned"  # survived quality, dropped by edge pruning
 STATUS_BELOW_QUALITY = "below_quality"  # correlation below the threshold
 STATUS_IMPLAUSIBLE_SHIFT = "implausible_shift"  # passed quality, shift is not physical
 STATUS_NO_CONTENT = "no_content"  # a side has nothing to register against
+# The shared strip is empty even though both TILES have structure elsewhere --
+# the sample ends partway across the mosaic. Never attempted, so like
+# STATUS_NO_CONTENT it must not count as a failure.
+STATUS_EMPTY_OVERLAP = "empty_overlap"
 STATUS_DROPPED = "dropped"  # expected pair, no edge, reason unrecoverable
 STATUS_NOT_RUN = "not_run"  # registration skipped / gated off / failed
 
@@ -511,6 +515,7 @@ def extract_seams(
     rejected_edges: Optional[Mapping[Tuple[int, int], str]] = None,
     index_map: Optional[Sequence[int]] = None,
     content_by_index: Optional[Sequence[bool]] = None,
+    empty_overlap_pairs: Optional[Sequence[Tuple[int, int]]] = None,
     quality_threshold: Optional[float] = None,
     frame_extent_um: Optional[Mapping[str, float]] = None,
     ran: bool = True,
@@ -576,6 +581,13 @@ def extract_seams(
             if a < len(index_map) and b < len(index_map)
         }
 
+    gated: set = set()
+    for pair in empty_overlap_pairs or ():
+        try:
+            gated.add(_edge_key(int(pair[0]), int(pair[1])))
+        except Exception:
+            continue
+
     rows: List[SeamResult] = []
     for index_a, index_b, axis in expected:
         key = _edge_key(index_a, index_b)
@@ -611,6 +623,19 @@ def extract_seams(
             # can be trusted or whether a tear matters.
             row.status = STATUS_NO_CONTENT
             row.note = "a tile on this seam has no structure to register against"
+            rows.append(row)
+            continue
+
+        if key in gated:
+            # Both tiles have structure somewhere, but not in the strip they
+            # share. Phase correlation on it returns a confident peak drawn from
+            # noise, so this pair was never scheduled. Not a failure: there is
+            # nothing visible here to be discontinuous.
+            row.status = STATUS_EMPTY_OVERLAP
+            row.note = (
+                "the shared strip has no structure on at least one side; "
+                "not attempted"
+            )
             rows.append(row)
             continue
 
@@ -798,7 +823,7 @@ def mosaic_coverage(n_tiles: int, seams: Sequence[SeamResult]) -> MosaicCoverage
     n_expected = 0
     for seam in seams or []:
         status = getattr(seam, "status", None)
-        if status == STATUS_NO_CONTENT:
+        if status in (STATUS_NO_CONTENT, STATUS_EMPTY_OVERLAP):
             # Never attempted, and nothing visible here to misalign. Counting it
             # would make a sparse mosaic look like a failed registration.
             continue
@@ -825,7 +850,7 @@ def mosaic_coverage(n_tiles: int, seams: Sequence[SeamResult]) -> MosaicCoverage
 
     unconstrained = []
     for seam in seams or []:
-        if getattr(seam, "status", None) == STATUS_NO_CONTENT:
+        if getattr(seam, "status", None) in (STATUS_NO_CONTENT, STATUS_EMPTY_OVERLAP):
             continue  # a tear between empty tiles is not a tear anyone can see
         a, b = int(seam.index_a), int(seam.index_b)
         if 0 <= a < n and 0 <= b < n and component_of[a] != component_of[b]:
@@ -1100,7 +1125,8 @@ def format_report_text(report: RegistrationReport, *, acquisition: str = "") -> 
         f"{report.count(STATUS_BELOW_QUALITY)} below quality · "
         f"{report.count(STATUS_IMPLAUSIBLE_SHIFT)} implausible shift · "
         f"{report.count(STATUS_DROPPED)} no edge · "
-        f"{report.count(STATUS_NO_CONTENT)} nothing to register"
+        f"{report.count(STATUS_NO_CONTENT)} nothing to register · "
+        f"{report.count(STATUS_EMPTY_OVERLAP)} empty overlap"
     )
     s = report.settings
     if s:
@@ -1311,6 +1337,7 @@ def report_to_json(
                 STATUS_BELOW_QUALITY,
                 STATUS_IMPLAUSIBLE_SHIFT,
                 STATUS_NO_CONTENT,
+                STATUS_EMPTY_OVERLAP,
                 STATUS_DROPPED,
                 STATUS_NOT_RUN,
             )

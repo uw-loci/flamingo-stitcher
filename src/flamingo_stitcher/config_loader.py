@@ -299,6 +299,10 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.skip_registration = bool(reg["skip"])
     if reg.get("channel") is not None:
         config_obj.reg_channel = int(reg["channel"])
+    if reg.get("channel_auto") is not None:
+        config_obj.registration_channel_auto = bool(reg["channel_auto"])
+    if reg.get("seam_content_gate") is not None:
+        config_obj.registration_seam_content_gate = bool(reg["seam_content_gate"])
     binning = reg.get("binning")
     if binning:
         # `xy` is the shape the GUI and CLI offer, so accept it here too rather

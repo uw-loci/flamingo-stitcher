@@ -101,6 +101,9 @@ SHAREABLE_CONFIG_FIELDS = (
     "min_registered_seam_frac",
     "min_tile_structure",
     "registration_z_content_crop",
+    "reg_channel",
+    "registration_channel_auto",
+    "registration_seam_content_gate",
     "scope_profile_source",
     "registration_upsample_factor",
     "registration_z_refine",
@@ -927,6 +930,23 @@ class StitchingConfig:
     verbose_alignment_log: bool = True
     skip_registration: bool = False  # Use stage positions only (no phase correlation)
     reg_channel: int = 0  # Channel index to use for registration
+    # Pick the registration channel by measured structure rather than taking
+    # the lowest channel ID. Registration runs on exactly ONE channel and costs
+    # hours; on a multichannel acquisition the first channel by ID is just as
+    # likely to be the sparse marker, which spends the entire budget on the
+    # worst available evidence and then loses its seams to the quality gate.
+    # There was no way to say otherwise from the GUI at all. Off = use
+    # reg_channel verbatim, which is what every run before this did.
+    registration_channel_auto: bool = True
+    # Skip a seam whose SHARED STRIP has no structure, even when both tiles have
+    # plenty elsewhere -- the sample ends partway across the mosaic. The
+    # whole-tile content gate cannot see this: it passes both tiles and the pair
+    # is then scheduled for a full phase correlation over empty medium, which
+    # does not fail loudly but returns a confident peak drawn from noise. Such a
+    # seam is reported as `empty_overlap` (never attempted) rather than counted
+    # as a failure. The band width is derived from the run's own measured
+    # overlap, so there is no threshold to tune.
+    registration_seam_content_gate: bool = True
     # Against NATIVE tiles: "z=2, xy=4" means half the raw planes and a quarter
     # of the raw pixels. Registration runs on the already-downsampled spill, so
     # the pipeline discounts this by the downsample it has applied rather than
@@ -4214,9 +4234,11 @@ class StitchingPipeline:
             )
             return None, None, None, None
 
-        ref_ch = self.config.reg_channel
+        ref_ch = getattr(self, "_reg_channel_choice", None)
         if ref_ch not in process_channels:
-            ref_ch = process_channels[0]
+            ref_ch = self.config.reg_channel
+            if ref_ch not in process_channels:
+                ref_ch = process_channels[0]
         side_tag = "" if reuse_side is None else f"_I{reuse_side}"
         if reuse_side is not None:
             self.logger.info(
@@ -4668,7 +4690,13 @@ class StitchingPipeline:
             except ImportError:
                 transform_key = "affine_metadata"
         else:
-            ref_ch = self.config.reg_channel
+            usable = [
+                ch for ch in process_channels
+                if ch in channel_tile_data and channel_tile_data[ch]
+            ]
+            ref_ch = self._resolve_reg_channel(
+                usable or process_channels, loaded=channel_tile_data
+            )
             if ref_ch not in channel_tile_data or not channel_tile_data[ref_ch]:
                 ref_ch = process_channels[0]
             ref_tile_data = channel_tile_data[ref_ch]
@@ -4955,9 +4983,7 @@ class StitchingPipeline:
                 except ImportError:
                     transform_key = "affine_metadata"
             else:
-                ref_ch = self.config.reg_channel
-                if ref_ch not in process_channels:
-                    ref_ch = process_channels[0]
+                ref_ch = self._resolve_reg_channel(process_channels, tiles=tiles)
                 ref_data = self._load_and_preprocess(tiles, [ref_ch])
                 ref_tile_data = ref_data.get(ref_ch, [])
                 if not ref_tile_data:
@@ -5087,9 +5113,7 @@ class StitchingPipeline:
             except ImportError:
                 transform_key = "affine_metadata"
         else:
-            ref_ch = self.config.reg_channel
-            if ref_ch not in process_channels:
-                ref_ch = process_channels[0]
+            ref_ch = self._resolve_reg_channel(process_channels, tiles=tiles)
 
             self._progress_fn(
                 5, f"Loading reference channel {ref_ch} for registration..."
@@ -6453,6 +6477,9 @@ class StitchingPipeline:
         )
         z_ranges = self._content_z_ranges(tile_data)
         msims = []
+        # Lateral world position per tile, needed by the seam gate to work out
+        # which edge band of each tile faces which neighbour.
+        world_xy: List[Tuple[float, float]] = []
         for index, (volume, tile_info) in enumerate(tile_data):
             translation_um = {
                 "z": tile_info.z_min_mm * 1000.0,
@@ -6465,6 +6492,9 @@ class StitchingPipeline:
                 )
                 * 1000.0,
             }
+            # AFTER the reverse-x/y flips, so "high band" means the same thing
+            # here as it does in the array the msim wraps.
+            world_xy.append((translation_um["x"], translation_um["y"]))
             # Register on the planes that contain something, and move the
             # translation to match so the crop stays in the same world position.
             # Getting this offset wrong would not fail loudly — it would shift
@@ -6524,7 +6554,13 @@ class StitchingPipeline:
         # exactly this failure (issue #70): a background tile produces a
         # confident wrong shift, and the cheapest way not to believe it is not
         # to ask.
-        content = self._score_tile_content(tile_data)
+        gate_on = bool(getattr(self.config, "registration_seam_content_gate", True))
+        content = self._score_tile_content(
+            tile_data,
+            edge_fraction=(
+                self._seam_band_fraction(tiles, extent_um) if gate_on else None
+            ),
+        )
         keep = [i for i, c in enumerate(content) if c.has_content]
         content_flags = [c.has_content for c in content]
         index_map = None
@@ -6547,6 +6583,15 @@ class StitchingPipeline:
             index_map = keep
             reg_msims = [msims[i] for i in keep]
         self._tiles_registered = len(reg_msims)
+
+        gate_pairs, gate_dropped = (
+            self._empty_overlap_pairs(
+                reg_msims, content, index_map, world_xy,
+                mvs_io.METADATA_TRANSFORM_KEY,
+            )
+            if gate_on
+            else (None, [])
+        )
 
         # Run registration
         self.logger.info(
@@ -6572,6 +6617,7 @@ class StitchingPipeline:
                     result = registration.register(
                         reg_msims,
                         reg_channel_index=0,
+                        pairs=gate_pairs,
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
                         registration_binning=self._effective_registration_binning(
@@ -6604,6 +6650,7 @@ class StitchingPipeline:
                 rejected_edges=sink.get("rejected"),
                 index_map=index_map,
                 content_by_index=content_flags,
+                empty_overlap_pairs=gate_dropped,
                 quality_threshold=self.config.quality_threshold,
                 frame_extent_um=extent_um,
             )
@@ -6684,7 +6731,7 @@ class StitchingPipeline:
 
             params, z_summary = self._refine_z_shifts(
                 reg_msims, params, tile_data, voxel_size_um, registration, clamp,
-                index_map,
+                index_map, gate_pairs,
             )
 
             # Snap BEFORE the report so the report describes the shifts that
@@ -6949,7 +6996,7 @@ class StitchingPipeline:
 
     def _refine_z_shifts(
         self, msims, params, tile_data, voxel_size_um, registration, clamp,
-        index_map=None,
+        index_map=None, pairs=None,
     ):
         """Second registration pass whose only contribution is Z.
 
@@ -7013,6 +7060,11 @@ class StitchingPipeline:
                 refined = registration.register(
                     msims,
                     reg_channel_index=0,
+                    # The same candidate seams pass 1 used. Re-measuring a strip
+                    # already established as empty would feed this pass exactly
+                    # the garbage Z shifts the gate exists to keep out, and this
+                    # pass contributes Z -- the axis where a wrong shift shows.
+                    pairs=pairs,
                     # Start from pass 1's (clamped) placement, so what comes
                     # back is the residual rather than a competing absolute.
                     transform_key="registered",
@@ -7191,7 +7243,108 @@ class StitchingPipeline:
         )
         return ranges
 
-    def _score_tile_content(self, tile_data):
+    # Tiles sampled per channel when choosing what to register on. Three is
+    # enough to separate a dense channel from a sparse one and costs ~30 s per
+    # channel against a registration measured in hours.
+    _REG_CHANNEL_PROBE_TILES = 3
+
+    def _resolve_reg_channel(self, process_channels, tiles=None, loaded=None):
+        """Which channel to register on, decided once per run.
+
+        The old behaviour was `reg_channel` if it happened to name a real
+        channel and otherwise the lowest channel ID -- an ordering that has
+        nothing to do with which channel carries structure. Registration runs on
+        one channel for hours, so choosing it by ID is choosing at random.
+
+        `loaded` is `{channel: [(volume, info), ...]}` when the caller already
+        has data in hand; scoring that costs nothing. Otherwise a few tiles per
+        channel are preprocessed just to be measured.
+        """
+        import gc
+
+        cached = getattr(self, "_reg_channel_choice", None)
+        if cached is not None:
+            return cached
+
+        available = [ch for ch in (process_channels or [])]
+        if not available:
+            return self.config.reg_channel
+        explicit = self.config.reg_channel
+
+        def _settle(choice):
+            self._reg_channel_choice = choice
+            return choice
+
+        if len(available) == 1:
+            return _settle(available[0])
+        if not getattr(self.config, "registration_channel_auto", True):
+            return _settle(explicit if explicit in available else available[0])
+
+        import numpy as _np
+
+        def _spread(n):
+            """Indices spread through a list of n tiles.
+
+            The first few tiles of a mosaic are a corner, and a corner is
+            exactly where the sample is not -- sampling the front of the list
+            would compare every channel on its emptiest tiles.
+            """
+            if n <= 0:
+                return []
+            k = min(self._REG_CHANNEL_PROBE_TILES, n)
+            return sorted(set(_np.linspace(0, n - 1, k).astype(int).tolist()))
+
+        picks = _spread(len(tiles)) if tiles else []
+
+        scores = {}
+        for ch in available:
+            volumes = []
+            data = (loaded or {}).get(ch) or []
+            if data:
+                idx = [i for i in picks if i < len(data)] or _spread(len(data))
+                volumes = [data[i][0] for i in idx]
+            elif tiles:
+                for i in picks:
+                    try:
+                        volumes.append(self._preprocess_single_tile(tiles[i], ch))
+                    except Exception as exc:  # noqa: BLE001
+                        self.logger.debug(
+                            f"  Could not probe channel {ch} tile {i}: {exc}"
+                        )
+            measured = [
+                v for v in (tile_content.structure_score(vol) for vol in volumes)
+                if v is not None
+            ]
+            if measured:
+                scores[ch] = float(sorted(measured)[len(measured) // 2])
+            del volumes
+            gc.collect()
+
+        if not scores:
+            self.logger.info(
+                f"  Registration channel: {available[0]} "
+                f"(could not measure structure on any channel; using the first)"
+            )
+            return _settle(available[0])
+
+        best = max(scores, key=lambda c: scores[c])
+        table = " · ".join(
+            f"ch{c}={scores[c]:.2f}" for c in available if c in scores
+        )
+        if explicit in available and explicit != best and explicit in scores:
+            self.logger.info(
+                f"  Registration channel: {best} (structure {table}) — chosen "
+                f"over the configured channel {explicit}, which scored "
+                f"{scores[explicit]:.2f}. Set 'Registration channel' in the "
+                f"Options tab to override."
+            )
+        else:
+            self.logger.info(
+                f"  Registration channel: {best} (structure {table})"
+            )
+        return _settle(best)
+
+    def _score_tile_content(self, tile_data, edge_fraction=None):
         """Which tiles have structure phase correlation can lock onto.
 
         Intensity is the wrong question. A fish in agarose in an FEP tube has
@@ -7208,6 +7361,7 @@ class StitchingPipeline:
                 if threshold is None
                 else float(threshold)
             ),
+            edge_fraction=edge_fraction,
         )
         self.logger.info(f"  Tile content: {tile_content.describe(results)}")
         for record in results:
@@ -7219,6 +7373,161 @@ class StitchingPipeline:
                     f"registration: {record.note}"
                 )
         return results
+
+    def _seam_band_fraction(self, tiles, extent_um):
+        """How wide an edge band the seam gate should score, as a fraction.
+
+        Taken from the run's OWN measured overlap rather than a tunable, with
+        margin: the band has to contain the shared strip, and erring wide only
+        makes the gate more permissive. That is the safe direction -- attempting
+        a seam costs time, wrongly skipping one costs a measurement that nothing
+        downstream can recover.
+        """
+        fraction = None
+        try:
+            layout = tile_geometry.grid_overlap(
+                tiles, extent_x_um=extent_um["x"], extent_y_um=extent_um["y"]
+            )
+            measured = [
+                layout[axis].fraction
+                for axis in ("x", "y")
+                if layout[axis].fraction
+            ]
+            if measured:
+                fraction = max(measured) * 1.5
+        except Exception:
+            fraction = None
+        if not fraction:
+            fraction = tile_content.DEFAULT_EDGE_FRACTION
+        return min(0.4, max(0.1, float(fraction)))
+
+    def _empty_overlap_pairs(
+        self, reg_msims, content, index_map, world_xy, transform_key
+    ):
+        """Seams whose shared strip has nothing on it, on at least one side.
+
+        Both tiles can clear the whole-tile content gate while the strip they
+        actually share is empty medium -- the sample simply ends partway across
+        the mosaic. That pair still costs a full pairwise registration, and
+        phase correlation over empty medium does not fail loudly: it returns a
+        confident peak drawn from noise, which then has to be caught downstream
+        by the quality threshold or the shift bound. Not asking is cheaper and
+        more honest than disbelieving the answer.
+
+        Built by SUBTRACTION from multiview-stitcher's own adjacency graph, not
+        from our own idea of who neighbours whom: every pair MVS would have
+        considered is still considered unless this positively measured the strip
+        as empty on one side.
+
+        Returns ``(pairs, dropped)``. ``pairs`` is the surviving candidate list
+        in ``reg_msims`` index space, or None to leave MVS's graph untouched --
+        None whenever nothing was dropped, so a run that gains nothing here is
+        byte-identical to one with the gate off. ``dropped`` is in ORIGINAL tile
+        indices, which is the space the report speaks.
+        """
+        try:
+            from multiview_stitcher import mv_graph
+        except Exception as exc:  # noqa: BLE001
+            self.logger.debug(f"  Seam content gate unavailable: {exc}")
+            return None, []
+
+        def original(i):
+            return index_map[i] if index_map else i
+
+        try:
+            graph = mv_graph.build_view_adjacency_graph_from_msims(
+                reg_msims, transform_key=transform_key, overlap_tolerance=0.0
+            )
+            candidates = [tuple(sorted(e)) for e in graph.edges()]
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a gate
+            self.logger.warning(
+                f"  Seam content gate skipped (could not build the overlap "
+                f"graph): {exc}"
+            )
+            return None, []
+
+        threshold = getattr(self.config, "min_tile_structure", None)
+        min_structure = (
+            tile_content.DEFAULT_MIN_STRUCTURE
+            if threshold is None
+            else float(threshold)
+        )
+
+        survivors, dropped, reasons = [], [], []
+        for i, j in candidates:
+            oi, oj = original(i), original(j)
+            edges_i = getattr(content[oi], "edges", None)
+            edges_j = getattr(content[oj], "edges", None)
+            if edges_i is None or edges_j is None:
+                survivors.append((i, j))
+                continue
+            try:
+                dx = world_xy[oj][0] - world_xy[oi][0]
+                dy = world_xy[oj][1] - world_xy[oi][1]
+            except Exception:
+                survivors.append((i, j))
+                continue
+            axis = "x" if abs(dx) >= abs(dy) else "y"
+            delta = dx if axis == "x" else dy
+            if abs(delta) < 1e-6:
+                # Stacked in Z, or coincident. No lateral band to read.
+                survivors.append((i, j))
+                continue
+            # j sits at the higher coordinate => i's HIGH band faces j.
+            high_i = delta > 0
+            ok_i = edges_i.has_content(axis, high_i, min_structure)
+            ok_j = edges_j.has_content(axis, not high_i, min_structure)
+            if ok_i and ok_j:
+                survivors.append((i, j))
+                continue
+            dropped.append((oi, oj))
+            empty = "both sides" if not (ok_i or ok_j) else (
+                f"tile {oi}" if not ok_i else f"tile {oj}"
+            )
+            reasons.append((oi, oj, axis, empty))
+
+        if not dropped:
+            return None, []
+
+        share = len(dropped) / max(1, len(candidates))
+        self.logger.info(
+            f"  Seam content gate: {len(dropped)} of {len(candidates)} candidate "
+            f"seams have an empty shared strip and were not attempted "
+            f"({len(survivors)} remain). These are reported as 'empty_overlap', "
+            f"NOT as registration failures."
+        )
+        for oi, oj, axis, empty in reasons[:10]:
+            self.logger.info(
+                f"    seam {oi}-{oj} ({axis}): no structure in the shared "
+                f"strip on {empty}"
+            )
+        if len(reasons) > 10:
+            self.logger.info(
+                f"    ... and {len(reasons) - 10} more (see registration_seams.csv)"
+            )
+        if share > 0.5:
+            self.logger.warning(
+                f"  Seam content gate dropped {share:.0%} of candidate seams. "
+                f"That is a lot: if the mosaic is NOT mostly empty, the tile "
+                f"structure threshold ({min_structure:.2f}) is too high for "
+                f"this data — registration will run on very little. Set "
+                f"'Skip empty overlaps' off in the Options tab to disable it."
+            )
+        # Leaving NOTHING to register is the one outcome where this gate breaks
+        # registration rather than informing it, so it is the one case worth
+        # refusing outright. A gate that merely leaves few seams is visible in
+        # the log and the seam table, and `min_registered_seam_frac` is the
+        # designed arbiter of whether that is enough to trust -- second-guessing
+        # it here would just be a threshold arguing with a threshold.
+        if not survivors:
+            self.logger.warning(
+                "  Seam content gate would leave NO seams to register at all; "
+                "not applying it. Every candidate overlap measured as empty, "
+                "which is more likely a threshold that does not suit this data "
+                "than a mosaic with nothing in it."
+            )
+            return None, []
+        return survivors, dropped
 
     def _expand_to_all_tiles(self, params, index_map, n_tiles):
         """Subset registration params back onto every tile.

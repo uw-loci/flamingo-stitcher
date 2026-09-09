@@ -94,6 +94,58 @@ TUNABLES: Tuple[Tunable, ...] = (
         ),
     ),
     Tunable(
+        field="registration_channel_auto",
+        label="Choose the registration channel automatically",
+        kind="bool",
+        minimum=0,
+        maximum=1,
+        step=1,
+        decimals=0,
+        help=(
+            "Registration runs on ONE channel and costs hours, so which channel "
+            "it uses matters as much as any threshold here. On measures the "
+            "structure in a few tiles of each channel and registers on the "
+            "densest. Off uses the channel number below, which is what every "
+            "run before this did — and that number defaulted to the lowest "
+            "channel ID, an ordering with nothing to do with which channel "
+            "carries structure. The chosen channel and every channel's score "
+            "are written to the run log."
+        ),
+    ),
+    Tunable(
+        field="reg_channel",
+        label="Registration channel (when not automatic)",
+        kind="int",
+        minimum=0,
+        maximum=15,
+        step=1,
+        decimals=0,
+        help=(
+            "The channel to register on when the automatic choice above is off. "
+            "If this channel is not present in an acquisition, the first one "
+            "that is gets used instead."
+        ),
+    ),
+    Tunable(
+        field="registration_seam_content_gate",
+        label="Skip seams whose overlap is empty",
+        kind="bool",
+        minimum=0,
+        maximum=1,
+        step=1,
+        decimals=0,
+        help=(
+            "Two tiles can both contain plenty of sample while the strip they "
+            "actually SHARE is empty medium — the sample ends partway across "
+            "the mosaic. Phase correlation on such a strip does not fail "
+            "loudly; it returns a confident peak drawn from noise, which then "
+            "has to be caught by the quality threshold or the shift bound. On, "
+            "the pair is never scheduled and is reported as 'empty_overlap' "
+            "rather than counted as a failed seam. Turn it off if the seam "
+            "table shows real seams being skipped."
+        ),
+    ),
+    Tunable(
         field="quality_threshold",
         label="Seam quality threshold",
         kind="float",
