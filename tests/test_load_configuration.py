@@ -155,3 +155,155 @@ def test_both_dialog_classes_have_the_button(qapp):
             assert hasattr(d, "_apply_stitching_config")
         finally:
             d.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# Settings with no control in this dialog
+#
+# The gap that made "Load Configuration" reproduce half a run: the loader only
+# ever pushed values into WIDGETS, so every setting without one -- destripe
+# tuning, the deconvolution parameters, depth attenuation, border QC, the
+# registration thresholds that live in the Options tab -- was silently dropped
+# even once it was in the file.
+# ---------------------------------------------------------------------------
+
+
+def _cfg_with_everything():
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.destripe = True
+    cfg.destripe_params = {
+        "sigma_foreground": 64.0,
+        "sigma_background": 512.0,
+        "level": 5,
+        "wavelet": "db4",
+    }
+    cfg.destripe_direction = "horizontal"
+    cfg.deconvolution_enabled = True
+    cfg.deconvolution_iterations = 25
+    cfg.deconvolution_na = 0.44
+    cfg.depth_attenuation = True
+    cfg.depth_attenuation_mu = 0.004
+    cfg.quality_threshold = 0.55
+    cfg.min_tile_structure = 0.22
+    cfg.border_qc_alpha = 0.7
+    return cfg
+
+
+def _load_into(dialog, cfg):
+    blob = json.loads(json.dumps(serialize_stitching_config(cfg)))
+    dialog._apply_stitching_config(blob)
+    return dialog._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+
+
+@pytest.mark.parametrize(
+    "field,expected",
+    [
+        ("destripe_params", {
+            "sigma_foreground": 64.0, "sigma_background": 512.0,
+            "level": 5, "wavelet": "db4",
+        }),
+        ("destripe_direction", "horizontal"),
+        ("deconvolution_iterations", 25),
+        ("deconvolution_na", 0.44),
+        ("depth_attenuation", True),
+        ("depth_attenuation_mu", 0.004),
+        ("quality_threshold", 0.55),
+        ("min_tile_structure", 0.22),
+        ("border_qc_alpha", 0.7),
+    ],
+)
+def test_settings_without_a_widget_still_reach_the_run(dialog, field, expected):
+    out = _load_into(dialog, _cfg_with_everything())
+    assert getattr(out, field) == expected
+
+
+def test_machine_limits_are_never_applied(dialog):
+    # A 191 GB rig's ceiling must not follow the file onto a laptop.
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.max_memory_gb = 180.0
+    cfg.preprocess_workers = 32
+    out = _load_into(dialog, cfg)
+    fresh = StitchingConfig.with_yaml_defaults()
+    assert out.max_memory_gb == fresh.max_memory_gb
+    assert out.preprocess_workers == fresh.preprocess_workers
+
+
+def test_a_scratch_path_from_another_machine_is_never_applied(dialog):
+    # Older files still carry one; taking it points this box at a disk it
+    # does not have, and the run only discovers that when it needs the space.
+    dialog._apply_stitching_config({"scratch_dir": "/other/machine/nvme"})
+    out = dialog._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+    assert out.scratch_dir == StitchingConfig.with_yaml_defaults().scratch_dir
+
+
+def test_a_psf_that_travelled_with_the_file_is_used(dialog, tmp_path):
+    psf = tmp_path / "psf.tif"
+    psf.write_bytes(b"stub")
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.deconvolution_psf_path = str(psf)
+    assert _load_into(dialog, cfg).deconvolution_psf_path == str(psf)
+
+
+def test_a_psf_path_that_does_not_exist_here_is_refused_and_reported(dialog):
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.deconvolution_psf_path = "/no/such/machine/psf.tif"
+    out = _load_into(dialog, cfg)
+    assert out.deconvolution_psf_path != "/no/such/machine/psf.tif"
+    assert dialog._psf_path_unavailable == "/no/such/machine/psf.tif"
+
+
+def test_an_unknown_field_from_a_newer_build_is_ignored(dialog):
+    dialog._apply_stitching_config({"a_setting_from_the_future": 1})
+    out = dialog._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+    assert not hasattr(out, "a_setting_from_the_future")
+
+
+def test_int_keyed_dicts_come_back_as_ints(dialog):
+    # JSON hands them back as strings; a string-keyed per-channel threshold
+    # matches no channel and nothing raises.
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.registration_z_refine_binning = {"z": 1, "y": 2, "x": 2}
+    out = _load_into(dialog, cfg)
+    assert out.registration_z_refine_binning == {"z": 1, "y": 2, "x": 2}
+
+
+def test_loading_nothing_leaves_the_config_alone(dialog):
+    base = StitchingConfig.with_yaml_defaults()
+    assert dialog._apply_loaded_overrides(base) is base
+
+
+# ---------------------------------------------------------------------------
+# Save Configuration
+# ---------------------------------------------------------------------------
+
+
+def test_saved_configuration_round_trips_through_the_loader(dialog, tmp_path):
+    from flamingo_stitcher.pipeline import serialize_stitching_config as ser
+
+    cfg = _cfg_with_everything()
+    path = tmp_path / "shared.json"
+    path.write_text(json.dumps({
+        "kind": "flamingo-stitcher-configuration",
+        "stitching_config": ser(cfg),
+    }))
+
+    blob = json.loads(path.read_text())["stitching_config"]
+    dialog._apply_stitching_config(blob)
+    out = dialog._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+    assert out.destripe_params == cfg.destripe_params
+    assert out.deconvolution_iterations == cfg.deconvolution_iterations
+    assert out.quality_threshold == cfg.quality_threshold
+
+
+def test_both_dialog_classes_have_the_save_button(qapp):
+    from flamingo_stitcher.gui.stitching_dialog import (
+        NativeStitchingDialog,
+        StitchingDialog,
+    )
+
+    for cls in (StitchingDialog, NativeStitchingDialog):
+        d = cls()
+        try:
+            assert hasattr(d, "_save_config_btn")
+        finally:
+            d.deleteLater()

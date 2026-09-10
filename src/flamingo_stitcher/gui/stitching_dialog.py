@@ -518,14 +518,27 @@ class StitchingDialog(PersistentDialog):
         self._load_config_btn = QPushButton("Load Configuration…")
         self._load_config_btn.setToolTip(
             "Load stitching settings from another run's stitch_metadata.json\n"
-            "(or a saved configuration file) to reuse a setup that worked —\n"
-            "e.g. one shared by another user.\n\n"
-            "Applies processing options only. Pixel size, Z spacing, frame AOI\n"
-            "and the output location are left as they are and re-detected by\n"
-            "Discover, so the settings transfer cleanly to your own data."
+            "or a saved configuration file — e.g. a setup that worked on the\n"
+            "microscope computer, reused here on your own data.\n\n"
+            "Applies everything that shapes the output: processing options,\n"
+            "destripe tuning, deconvolution parameters, registration\n"
+            "thresholds and border QC.\n\n"
+            "Left alone: pixel size, Z spacing and frame AOI (Discover measures\n"
+            "those from your own acquisition), the output location, and this\n"
+            "machine's memory and worker limits."
         )
         self._load_config_btn.clicked.connect(self._on_load_configuration)
         queue_btn_layout.addWidget(self._load_config_btn)
+
+        self._save_config_btn = QPushButton("Save Configuration…")
+        self._save_config_btn.setToolTip(
+            "Write the current settings to a file others can load.\n\n"
+            "The same thing a completed run records in its\n"
+            "stitch_metadata.json, but without having to finish a run first —\n"
+            "so a setup can be shared before it is used in anger."
+        )
+        self._save_config_btn.clicked.connect(self._on_save_configuration)
+        queue_btn_layout.addWidget(self._save_config_btn)
 
         queue_layout.addLayout(queue_btn_layout)
         queue_group.setLayout(queue_layout)
@@ -3252,9 +3265,15 @@ class StitchingDialog(PersistentDialog):
     # (physical geometry) or to this machine, so a *shared* configuration must
     # not overwrite them. Discover re-derives the file-specific ones from the
     # actual data; the output/scratch locations are environment-specific.
-    _NONSHAREABLE_CONFIG_FIELDS = frozenset(
-        {"pixel_size_um", "z_step_um", "frame_width", "frame_height", "scratch_dir"}
-    )
+    # Recorded in a configuration file but never applied here: geometry that
+    # Discover re-measures, machine limits that do not transfer between boxes,
+    # and pure provenance. Defined ONCE, in the pipeline, so this cannot drift
+    # from what the writer actually emits.
+    @property
+    def _NONSHAREABLE_CONFIG_FIELDS(self):
+        from flamingo_stitcher.pipeline import NON_APPLICABLE_CONFIG_FIELDS
+
+        return NON_APPLICABLE_CONFIG_FIELDS
 
     @staticmethod
     def _set_combo_by_data(combo, value) -> bool:
@@ -3269,6 +3288,76 @@ class StitchingDialog(PersistentDialog):
                 combo.setCurrentIndex(i)
                 return True
         return False
+
+    def _on_save_configuration(self):
+        """Write the current settings to a shareable configuration file.
+
+        The same block a completed run records in stitch_metadata.json, so
+        `Load Configuration` reads either without knowing the difference --
+        but available before a run has finished, which is what makes a setup
+        shareable while it is still being decided.
+        """
+        from flamingo_stitcher.pipeline import serialize_stitching_config
+
+        try:
+            config = self._build_config()
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Couldn't build the configuration",
+                f"Could not read the current settings:\n\n{e}",
+            )
+            return
+
+        start_dir = (
+            self._output_dir_edit.text().strip()
+            or QSettings().value(_LAST_BROWSE_KEY, "", type=str)
+            or ""
+        )
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Stitching Configuration",
+            str(Path(start_dir) / "stitching_configuration.json")
+            if start_dir
+            else "stitching_configuration.json",
+            "Stitching configuration (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".json"):
+            path += ".json"
+
+        from datetime import datetime
+
+        from flamingo_stitcher import __version__
+
+        payload = {
+            # Named so a human opening the file knows what it is, and so Load
+            # can tell a configuration from a stitch_metadata.json at a glance.
+            "kind": "flamingo-stitcher-configuration",
+            "version": __version__,
+            "saved": datetime.now().isoformat(timespec="seconds"),
+            "stitching_config": serialize_stitching_config(config),
+        }
+        try:
+            Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except Exception as e:
+            QMessageBox.warning(
+                self,
+                "Couldn't save the configuration",
+                f"Could not write:\n{path}\n\n{e}",
+            )
+            return
+
+        n = len(payload["stitching_config"])
+        self._log(f"Saved stitching configuration to {Path(path).name} ({n} settings)")
+        QMessageBox.information(
+            self,
+            "Configuration saved",
+            f"Wrote {n} setting(s) to:\n{Path(path).name}\n\n"
+            "Load it on another machine with Load Configuration to reproduce "
+            "this setup on different data.",
+        )
 
     def _on_load_configuration(self):
         """Load processing settings from a run's stitch_metadata.json (or a
@@ -3328,19 +3417,40 @@ class StitchingDialog(PersistentDialog):
                 "frame_width": "frame AOI",
                 "frame_height": "frame AOI",
                 "scratch_dir": "scratch location",
+                "max_memory_gb": "memory ceiling",
+                "preprocess_workers": "worker counts",
+                "fuse_workers": "worker counts",
+                "destripe_workers": "worker counts",
+                "zarr_use_tensorstore": "zarr writer backend",
+                "scope_profile_source": "which scope profile the run used",
             }
             pretty = sorted({labels.get(s, s) for s in skipped})
             self._log(
-                "  Left unchanged (acquisition/environment specific, re-detected "
-                "by Discover): " + ", ".join(pretty) + "."
+                "  Left unchanged (this acquisition's geometry and this "
+                "machine's limits): " + ", ".join(pretty) + "."
             )
-        QMessageBox.information(
-            self,
-            "Configuration loaded",
-            f"Applied {applied} processing setting(s) from:\n{Path(path).name}\n\n"
-            "Pixel size, Z spacing, frame AOI and the output location were left "
-            "as they are — run Discover to detect those from your acquisition.",
+        psf = getattr(self, "_psf_path_unavailable", "")
+        if psf:
+            self._log(
+                f"  WARNING: the configuration names a PSF file that is not on "
+                f"this machine, so deconvolution keeps its current PSF: {psf}"
+            )
+
+        detail = (
+            f"Applied {applied} setting(s) from:\n{Path(path).name}\n\n"
+            "This includes the processing options, destripe tuning, "
+            "deconvolution parameters and registration thresholds — everything "
+            "that shaped the original run.\n\n"
+            "Left as they are: pixel size, Z spacing and frame AOI (Discover "
+            "measures those from your own acquisition), the output location, "
+            "and this machine's memory and worker limits."
         )
+        if psf:
+            detail += (
+                f"\n\nThe PSF file it names is not on this machine, so "
+                f"deconvolution kept its current PSF:\n{psf}"
+            )
+        QMessageBox.information(self, "Configuration loaded", detail)
 
     def _apply_stitching_config(self, cfg: dict):
         """Apply a serialized StitchingConfig dict to the current widgets.
@@ -3352,12 +3462,22 @@ class StitchingDialog(PersistentDialog):
         """
         applied = 0
         skipped = set()
+        non_shareable = self._NONSHAREABLE_CONFIG_FIELDS
+        # Every field the WIDGET pass below consumes. Recorded as it goes rather
+        # than kept as a second list: whatever is left over is what no control
+        # owns, and that is exactly the set that has to be carried into the run
+        # as an override. A hand-maintained list here would drift the same way
+        # the shareable whitelist did.
+        handled = set()
 
         def has(name):
-            return name in cfg and name not in self._NONSHAREABLE_CONFIG_FIELDS
+            if name in cfg and name not in non_shareable:
+                handled.add(name)
+                return True
+            return False
 
-        # Note which non-shareable fields the file carried, for the summary.
-        for name in self._NONSHAREABLE_CONFIG_FIELDS:
+        # Note which non-applicable fields the file carried, for the summary.
+        for name in non_shareable:
             if name in cfg:
                 skipped.add(name)
 
@@ -3371,6 +3491,7 @@ class StitchingDialog(PersistentDialog):
         # matches the (now-applied) format.
         fmt = self._format_combo.currentData()
         comp = None
+        handled.update({"tiff_compression", "zarr_compression"} & set(cfg))
         if fmt in ("ome-tiff", "both") and has("tiff_compression"):
             comp = cfg["tiff_compression"]
         elif fmt in ("ome-zarr-sharded", "ome-zarr-v2", "both") and has(
@@ -3462,6 +3583,39 @@ class StitchingDialog(PersistentDialog):
             # Apply immediately too, in case channels are already populated.
             self._bg_zero_panel.set_thresholds(thr)
             applied += 1
+
+        # Whatever is left has no control in this dialog -- destripe tuning
+        # (sigma, wavelet, level), the deconvolution parameters, the border-QC
+        # numbers, the registration thresholds that live in the Options tab.
+        # Those are most of a real processing setup, and dropping them is why
+        # "Load Configuration" only ever reproduced half a run. Carry them and
+        # apply them to the config the worker actually gets.
+        overrides = {}
+        for name, value in cfg.items():
+            if name in handled or name in non_shareable:
+                continue
+            if name == "deconvolution_psf_path":
+                continue  # handled below: a path is only worth taking if it exists
+            overrides[name] = value
+
+        # A PSF path from another machine is meaningless unless the PSF came
+        # with it. Take it when the file is really there, say so when it is not
+        # -- silently keeping a dead path would fail the run much later.
+        psf = cfg.get("deconvolution_psf_path")
+        self._psf_path_unavailable = ""
+        if psf:
+            try:
+                exists = Path(str(psf)).is_file()
+            except Exception:
+                exists = False
+            if exists:
+                overrides["deconvolution_psf_path"] = psf
+                applied += 1
+            else:
+                self._psf_path_unavailable = str(psf)
+
+        self._loaded_config_overrides = overrides
+        applied += len(overrides)
 
         # A shared config can re-check options whose backend is missing on this
         # box (e.g. Destripe with pystripe absent); re-gate so those clear.
@@ -4220,6 +4374,73 @@ class StitchingDialog(PersistentDialog):
             self._log(f"⚠ {message}")
         return item_config
 
+    @staticmethod
+    def _coerce_config_value(current, value):
+        """JSON round-trips lose types the dataclass cares about.
+
+        `serialize_stitching_config` stringifies dict keys so json.dumps will
+        accept them, and JSON has no tuples. Rebuild both shapes from whatever
+        the field currently holds -- getting this wrong is silent: an int-keyed
+        per-channel threshold dict with string keys simply never matches a
+        channel, and nothing raises.
+        """
+        if isinstance(current, dict) and isinstance(value, dict):
+            int_keyed = bool(current) and all(
+                isinstance(k, int) for k in current
+            )
+            if int_keyed:
+                out = {}
+                for k, v in value.items():
+                    try:
+                        out[int(k)] = v
+                    except (TypeError, ValueError):
+                        out[k] = v
+                return out
+            return dict(value)
+        if isinstance(current, tuple) and isinstance(value, list):
+            return tuple(value)
+        return value
+
+    def _apply_loaded_overrides(self, item_config):
+        """Apply loaded settings that no control in this dialog owns.
+
+        Destripe tuning (sigma, wavelet, level, direction), the deconvolution
+        parameters, depth attenuation, the border-QC numbers, the registration
+        thresholds that live in the Options tab -- none of these has a widget
+        here, so the widget pass in `_apply_stitching_config` cannot carry them.
+        They are most of a real processing setup, and until now a loaded
+        configuration silently dropped every one.
+        """
+        overrides = getattr(self, "_loaded_config_overrides", None)
+        if not overrides:
+            return item_config
+
+        applied, unknown = [], []
+        for name, value in overrides.items():
+            if not hasattr(item_config, name):
+                unknown.append(name)  # a file from a newer build
+                continue
+            try:
+                setattr(
+                    item_config,
+                    name,
+                    self._coerce_config_value(getattr(item_config, name), value),
+                )
+                applied.append(name)
+            except Exception:
+                unknown.append(name)
+        if applied:
+            self._log(
+                f"  Loaded configuration also set {len(applied)} setting(s) with "
+                f"no control in this dialog: {', '.join(sorted(applied))}"
+            )
+        if unknown:
+            self._log(
+                f"  Loaded configuration named {len(unknown)} setting(s) this "
+                f"build does not have (ignored): {', '.join(sorted(unknown))}"
+            )
+        return item_config
+
     def _apply_scope_profile(self, item_config, acq_path):
         """Swap in this acquisition's microscope + objective stitching options.
 
@@ -4304,6 +4525,12 @@ class StitchingDialog(PersistentDialog):
         # can plausibly be wrong, are facts about an instrument. Resolved per
         # item so a queue mixing rigs gets each one's own tuning.
         item_config = self._apply_scope_profile(item_config, item["path"])
+
+        # A configuration the user loaded is an explicit choice for THIS run, so
+        # it wins over the per-microscope destripe preset and scope profile
+        # resolved above. That is the precedence scope_profiles documents:
+        # defaults -> YAML -> profile -> an explicit control for this run.
+        item_config = self._apply_loaded_overrides(item_config)
 
         self._worker = StitchingWorker(
             config=item_config,

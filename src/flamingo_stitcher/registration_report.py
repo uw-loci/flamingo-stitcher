@@ -1472,6 +1472,7 @@ def write_report(
     *,
     acquisition: str = "",
     write_json: bool = False,
+    prefix: str = "",
     logger=None,
 ) -> Dict[str, Path]:
     """Write the CSVs and the text summary into `output_dir`.
@@ -1479,6 +1480,22 @@ def write_report(
     Into the OUTPUT directory, deliberately — not beside the log where border QC
     puts its report. These numbers describe the store sitting next to them and
     have to travel with it when someone copies the result off the rig.
+
+    ``prefix`` is the run's output basename, and it is what stops a second
+    stitch into the same folder DESTROYING the first one's evidence. The image
+    already carried its settings in its name (``..._flatfield``,
+    ``..._xy8x_z1x``) while these files did not, so three stitches of one
+    acquisition left three TIFFs and exactly ONE report — describing whichever
+    ran last. These files are the only record of how a run placed its tiles;
+    losing them silently is worse than losing the image, which at least is
+    obviously missing.
+
+    With a prefix, EACH file is written twice: once under its documented name
+    and once prefixed. The documented name always holds the newest run, because
+    that is the name the troubleshooting guide tells people to open and the one
+    every habit and script already reaches for; the prefixed copy is the one
+    that survives the next stitch. Both are a few KB of text, a cheap price for
+    never having to explain that the evidence is gone.
 
     Best-effort per file: an unwritable path warns and is omitted from the
     returned mapping. Evidence about a run must never be the thing that fails
@@ -1508,11 +1525,18 @@ def write_report(
             )
         )
 
+    stem = str(prefix).strip().strip("_")
     for key, name, render in payloads:
         path = directory / name
         try:
-            path.write_text(render(), encoding="utf-8")
+            content = render()
+            path.write_text(content, encoding="utf-8")
             written[key] = path
+            if stem:
+                per_run = directory / f"{stem}_{name}"
+                if per_run != path:
+                    per_run.write_text(content, encoding="utf-8")
+                    written[f"{key}_per_run"] = per_run
         except Exception as exc:
             if logger is not None:
                 logger.warning(f"Could not write {name}: {exc}")

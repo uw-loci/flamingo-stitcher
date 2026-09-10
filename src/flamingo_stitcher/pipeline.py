@@ -61,12 +61,40 @@ REGISTRATION_OVERLAP_TARGET_PX = 32
 REFERENCE_Z_STEP_UM = 10.0
 
 
-# StitchingConfig fields recorded into stitch_metadata.json's "stitching_config"
-# block so a run's settings can be reloaded into the GUI ("Load Configuration",
-# to share a setup that worked). The file-specific ones at the end are recorded
-# for provenance; the GUI loader deliberately skips them (Discover re-derives
-# them from the actual acquisition). Order is presentation-only.
-SHAREABLE_CONFIG_FIELDS = (
+# Fields re-derived from the acquisition itself. A shared configuration records
+# them for provenance but must never apply them: they describe THIS data, and
+# Discover measures them again for the next dataset.
+ACQUISITION_CONFIG_FIELDS = frozenset(
+    {"pixel_size_um", "z_step_um", "frame_width", "frame_height"}
+)
+
+# Fields that describe the MACHINE, not the processing. Recorded, never applied:
+# carrying a 191 GB box's memory ceiling or its core count onto a laptop is how
+# a shared configuration turns into a support call. `deconvolution_psf_path` is
+# handled separately by the loader -- applied when the file exists here, skipped
+# when it does not, because the path only means anything if the PSF travelled.
+MACHINE_CONFIG_FIELDS = frozenset(
+    {
+        "max_memory_gb",
+        "preprocess_workers",
+        "fuse_workers",
+        "destripe_workers",
+        "zarr_use_tensorstore",
+    }
+)
+
+# Provenance only: which scope profile shaped the run that produced the file.
+# Applying it would claim this run read a profile it never did.
+PROVENANCE_CONFIG_FIELDS = frozenset({"scope_profile_source"})
+
+# Local paths and this run's inputs. Never travel in any form.
+_PRIVATE_CONFIG_FIELDS = frozenset(
+    {"scratch_dir", "acquisition_dir", "output_dir", "channels"}
+)
+
+# Presentation order, so a stitch_metadata.json diff stays readable. This is
+# NOT the gate -- see below.
+_CONFIG_FIELD_ORDER = (
     "illumination_fusion",
     "split_illumination",
     "tile_overlap_fusion",
@@ -128,12 +156,36 @@ SHAREABLE_CONFIG_FIELDS = (
     "border_qc_beta",
     "border_qc_min_component_px",
     "border_qc_z_stride",
-    # File-specific (recorded for provenance; GUI loader skips these):
     "pixel_size_um",
     "z_step_um",
     "frame_width",
     "frame_height",
 )
+
+
+def _shareable_config_fields():
+    """Every StitchingConfig field that belongs in stitch_metadata.json.
+
+    Computed by SUBTRACTION rather than kept as a whitelist. The whitelist WAS
+    the bug: it had to be edited by hand whenever a setting was added, nobody
+    remembered, and 34 real processing settings never travelled -- every
+    destripe tuning parameter (sigma, wavelet, level), every deconvolution
+    parameter, depth attenuation, the tile-orientation overrides. A
+    configuration exists to reproduce a run, so anything that changes the output
+    and is not excluded above is part of it.
+    """
+    import dataclasses
+
+    # Machine and acquisition fields ARE written -- a stitch_metadata.json is a
+    # record of what a run did as well as a recipe, and "how many workers, what
+    # memory ceiling" is exactly what a slow or dead run gets diagnosed from.
+    # The GUI loader refuses to APPLY them; see NON_APPLICABLE_CONFIG_FIELDS.
+    excluded = _PRIVATE_CONFIG_FIELDS
+    names = [f.name for f in dataclasses.fields(StitchingConfig)]
+    known = set(names)
+    first = [n for n in _CONFIG_FIELD_ORDER if n in known and n not in excluded]
+    seen = set(first)
+    return tuple(first + [n for n in names if n not in seen and n not in excluded])
 
 
 def serialize_stitching_config(config) -> Dict[str, Any]:
@@ -1378,6 +1430,24 @@ ISO_DOWNSAMPLE = -1
 #: Never chunk finer than this (px). Below it, zarr shard/chunk bookkeeping and
 #: per-block dask overhead cost more than the memory saved.
 _MIN_CHUNK_PX = 64
+
+
+#: Every setting written into stitch_metadata.json's "stitching_config" block,
+#: so a run can be reproduced elsewhere. Derived from the dataclass, so a new
+#: setting travels the day it is added -- see :func:`_shareable_config_fields`.
+SHAREABLE_CONFIG_FIELDS = _shareable_config_fields()
+
+#: Recorded, but never applied by the GUI loader: geometry Discover re-measures,
+#: machine limits that do not transfer, and pure provenance.
+NON_APPLICABLE_CONFIG_FIELDS = (
+    ACQUISITION_CONFIG_FIELDS
+    | MACHINE_CONFIG_FIELDS
+    | PROVENANCE_CONFIG_FIELDS
+    # Not written any more, but a file from an older build still carries a
+    # scratch path. Applying one would point this machine at another machine's
+    # disk — a failure that surfaces only once the run needs the space.
+    | _PRIVATE_CONFIG_FIELDS
+)
 
 
 def resolve_output_chunksize(
@@ -4123,7 +4193,7 @@ class StitchingPipeline:
             include_z_seams=bool(self.config.border_qc_include_z_seams),
         )
 
-    def _write_registration_report(self, output_path, acquisition_dir):
+    def _write_registration_report(self, output_path, acquisition_dir, basename=""):
         """Write the registration evidence next to the stitched output.
 
         Into the OUTPUT directory, unlike border QC, which puts its report
@@ -4146,6 +4216,7 @@ class StitchingPipeline:
             report,
             acquisition=acq_name,
             write_json=bool(self.config.registration_report_json),
+            prefix=basename or self._build_output_basename(Path(acquisition_dir)),
             logger=self.logger,
         )
         for line in registration_report.format_report_text(
@@ -4874,7 +4945,7 @@ class StitchingPipeline:
 
         if self.config.registration_report_enabled:
             try:
-                self._write_registration_report(output_path, acquisition_dir)
+                self._write_registration_report(output_path, acquisition_dir, basename)
             except Exception as exc:  # evidence must never fail a run
                 self.logger.warning(f"Registration report skipped: {exc}")
 
@@ -5673,7 +5744,7 @@ class StitchingPipeline:
 
         if self.config.registration_report_enabled:
             try:
-                self._write_registration_report(output_path, acquisition_dir)
+                self._write_registration_report(output_path, acquisition_dir, basename)
             except Exception as exc:  # evidence must never fail a run
                 self.logger.warning(f"Registration report skipped: {exc}")
 
@@ -8916,6 +8987,40 @@ class StitchingPipeline:
                     f"  Streaming OME-TIFF write failed: {e}", exc_info=True
                 )
 
+    def _write_metadata_json(self, output_dir: Path, metadata: dict, basename: str = ""):
+        """Write stitch_metadata.json, and a per-run copy beside it.
+
+        TWO files on purpose. Three stitches of one acquisition into one folder
+        produce three differently-named images but shared this single fixed
+        filename, so each run silently destroyed the previous one's record of
+        how it was made.
+
+        The canonical name still holds the newest run, because Sample View and
+        the pipeline importer read it at a FIXED path
+        (`session_manager.py`, `sample_view.py`) and renaming it would break
+        loading stitched data. The per-run copy is what survives the next
+        stitch, and Load Configuration reads either.
+        """
+        import json as _json
+
+        text = _json.dumps(metadata, indent=2)
+        meta_path = output_dir / "stitch_metadata.json"
+        meta_path.write_text(text)
+        self.logger.info(f"  Wrote {meta_path}")
+
+        stem = str(basename or "").strip().strip("_")
+        if stem:
+            per_run = output_dir / f"{stem}_stitch_metadata.json"
+            if per_run != meta_path:
+                try:
+                    per_run.write_text(text)
+                    self.logger.info(
+                        f"  Wrote {per_run} (kept per-run, so the next stitch "
+                        f"into this folder cannot overwrite it)"
+                    )
+                except Exception as exc:  # noqa: BLE001 - provenance, not the run
+                    self.logger.warning(f"  Could not write {per_run}: {exc}")
+
     def _write_stitch_metadata_v2(
         self,
         output_dir: Path,
@@ -9028,9 +9133,7 @@ class StitchingPipeline:
             "stitching_config": serialize_stitching_config(self.config),
         }
 
-        meta_path = output_dir / "stitch_metadata.json"
-        meta_path.write_text(json.dumps(metadata, indent=2))
-        self.logger.info(f"  Wrote {meta_path}")
+        self._write_metadata_json(output_dir, metadata, basename)
 
     def _register_and_fuse(
         self,
@@ -9361,9 +9464,9 @@ class StitchingPipeline:
             "tile_count": len(tiles),
         }
 
-        meta_path = output_dir / "stitch_metadata.json"
-        meta_path.write_text(json.dumps(metadata, indent=2))
-        self.logger.info(f"  Wrote {meta_path}")
+        self._write_metadata_json(
+            output_dir, metadata, self._build_output_basename(Path(acquisition_dir))
+        )
 
     def _save_as_tiff(self, sim, path: Path) -> None:
         """Save a SpatialImage to TIFF via tifffile."""
