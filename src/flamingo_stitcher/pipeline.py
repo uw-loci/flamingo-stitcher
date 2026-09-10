@@ -4327,7 +4327,7 @@ class StitchingPipeline:
         # useless partial spill — drop it and re-raise (the caller swallows).
         try:
             probe = self._preprocess_single_tile(
-                tiles[0], ref_ch, illum_side=reuse_side
+                tiles[0], ref_ch, illum_side=reuse_side, shape_only=True
             )
             shape = probe.shape
             del probe
@@ -5205,7 +5205,7 @@ class StitchingPipeline:
                 / ".stitch_tmp"
                 / f"reg_ch{ref_ch:02d}"
             )
-            probe = self._preprocess_single_tile(tiles[0], ref_ch)
+            probe = self._preprocess_single_tile(tiles[0], ref_ch, shape_only=True)
             ref_shape = probe.shape
             del probe
             gc.collect()
@@ -5870,7 +5870,11 @@ class StitchingPipeline:
         return out
 
     def _preprocess_single_tile(
-        self, tile: RawTileInfo, ch_id: int, illum_side: Optional[int] = None
+        self,
+        tile: RawTileInfo,
+        ch_id: int,
+        illum_side: Optional[int] = None,
+        shape_only: bool = False,
     ) -> np.ndarray:
         """Load and preprocess a single tile for one channel.
 
@@ -5882,6 +5886,14 @@ class StitchingPipeline:
         (used by the ``split_illumination`` diagnostic). When set and present on
         the tile, only that side is loaded and illumination fusion is skipped; if
         the requested side is absent the tile's available side(s) are used.
+
+        ``shape_only`` skips the stages that cannot change the result's SHAPE.
+        Destripe, deconvolution and depth attenuation are filters; only
+        ``downsample_volume`` resizes anything. Callers that want the shape and
+        throw the pixels away were paying for the whole chain to learn a tuple:
+        the 2026-09-09 run destriped tile 1 twice, 93 s of it wasted, and at
+        2.5 µm Z or with deconvolution on it is several times worse. The
+        returned array is NOT valid image data — use it for ``.shape`` only.
         """
         illum_files = tile.raw_files.get(ch_id, {})
         if not illum_files:
@@ -5896,7 +5908,9 @@ class StitchingPipeline:
         # downsampled, already-fused tile as a speed/quality trade-off; see
         # below.) Single-side acquisitions (e.g. ASLM) have one entry, so this is
         # just "destripe the tile".
-        _destripe_per_side = self.config.destripe and not self.config.destripe_fast
+        _destripe_per_side = (
+            self.config.destripe and not self.config.destripe_fast and not shape_only
+        )
 
         illum_volumes = {}
         for illum_side, raw_path in illum_files.items():
@@ -5945,7 +5959,7 @@ class StitchingPipeline:
         if _ff_model is not None:
             volume = self._apply_flatfield_volume(volume, _ff_model)
 
-        if self.config.depth_attenuation:
+        if self.config.depth_attenuation and not shape_only:
             from .depth_attenuation import correct_depth_attenuation
 
             z_step = self.config.z_step_um
@@ -5958,7 +5972,7 @@ class StitchingPipeline:
         # (Non-fast destripe already ran per illumination side, before fusion.)
 
         _deconv_fast = bool(getattr(self.config, "deconvolution_fast", False))
-        if self.config.deconvolution_enabled and not _deconv_fast:
+        if self.config.deconvolution_enabled and not _deconv_fast and not shape_only:
             volume = self._deconvolve_tile(volume, tile)
 
         if self.config.downsample_xy > 1 or self.config.downsample_z > 1:
@@ -5966,7 +5980,7 @@ class StitchingPipeline:
                 volume, self.config.downsample_xy, self.config.downsample_z
             )
 
-        if self.config.destripe and self.config.destripe_fast:
+        if self.config.destripe and self.config.destripe_fast and not shape_only:
             volume = destripe_volume(
                 volume,
                 max_workers=self._destripe_worker_budget(),
@@ -5981,7 +5995,7 @@ class StitchingPipeline:
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far
         # cheaper (fewer voxels + smaller PSF) but lower quality, since the PSF
         # blur is estimated/removed at reduced resolution. Off by default.
-        if self.config.deconvolution_enabled and _deconv_fast:
+        if self.config.deconvolution_enabled and _deconv_fast and not shape_only:
             volume = self._deconvolve_tile(volume, tile)
 
         # Per-tile camera→stage orientation. Reorient each tile's pixels so its

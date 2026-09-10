@@ -327,6 +327,25 @@ class StitchingDialog(PersistentDialog):
     # clobber each other's queue/options.
     _settings_group = _SETTINGS_GROUP
 
+    # Which acquisition types a configuration saved HERE applies to, used to
+    # name the saved file and to warn on load.
+    #
+    # "all-workflows" is the honest answer for this tab and Single Workflow:
+    # they differ only in how tiles are DISCOVERED (folder-per-tile vs flat),
+    # which is not a setting a configuration carries, so every processing value
+    # transfers between them unchanged. Multi-View is the real exception — see
+    # MultiViewStitchingDialog.
+    _workflow_kind = "all-workflows"
+
+    # Settings that only mean anything on a multi-angle acquisition. Loading
+    # them into a single-angle run would silently switch on multi-view fusion,
+    # so they are refused rather than applied — by FIELD, not by the file's own
+    # label, because a stitch_metadata.json from a multi-view run carries no
+    # label at all.
+    _MULTIVIEW_ONLY_FIELDS = frozenset(
+        {"multiview_fusion", "rotation_sign", "rotation_center_um"}
+    )
+
     def __init__(self, parent=None, **kwargs):
         # **kwargs forwards PersistentDialog options (geometry_manager,
         # window_id) so the host app can inject its own geometry manager when
@@ -3314,12 +3333,13 @@ class StitchingDialog(PersistentDialog):
             or QSettings().value(_LAST_BROWSE_KEY, "", type=str)
             or ""
         )
+        # Name the file after what it applies to, so a folder of saved setups
+        # says which is which and an overwrite prompt is readable.
+        default_name = f"stitching_configuration_{self._workflow_kind}.json"
         path, _ = QFileDialog.getSaveFileName(
             self,
             "Save Stitching Configuration",
-            str(Path(start_dir) / "stitching_configuration.json")
-            if start_dir
-            else "stitching_configuration.json",
+            str(Path(start_dir) / default_name) if start_dir else default_name,
             "Stitching configuration (*.json);;All files (*)",
         )
         if not path:
@@ -3336,6 +3356,11 @@ class StitchingDialog(PersistentDialog):
             # can tell a configuration from a stitch_metadata.json at a glance.
             "kind": "flamingo-stitcher-configuration",
             "version": __version__,
+            # What these settings apply to. "all-workflows" means every
+            # processing value transfers as-is between the Multi-Acquisition and
+            # Single Workflow tabs; "multi-view" carries rotation settings that
+            # belong only to a multi-angle acquisition.
+            "workflow": self._workflow_kind,
             "saved": datetime.now().isoformat(timespec="seconds"),
             "stitching_config": serialize_stitching_config(config),
         }
@@ -3350,11 +3375,24 @@ class StitchingDialog(PersistentDialog):
             return
 
         n = len(payload["stitching_config"])
-        self._log(f"Saved stitching configuration to {Path(path).name} ({n} settings)")
+        kind = self._workflow_kind
+        self._log(
+            f"Saved stitching configuration to {Path(path).name} "
+            f"({n} settings, applies to: {kind})"
+        )
+        scope = (
+            "These settings apply to any acquisition type — the Multi-"
+            "Acquisition and Single Workflow tabs differ only in how tiles are "
+            "found, not in how they are processed."
+            if kind == "all-workflows"
+            else "These settings include multi-angle rotation values, so they "
+            "belong to a Multi-View acquisition. Loading them into another tab "
+            "will apply everything EXCEPT the rotation settings."
+        )
         QMessageBox.information(
             self,
             "Configuration saved",
-            f"Wrote {n} setting(s) to:\n{Path(path).name}\n\n"
+            f"Wrote {n} setting(s) to:\n{Path(path).name}\n\n{scope}\n\n"
             "Load it on another machine with Load Configuration to reproduce "
             "this setup on different data.",
         )
@@ -3408,7 +3446,11 @@ class StitchingDialog(PersistentDialog):
             return
 
         applied, skipped = self._apply_stitching_config(cfg)
-        self._log(f"Loaded stitching configuration from {Path(path).name}")
+        source_kind = data.get("workflow") if isinstance(data, dict) else None
+        self._log(
+            f"Loaded stitching configuration from {Path(path).name}"
+            + (f" (saved for: {source_kind})" if source_kind else "")
+        )
         self._log(f"  Applied {applied} setting(s) from the shared configuration.")
         if skipped:
             labels = {
@@ -3435,6 +3477,14 @@ class StitchingDialog(PersistentDialog):
                 f"  WARNING: the configuration names a PSF file that is not on "
                 f"this machine, so deconvolution keeps its current PSF: {psf}"
             )
+        refused = getattr(self, "_refused_multiview_fields", [])
+        if refused:
+            self._log(
+                "  Skipped multi-angle settings from a Multi-View "
+                f"configuration ({', '.join(sorted(refused))}) — this tab "
+                "stitches single-angle acquisitions. Everything else was "
+                "applied."
+            )
 
         detail = (
             f"Applied {applied} setting(s) from:\n{Path(path).name}\n\n"
@@ -3449,6 +3499,12 @@ class StitchingDialog(PersistentDialog):
             detail += (
                 f"\n\nThe PSF file it names is not on this machine, so "
                 f"deconvolution kept its current PSF:\n{psf}"
+            )
+        if refused:
+            detail += (
+                "\n\nThis file came from a Multi-View acquisition. Its "
+                "multi-angle settings were skipped because this tab stitches "
+                "single-angle data; everything else was applied."
             )
         QMessageBox.information(self, "Configuration loaded", detail)
 
@@ -3591,11 +3647,23 @@ class StitchingDialog(PersistentDialog):
         # "Load Configuration" only ever reproduced half a run. Carry them and
         # apply them to the config the worker actually gets.
         overrides = {}
+        self._refused_multiview_fields = []
+        multiview_here = self._workflow_kind == "multi-view"
         for name, value in cfg.items():
             if name in handled or name in non_shareable:
                 continue
             if name == "deconvolution_psf_path":
                 continue  # handled below: a path is only worth taking if it exists
+            if not multiview_here and name in self._MULTIVIEW_ONLY_FIELDS:
+                # Multi-angle rotation settings on a single-angle tab. Applying
+                # multiview_fusion here would quietly change what the run
+                # PRODUCES, not merely how it is tuned, so it is refused and
+                # said out loud. Checked by field rather than by the file's
+                # label: a stitch_metadata.json from a multi-view run carries no
+                # label at all.
+                if value not in (None, False):
+                    self._refused_multiview_fields.append(name)
+                continue
             overrides[name] = value
 
         # A PSF path from another machine is meaningless unless the PSF came
@@ -6370,6 +6438,11 @@ class MultiViewStitchingDialog(StitchingDialog):
     # (A past crash came from shadowing this name with a QWidget; the widget
     # container is ``self._config_container``, kept separate.)
     _settings_group = _MULTIVIEW_SETTINGS_GROUP
+
+    # The one tab whose configuration is NOT portable: _build_config forces
+    # multiview_fusion on and adds the rotation sign/centre, which describe a
+    # multi-angle acquisition and would be wrong anywhere else.
+    _workflow_kind = "multi-view"
 
     def __init__(self, parent=None, **kwargs):
         super().__init__(parent=parent, **kwargs)

@@ -307,3 +307,106 @@ def test_both_dialog_classes_have_the_save_button(qapp):
             assert hasattr(d, "_save_config_btn")
         finally:
             d.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# Which acquisition types does a configuration apply to?
+#
+# Multi-Acquisition and Single Workflow differ only in how tiles are DISCOVERED
+# (folder-per-tile vs flat), which is not something a configuration carries, so
+# every processing value transfers between them unchanged. Multi-View is the
+# exception: its _build_config forces multiview_fusion on and adds the rotation
+# sign/centre. Letting those reach a single-angle tab would change what the run
+# PRODUCES, not merely how it is tuned.
+# ---------------------------------------------------------------------------
+
+
+def _multiview_dialog(qapp):
+    from flamingo_stitcher.gui.stitching_dialog import MultiViewStitchingDialog
+
+    return MultiViewStitchingDialog()
+
+
+def test_the_portable_tabs_say_all_workflows(qapp):
+    from flamingo_stitcher.gui.stitching_dialog import (
+        NativeStitchingDialog,
+        StitchingDialog,
+    )
+
+    for cls in (StitchingDialog, NativeStitchingDialog):
+        assert cls._workflow_kind == "all-workflows"
+
+
+def test_multi_view_says_so(qapp):
+    from flamingo_stitcher.gui.stitching_dialog import MultiViewStitchingDialog
+
+    assert MultiViewStitchingDialog._workflow_kind == "multi-view"
+
+
+def test_a_saved_file_records_what_it_applies_to(dialog):
+    from flamingo_stitcher.pipeline import serialize_stitching_config
+
+    payload = {
+        "kind": "flamingo-stitcher-configuration",
+        "workflow": dialog._workflow_kind,
+        "stitching_config": serialize_stitching_config(dialog._build_config()),
+    }
+    assert payload["workflow"] == "all-workflows"
+
+
+def test_multi_view_settings_are_refused_on_a_single_angle_tab(dialog):
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.multiview_fusion = True
+    cfg.rotation_sign = -1.0
+    out = _load_into(dialog, cfg)
+    assert out.multiview_fusion is False, "silently enabled multi-view fusion"
+    assert set(dialog._refused_multiview_fields) >= {
+        "multiview_fusion",
+        "rotation_sign",
+    }
+
+
+def test_the_refusal_is_by_field_not_by_the_files_label(dialog):
+    # A stitch_metadata.json from a multi-view RUN carries no "workflow" key,
+    # so trusting the label would let this through.
+    dialog._apply_stitching_config({"multiview_fusion": True})
+    out = dialog._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+    assert out.multiview_fusion is False
+
+
+def test_everything_else_still_applies_from_a_multi_view_file(dialog):
+    cfg = StitchingConfig.with_yaml_defaults()
+    cfg.multiview_fusion = True
+    cfg.quality_threshold = 0.55
+    cfg.destripe_direction = "horizontal"
+    out = _load_into(dialog, cfg)
+    assert out.quality_threshold == 0.55
+    assert out.destripe_direction == "horizontal"
+
+
+def test_multi_view_keeps_its_own_rotation_settings(qapp):
+    d = _multiview_dialog(qapp)
+    try:
+        cfg = StitchingConfig.with_yaml_defaults()
+        cfg.multiview_fusion = True
+        cfg.rotation_sign = -1.0
+        blob = json.loads(json.dumps(serialize_stitching_config(cfg)))
+        d._apply_stitching_config(blob)
+        out = d._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+        assert out.rotation_sign == -1.0
+        assert not d._refused_multiview_fields
+    finally:
+        d.deleteLater()
+
+
+def test_an_all_workflows_file_loads_into_multi_view_without_complaint(qapp):
+    d = _multiview_dialog(qapp)
+    try:
+        cfg = StitchingConfig.with_yaml_defaults()
+        cfg.quality_threshold = 0.55
+        d._apply_stitching_config(json.loads(json.dumps(serialize_stitching_config(cfg))))
+        out = d._apply_loaded_overrides(StitchingConfig.with_yaml_defaults())
+        assert out.quality_threshold == 0.55
+        assert not d._refused_multiview_fields
+    finally:
+        d.deleteLater()
