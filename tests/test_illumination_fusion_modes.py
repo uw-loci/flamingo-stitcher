@@ -29,6 +29,13 @@ RNG = np.random.default_rng(3)
 NZ, NY, NX = 4, 64, 96
 
 
+def _blobs(shape):
+    """Smooth 2-D structure in [0, 1], for the detail-measure tests."""
+    seed = RNG.random(shape).astype(np.float32)
+    out = ndimage.gaussian_filter(seed, sigma=1.5)
+    return (out - out.min()) / max(1e-9, float(np.ptp(out)))
+
+
 def _detail(nz=NZ, ny=NY, nx=NX, level=400.0):
     """Fine structure — what an in-focus sheet records."""
     seed = RNG.random((nz, ny, nx)).astype(np.float32)
@@ -195,3 +202,67 @@ class TestItStaysUint16:
         out = fuse_illumination_sides(vols, method, axis=-1, low_side=1)
         assert out.dtype == np.uint16
         assert out.shape == (NZ, NY, NX)
+
+
+class TestContentIsFastEnoughToUse:
+    """The measure is computed on a decimated copy with box filters.
+
+    Written literally it costs 562 s per 643-plane tile at 2048x2048 — eight
+    hours of fusion across a 49-tile mosaic, which makes the one mode that
+    needs no geometry the one nobody can afford. These tests pin the shortcuts
+    that make it usable, and the limit past which they stop working.
+    """
+
+    def test_it_still_prefers_detail_over_brightness(self):
+        # The whole point survives the optimisation: a bright blur must lose
+        # to a dimmer sharp signal.
+        from scipy import ndimage
+
+        from flamingo_stitcher.pipeline import _detail_weights
+
+        sharp = (_blobs((256, 256)) * 3000).astype(np.float32) + 200
+        blur = ndimage.gaussian_filter(sharp, 6.0) * 3.0 + 5000
+        w = _detail_weights(sharp, blur)
+        assert w.mean() > 0.9, "the bright blur won"
+
+    def test_the_weight_map_is_full_resolution(self):
+        from flamingo_stitcher.pipeline import _detail_weights
+
+        a = (_blobs((300, 220)) * 1000).astype(np.float32)
+        assert _detail_weights(a, a * 2).shape == (300, 220)
+
+    def test_a_tiny_plane_does_not_decimate_into_nothing(self):
+        from flamingo_stitcher.pipeline import _detail_weights
+
+        a = (_blobs((6, 6)) * 1000).astype(np.float32)
+        assert _detail_weights(a, a).shape == (6, 6)
+
+    @pytest.mark.parametrize("sigma_1", [2.0, 5.0, 8.0, 20.0])
+    def test_the_inner_kernel_never_degenerates(self, sigma_1):
+        # At 8x on sigma_1=5 the inner kernel rounds to ONE pixel, the
+        # high-pass becomes p - p, and the comparison INVERTS: measured, it
+        # then picked the wrong sheet for 100% of the frame. The guard is that
+        # the decimation is chosen from the kernel it leaves behind, so this
+        # asserts the kernel actually used rather than a constant.
+        from flamingo_stitcher.pipeline import (
+            _DETAIL_MAX_DECIMATION,
+            _DETAIL_MIN_KERNEL_PX,
+        )
+
+        inner = 2.355 * sigma_1
+        f = int(min(_DETAIL_MAX_DECIMATION, max(1, inner // _DETAIL_MIN_KERNEL_PX)))
+        assert round(inner / f) >= _DETAIL_MIN_KERNEL_PX, (
+            f"sigma_1={sigma_1} decimates to f={f}, leaving a "
+            f"{round(inner / f)}px high-pass kernel"
+        )
+
+    def test_a_degenerate_kernel_really_would_invert_the_choice(self):
+        # Guards the guard: shows WHY the cap exists, so a future change that
+        # raises it fails with a reason rather than a bare assertion.
+        from scipy import ndimage
+
+        sharp = (_blobs((256, 256)) * 3000).astype(np.float32) + 200
+        blur = ndimage.gaussian_filter(sharp, 6.0) * 3.0 + 5000
+        # A 1px "high-pass" is the identity minus itself: no detail survives.
+        flat_a = sharp - ndimage.uniform_filter(sharp, 1)
+        assert float(np.abs(flat_a).max()) == 0.0

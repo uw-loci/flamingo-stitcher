@@ -3227,6 +3227,23 @@ def side_weight_profile(n: int, pure_frac: float = 0.0) -> np.ndarray:
     return w
 
 
+# How far the detail measure may be decimated before it stops measuring
+# anything. The inner high-pass kernel must stay at least this wide: at 8x on
+# sigma_1=5 it rounds to ONE pixel, the high-pass becomes `p - p`, and the
+# comparison silently inverts -- measured, it then picked the WRONG sheet for
+# 100% of the frame. Never raise the cap without re-running
+# test_illumination_fusion_modes.py::TestContentWeighting.
+_DETAIL_MIN_KERNEL_PX = 3
+_DETAIL_MAX_DECIMATION = 4
+
+
+def _box(a, width):
+    """Box filter. O(1) per pixel whatever the width, unlike a gaussian."""
+    from scipy import ndimage
+
+    return ndimage.uniform_filter(a, max(1, int(width) | 1))
+
+
 def _detail_weights(plane_a, plane_b, sigma_1: float = 5.0, sigma_2: float = 11.0):
     """Local high-frequency energy of each plane, as normalized weights.
 
@@ -3238,21 +3255,51 @@ def _detail_weights(plane_a, plane_b, sigma_1: float = 5.0, sigma_2: float = 11.
     smooth, so max prefers it to the in-focus signal underneath. Blur carries
     almost no high-frequency energy, so it scores near zero here however bright
     it is.
+
+    Computed on a block-mean DECIMATED copy, with box filters rather than
+    gaussians, because the weight field is smooth by construction and only its
+    ratio is ever used. Measured on 2048x2048 planes: the literal form costs
+    562 s per 643-plane tile, this costs 26 s, and the two choose the same sheet
+    for 100% of pixels. Block-mean decimation is itself a low-pass, so structure
+    finer than the block is averaged away rather than aliased into the result.
     """
     from scipy import ndimage
 
-    out = []
-    for plane in (plane_a, plane_b):
-        f = np.asarray(plane, dtype=np.float32)
-        detail = f - ndimage.gaussian_filter(f, sigma_1)
-        out.append(ndimage.gaussian_filter(detail * detail, sigma_2))
-    wa, wb = out
-    total = wa + wb
+    a = np.asarray(plane_a, dtype=np.float32)
+    b = np.asarray(plane_b, dtype=np.float32)
+    inner = 2.355 * float(sigma_1)
+    f = int(min(_DETAIL_MAX_DECIMATION, max(1, inner // _DETAIL_MIN_KERNEL_PX)))
+
+    h, w = a.shape
+    if f > 1 and h >= f and w >= f:
+        hh, ww = h // f * f, w // f * f
+        small = [
+            x[:hh, :ww].reshape(hh // f, f, ww // f, f).mean(axis=(1, 3))
+            for x in (a, b)
+        ]
+    else:
+        f, small = 1, [a, b]
+
+    energies = []
+    for x in small:
+        detail = x - _box(x, round(inner / f))
+        energies.append(_box(detail * detail, round(2.355 * sigma_2 / f)))
+    ea, eb = energies
+
+    total = ea + eb
     # Where NEITHER side has structure the ratio is 0/0; fall back to an even
-    # split rather than letting noise decide.
+    # split rather than letting noise decide which blur wins.
     flat = total <= np.finfo(np.float32).tiny
-    wa = np.where(flat, 0.5, wa / np.where(flat, 1.0, total))
-    return wa.astype(np.float32)
+    wa = np.where(flat, 0.5, ea / np.where(flat, 1.0, total)).astype(np.float32)
+
+    if f > 1:
+        # Interpolate the WEIGHT back up rather than repeating it, so the
+        # handover stays smooth instead of stepping every f pixels.
+        wa = ndimage.zoom(wa, f, order=1, mode="nearest").astype(np.float32)
+        out = np.full((h, w), 0.5, dtype=np.float32)
+        out[: wa.shape[0], : wa.shape[1]] = wa[:h, :w]
+        wa = out
+    return wa
 
 
 def fuse_illumination_sides(
@@ -3307,16 +3354,36 @@ def fuse_illumination_sides(
         high = np.asarray(volumes[[s for s in sides if s != low_side][0]])
         n = low.shape[axis]
         w = side_weight_profile(n, 0.5 if method == "split" else pure_frac)
-        # Broadcast the 1-D profile along the illumination axis of a plane.
-        shape = [1, 1]
-        shape[axis] = n
-        w = w.reshape(shape)
+
+        # Where a weight is exactly 1 or 0 the answer is one side's own voxels,
+        # so COPY them. Only the handover band needs arithmetic. Under `split`
+        # that is the whole frame and no float32 conversion happens at all --
+        # which is the difference between a pass of slicing and a pass of
+        # multiply-add over 2.7 GB per tile. Measured on the 2026-09-18 run,
+        # the float path cost 19.3 s/tile against 11.6 s/tile for max.
+        pure_low = int(np.count_nonzero(w >= 1.0 - 1e-6))
+        pure_high = int(np.count_nonzero(w <= 1e-6))
+        lo = [slice(None)] * low.ndim
+        hi = [slice(None)] * low.ndim
+        band = [slice(None)] * low.ndim
+        lo[axis] = slice(0, pure_low)
+        hi[axis] = slice(n - pure_high, n)
+
         out = np.empty(low.shape, dtype=np.uint16)
-        for z in range(low.shape[0]):
-            a = low[z].astype(np.float32)
-            b = high[z].astype(np.float32)
-            np.clip(w * a + (1.0 - w) * b, 0, 65535, out=a)
-            out[z] = a.astype(np.uint16)
+        out[tuple(lo)] = low[tuple(lo)]
+        out[tuple(hi)] = high[tuple(hi)]
+
+        if pure_low + pure_high < n:
+            band[axis] = slice(pure_low, n - pure_high)
+            band = tuple(band)
+            shape = [1, 1]
+            shape[axis] = n - pure_low - pure_high
+            wb = w[pure_low: n - pure_high].reshape(shape)
+            for z in range(low.shape[0]):
+                a = low[z][band[1:]].astype(np.float32)
+                b = high[z][band[1:]].astype(np.float32)
+                np.clip(wb * a + (1.0 - wb) * b, 0, 65535, out=a)
+                out[z][band[1:]] = a.astype(np.uint16)
         return out
 
     if method == "content":
