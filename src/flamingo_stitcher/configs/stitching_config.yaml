@@ -28,6 +28,36 @@ pixel_size_um: 0.406
 # ============================================================
 # Registration
 # ============================================================
+illumination:
+  # How the two light sheets of one tile are combined. See the
+  # `illumination_fusion` notes in pipeline.py for the full reasoning.
+  #
+  #   max      brighter of the two. Historical default, and actively WRONG on a
+  #            scattering sample: out-of-focus blur is bright and smooth, so max
+  #            prefers the blur to the in-focus signal underneath it.
+  #   mean     simple average.
+  #   split    each sheet owns its own half of the frame; the far half of each
+  #            is discarded. Needs `low_side`.
+  #   blend    as split, with a smoothstep handover band (`pure_frac`).
+  #   content  weight each sheet by local high-frequency energy — the measure
+  #            that tells IN FOCUS from BRIGHT. Needs no geometry at all.
+  #   leonardo Leonardo FUSE_illu (needs leonardo-toolset in a GPU env).
+  fusion: max
+
+  # Which illumination side (the I number in the file name) lights the LOW end
+  # of the illumination axis. -1 = not set, in which case split/blend fall back
+  # to max rather than guess — picking the wrong sheet everywhere is silent.
+  # On n7 this is 1 (I1 is the left-hand sheet).
+  low_side: -1
+
+  # Share of the frame each sheet owns outright under `blend`; the rest is the
+  # handover. 0.5 is a hard split.
+  pure_frac: 0.35
+
+  # Sheet propagation axis in the camera frame. "auto" derives it from the tile
+  # orientation, the same way destriping does.
+  axis: auto
+
 registration:
   # Skip phase-correlation registration entirely.
   # When true, tiles are placed using only their stage coordinates.

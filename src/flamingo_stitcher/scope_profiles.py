@@ -94,6 +94,41 @@ TUNABLES: Tuple[Tunable, ...] = (
         ),
     ),
     Tunable(
+        field="illumination_low_side",
+        label="Illumination side lighting the LOW end of the frame",
+        kind="int",
+        minimum=-1,
+        maximum=7,
+        step=1,
+        decimals=0,
+        help=(
+            "Which illumination side (the I number in the file name) lights the "
+            "LOW-numbered end of the illumination axis — the left of the frame "
+            "when the sheets run across X. Only the Split and Blend fusion "
+            "modes use it, and without it they fall back to Max rather than "
+            "guess: choosing the wrong sheet everywhere is silent, because the "
+            "output stays smooth and plausible while being built from the worse "
+            "half of every frame. -1 means not set. On n7 this is 1."
+        ),
+    ),
+    Tunable(
+        field="illumination_pure_frac",
+        label="Share of the frame each sheet owns outright (Blend)",
+        kind="fraction",
+        minimum=0.0,
+        maximum=0.5,
+        step=0.05,
+        decimals=2,
+        suffix=" of the frame",
+        help=(
+            "Under Blend, how much of the frame nearest each sheet is taken "
+            "from that sheet alone; the rest is a smoothstep handover. 0.5 is a "
+            "hard split with no handover at all (the same as Split). Lower it "
+            "if the middle of the frame looks abruptly different; raise it if "
+            "the handover band itself looks soft."
+        ),
+    ),
+    Tunable(
         field="registration_channel_auto",
         label="Choose the registration channel automatically",
         kind="bool",

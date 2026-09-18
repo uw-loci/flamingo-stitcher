@@ -127,6 +127,9 @@ _CONFIG_FIELD_ORDER = (
     "max_registration_shift_z_um",
     "min_registration_overlap_frac",
     "min_registered_seam_frac",
+    "illumination_low_side",
+    "illumination_pure_frac",
+    "illumination_axis",
     "min_tile_structure",
     "registration_z_content_crop",
     "reg_channel",
@@ -1130,7 +1133,35 @@ class StitchingConfig:
     registration_report_json: bool = False  # machine-readable twin
 
     # Illumination fusion
-    illumination_fusion: str = "max"  # "max", "mean", or "leonardo"
+    # "max", "mean", "leonardo", "split", "blend" or "content".
+    #
+    # max is the historical default and the naive one: it takes the brighter
+    # sample of the two sheets. On a scattering sample that is actively wrong —
+    # out-of-focus blur is BRIGHT and smooth, so max prefers the blur to the
+    # in-focus signal underneath it. The alternatives:
+    #
+    #   split   each sheet owns its own half of the frame; the far half of each
+    #           is simply discarded. Cheapest, and the one to try first.
+    #   blend   as split, with a smoothstep handover band
+    #           (illumination_pure_frac) so there is no step down the middle.
+    #   content weight each sheet by local high-frequency energy, which is what
+    #           tells IN FOCUS from BRIGHT. Costs two gaussian filters a plane.
+    illumination_fusion: str = "max"
+    # Which illumination side lights the LOW end of the illumination axis
+    # (low columns when the sheets run across X). Required by split/blend; those
+    # fall back to max without it rather than guess, because choosing the wrong
+    # sheet everywhere is SILENT — the output stays smooth and plausible, just
+    # built from the worse half of every frame. On n7 this is side 1 (I1 is the
+    # left-hand sheet).
+    illumination_low_side: int = -1  # -1 = not set
+    # Share of the illumination axis each sheet owns outright under "blend".
+    # The rest is the handover band. 0.5 or more degenerates to a hard split.
+    illumination_pure_frac: float = 0.35
+    # Illumination (sheet propagation) axis in the camera frame: "auto" derives
+    # it from the same place destriping does — a per-microscope constant mapped
+    # back through the tile orientation — so there is no second copy of that
+    # calculation to drift. "x" or "y" force it.
+    illumination_axis: str = "auto"
     # Diagnostic: when True, do NOT fuse the two light-sheet illumination sides.
     # Each side is stitched independently and written as its own output channel
     # (e.g. Channel_3_I0, Channel_3_I1), so a per-side artifact (a seam/step that
@@ -3159,16 +3190,90 @@ def load_tile_volume(
     return load_raw_volume(path, n_planes, frame_width, frame_height)
 
 
+def _smoothstep(t: np.ndarray) -> np.ndarray:
+    """Hermite 3t^2-2t^3 on [0,1]. Continuous first derivative at both ends,
+    so the handover leaves no visible slope break the way a linear ramp does."""
+    t = np.clip(t, 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def side_weight_profile(n: int, pure_frac: float = 0.0) -> np.ndarray:
+    """Weight of the LOW-end side across `n` samples of the illumination axis.
+
+    1.0 where the low-end sheet owns the image outright, 0.0 where the high-end
+    sheet does, smoothstep between. ``pure_frac`` is the share of the axis each
+    side owns outright; 0.5 (or more) degenerates to a hard split at the
+    midline, which is the cheapest option and the one usually asked for first.
+    """
+    n = max(1, int(n))
+    frac = min(0.5, max(0.0, float(pure_frac)))
+    pure = int(round(frac * n))
+    if pure * 2 >= n:  # hard split — no band left to ramp across
+        w = np.zeros(n, dtype=np.float32)
+        w[: n // 2] = 1.0
+        return w
+    w = np.empty(n, dtype=np.float32)
+    w[:pure] = 1.0
+    w[n - pure:] = 0.0
+    band = n - 2 * pure
+    # 1 -> 0 across the band, endpoints excluded so the joins are flat.
+    t = (np.arange(band, dtype=np.float32) + 0.5) / band
+    w[pure: n - pure] = 1.0 - _smoothstep(t)
+    return w
+
+
+def _detail_weights(plane_a, plane_b, sigma_1: float = 5.0, sigma_2: float = 11.0):
+    """Local high-frequency energy of each plane, as normalized weights.
+
+    ``W = G_s2 * (I - G_s1 * I)^2`` -- Preibisch's content-based fusion measure,
+    the same one multiview-stitcher uses for tile overlaps.
+
+    This is the measure that separates IN FOCUS from BRIGHT, which is the whole
+    problem with max on a scattering sample: out-of-focus blur is bright and
+    smooth, so max prefers it to the in-focus signal underneath. Blur carries
+    almost no high-frequency energy, so it scores near zero here however bright
+    it is.
+    """
+    from scipy import ndimage
+
+    out = []
+    for plane in (plane_a, plane_b):
+        f = np.asarray(plane, dtype=np.float32)
+        detail = f - ndimage.gaussian_filter(f, sigma_1)
+        out.append(ndimage.gaussian_filter(detail * detail, sigma_2))
+    wa, wb = out
+    total = wa + wb
+    # Where NEITHER side has structure the ratio is 0/0; fall back to an even
+    # split rather than letting noise decide.
+    flat = total <= np.finfo(np.float32).tiny
+    wa = np.where(flat, 0.5, wa / np.where(flat, 1.0, total))
+    return wa.astype(np.float32)
+
+
 def fuse_illumination_sides(
     volumes: Dict[int, np.ndarray],
     method: str = "max",
+    *,
+    axis: int = -1,
+    low_side: Optional[int] = None,
+    pure_frac: float = 0.0,
 ) -> np.ndarray:
-    """Fuse left (I0) and right (I1) illumination volumes.
+    """Fuse the two illumination volumes of one tile.
 
     Args:
         volumes: {illumination_side: volume_array}
-        method: "max" (naive, same as FlamingoConverter),
-                "mean" (simple average), or "leonardo" (Leonardo FUSE)
+        method: "max" (naive, same as FlamingoConverter), "mean" (average),
+                "leonardo" (Leonardo FUSE), "split" (each sheet owns its own
+                half of the frame), "blend" (as split, with a smoothstep
+                handover band) or "content" (weight each sheet by local
+                high-frequency energy).
+        axis: illumination axis of the volume (-1 = X/columns, -2 = Y/rows),
+            i.e. the axis the sheets propagate along.
+        low_side: which illumination side lights the LOW end of that axis.
+            Required by "split"/"blend"; without it they fall back to "max"
+            rather than guess, because picking the wrong sheet everywhere is
+            silent -- the result stays smooth and plausible.
+        pure_frac: for "blend", the share of the axis each sheet owns outright.
 
     Returns:
         Fused volume (Z, Y, X)
@@ -3180,6 +3285,40 @@ def fuse_illumination_sides(
 
     left = np.asarray(volumes[sides[0]])
     right = np.asarray(volumes[sides[1]])
+
+    if method in ("split", "blend"):
+        if low_side is None or low_side not in volumes:
+            logger.warning(
+                f"Illumination fusion '{method}' needs to know which side "
+                f"lights the low end of the frame; got low_side={low_side!r} "
+                f"with sides {sides}. Falling back to max."
+            )
+            return np.maximum(left, right)
+        low = np.asarray(volumes[low_side])
+        high = np.asarray(volumes[[s for s in sides if s != low_side][0]])
+        n = low.shape[axis]
+        w = side_weight_profile(n, 0.5 if method == "split" else pure_frac)
+        # Broadcast the 1-D profile along the illumination axis of a plane.
+        shape = [1, 1]
+        shape[axis] = n
+        w = w.reshape(shape)
+        out = np.empty(low.shape, dtype=np.uint16)
+        for z in range(low.shape[0]):
+            a = low[z].astype(np.float32)
+            b = high[z].astype(np.float32)
+            np.clip(w * a + (1.0 - w) * b, 0, 65535, out=a)
+            out[z] = a.astype(np.uint16)
+        return out
+
+    if method == "content":
+        out = np.empty(left.shape, dtype=np.uint16)
+        for z in range(left.shape[0]):
+            wa = _detail_weights(left[z], right[z])
+            a = left[z].astype(np.float32)
+            b = right[z].astype(np.float32)
+            np.clip(wa * a + (1.0 - wa) * b, 0, 65535, out=a)
+            out[z] = a.astype(np.uint16)
+        return out
 
     if method == "max":
         return np.maximum(left, right)
@@ -4518,6 +4657,7 @@ class StitchingPipeline:
         self.logger.info(f"=== Stitching Pipeline Start ===")
         for _line in environment_summary():
             self.logger.info(_line)
+        self._warn_if_illumination_fusion_is_unusable()
         # Loud, before anything expensive: an old multiview-stitcher silently
         # writes black lines through the output, and finding that out after a
         # 10-hour fuse is the worst possible time.
@@ -5845,9 +5985,15 @@ class StitchingPipeline:
                     # TIFF mosaics — defeats the "one plane per tile" bound).
                     planes[side] = np.array(vol[mid])[None]  # (1, H, W) copy
                 if len(planes) > 1:
-                    fused = fuse_illumination_sides(
-                        planes, method=self.config.illumination_fusion
-                    )
+                    # Flat-field estimation deliberately ignores the POSITIONAL
+                    # methods. Their whole point is to discard half of each
+                    # sheet, which is exactly the illumination profile the
+                    # estimator is trying to measure — handing it a split frame
+                    # would bake the handover into the correction itself.
+                    _ff_method = self.config.illumination_fusion
+                    if _ff_method in ("split", "blend", "content"):
+                        _ff_method = "max"
+                    fused = fuse_illumination_sides(planes, method=_ff_method)
                 else:
                     fused = list(planes.values())[0]
                 ch_data[ch].append((fused, tile))
@@ -5944,8 +6090,11 @@ class StitchingPipeline:
                 f"    Ch{ch_id}: fusing {len(illum_volumes)} illumination "
                 f"sides ({self.config.illumination_fusion})"
             )
+            _first = next(iter(illum_volumes.values()))
             volume = fuse_illumination_sides(
-                illum_volumes, method=self.config.illumination_fusion
+                illum_volumes,
+                method=self.config.illumination_fusion,
+                **self._illumination_fuse_kwargs(_first),
             )
         else:
             volume = np.asarray(list(illum_volumes.values())[0])
@@ -6287,6 +6436,59 @@ class StitchingPipeline:
             "which is unreliable on dim or blank tiles. Set Dir: explicitly."
         )
         return self._detect_destripe_direction_from_content(volume)
+
+    def _warn_if_illumination_fusion_is_unusable(self) -> None:
+        """Say ONCE, at the start, if split/blend cannot run as configured.
+
+        Without a low-end side these fall back to max, and the fallback is
+        otherwise invisible until someone reads a per-tile warning buried in
+        hours of log — by which point the run has already produced max output.
+        """
+        method = getattr(self.config, "illumination_fusion", "max")
+        if method not in ("split", "blend"):
+            return
+        if int(getattr(self.config, "illumination_low_side", -1)) >= 0:
+            return
+        self.logger.warning(
+            f"Illumination fusion '{method}' needs to know which illumination "
+            f"side lights the LOW end of the frame, and none is set — so this "
+            f"run will fall back to MAX. Set 'Illumination side lighting the "
+            f"LOW end of the frame' in the Options tab (on n7 it is 1), or "
+            f"pass --illum-low-side."
+        )
+
+    def _resolve_illumination_axis(self, volume) -> int:
+        """Volume axis the light sheets propagate along (-1 = X, -2 = Y).
+
+        Derived from the SAME place destriping gets its axis: stripes are
+        shadows cast along the beam, so the stripe direction IS the illumination
+        direction. Reusing that derivation means there is no second copy of a
+        per-microscope orientation constant to drift out of step — the failure
+        this codebase has already paid for more than once.
+        """
+        configured = (getattr(self.config, "illumination_axis", "auto") or "auto").lower()
+        if configured in ("x", "-1"):
+            return -1
+        if configured in ("y", "-2"):
+            return -2
+        try:
+            return -1 if self._resolve_destripe_direction(volume) == "horizontal" else -2
+        except Exception:  # noqa: BLE001 - never fail a run over an axis guess
+            return -1
+
+    def _illumination_fuse_kwargs(self, volume) -> Dict[str, Any]:
+        """Extra arguments for `fuse_illumination_sides` on this acquisition."""
+        method = getattr(self.config, "illumination_fusion", "max")
+        if method not in ("split", "blend"):
+            return {}
+        return {
+            "axis": self._resolve_illumination_axis(volume),
+            "low_side": (
+                _low if (_low := getattr(self.config, "illumination_low_side", -1)) >= 0
+                else None
+            ),
+            "pure_frac": float(getattr(self.config, "illumination_pure_frac", 0.35)),
+        }
 
     def _detect_destripe_direction_from_content(self, volume: np.ndarray) -> str:
         """Last-resort content-based axis guess, when derivation is impossible.

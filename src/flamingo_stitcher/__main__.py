@@ -93,9 +93,12 @@ def build_parser() -> argparse.ArgumentParser:
     preproc_group = parser.add_argument_group("Preprocessing")
     preproc_group.add_argument(
         "--illumination-fusion",
-        choices=["max", "mean", "leonardo"],
+        choices=["max", "mean", "split", "blend", "content", "leonardo"],
         default="max",
-        help="Dual-illumination fusion method (default: max)",
+        help="Dual-illumination fusion method (default: max). split/blend give "
+        "each sheet its own half of the frame (see --illum-low-side); content "
+        "weights each sheet by local detail, which rejects out-of-focus blur "
+        "that max would prefer for being brighter.",
     )
     preproc_group.add_argument(
         "--split-illumination",
@@ -324,6 +327,30 @@ def build_parser() -> argparse.ArgumentParser:
         dest="z_content_crop",
         action="store_false",
         help="Register on the whole Z stack.",
+    )
+    reg_group.add_argument(
+        "--illum-low-side",
+        type=int,
+        default=None,
+        metavar="SIDE",
+        help="Illumination side (the I number in the file name) that lights "
+        "the LOW end of the illumination axis. Required by --illum-fusion "
+        "split/blend, which fall back to max without it rather than guess.",
+    )
+    reg_group.add_argument(
+        "--illum-pure-frac",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="For --illum-fusion blend: share of the frame each sheet owns "
+        "outright (0-0.5; 0.5 is a hard split).",
+    )
+    reg_group.add_argument(
+        "--illum-axis",
+        choices=("auto", "x", "y"),
+        default=None,
+        help="Illumination (sheet propagation) axis in the camera frame. "
+        "auto derives it from the tile orientation, as destriping does.",
     )
     reg_group.add_argument(
         "--auto-reg-channel",
@@ -871,6 +898,9 @@ def main():
         ("min_tile_structure", args.min_tile_structure),
         ("registration_z_content_crop", args.z_content_crop),
         ("registration_channel_auto", args.auto_reg_channel),
+        ("illumination_low_side", args.illum_low_side),
+        ("illumination_pure_frac", args.illum_pure_frac),
+        ("illumination_axis", args.illum_axis),
         ("registration_seam_content_gate", args.seam_content_gate),
         ("registration_z_refine", args.z_refine),
         ("registration_z_refine_range_um", args.z_refine_range_um),

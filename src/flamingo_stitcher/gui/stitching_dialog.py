@@ -741,6 +741,9 @@ class StitchingDialog(PersistentDialog):
         for label, value in [
             ("Max", "max"),
             ("Mean", "mean"),
+            ("Split (each sheet owns its half)", "split"),
+            ("Blend (split with a soft handover)", "blend"),
+            ("Content (weight by local detail)", "content"),
             ("Leonardo FUSE", "leonardo"),
             ("Separate (keep light paths)", "separate"),
         ]:
@@ -750,7 +753,20 @@ class StitchingDialog(PersistentDialog):
             "single tile. Has no effect when only one illumination side was\n"
             "acquired. This is NOT how adjacent tiles are combined — see\n"
             "'Tile overlap'.\n\n"
-            "  Max / Mean / Leonardo FUSE — fuse the two sides into one channel.\n\n"
+            "  Max — take the brighter sample of the two. Cheap, and the\n"
+            "    historical default, but on a SCATTERING sample it is actively\n"
+            "    wrong: out-of-focus blur is bright and smooth, so Max prefers\n"
+            "    the blur to the in-focus signal underneath it.\n\n"
+            "  Split — each sheet owns its own half of the frame and the far\n"
+            "    half of each is discarded. The simplest answer when one half\n"
+            "    of every image is unusable. Needs 'Low-end side' set.\n\n"
+            "  Blend — as Split, with a smoothstep handover band so there is no\n"
+            "    step down the middle of the frame.\n\n"
+            "  Content — weight each sheet by local high-frequency energy,\n"
+            "    which is what distinguishes IN FOCUS from BRIGHT. Rejects\n"
+            "    out-of-focus blur however bright it is. Costs two gaussian\n"
+            "    filters per plane.\n\n"
+            "  Mean / Leonardo FUSE — average, or Leonardo's content-based fuse.\n\n"
             "  Separate (keep light paths) — DIAGNOSTIC: do NOT fuse. Stitch each\n"
             "    side independently and write it as its own output channel\n"
             "    (Channel_<ch>_I0, Channel_<ch>_I1) in the same file, so you can\n"
