@@ -91,7 +91,7 @@ whole-mosaic approach was wrong.
 
 **Tile-overlap fusion is not illumination fusion (step 14 vs step 3).**
 Two distinct controls that are easy to confuse:
-- `illumination_fusion` (`max` / `mean` / `leonardo`) combines the **left/right light-sheet
+- `illumination_fusion` (`max` / `mean` / `split` / `blend` / `content` / `leonardo`) combines the **left/right light-sheet
   paths of one tile**.
 - `tile_overlap_fusion` (`max` / `blend` / `brightest`) combines **adjacent tiles** where
   they overlap.
@@ -171,7 +171,7 @@ throughput line, never the per-tile rate.
 
 | Option | Config field | Status |
 |---|---|---|
-| Illumination fusion (max/mean) | `illumination_fusion` | Shipped |
+| Illumination fusion (max/mean/split/blend/content) | `illumination_fusion` | Shipped |
 | Split illumination | `split_illumination` | Shipped (forces streaming) |
 | Flat-field (BaSiCPy) | `flat_field_correction` | Shipped — runs in an isolated env |
 | Destripe (pystripe) | `destripe`, `destripe_fast` | Shipped — vendored `_pystripe_core` |

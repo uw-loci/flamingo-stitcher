@@ -40,11 +40,22 @@ selects streaming when the in-memory estimate exceeds ~60% of system RAM.
 The header echoes the settings and provenance. Lines worth checking first:
 
 - `Downsample: XY=?x Z=?x` — 1×/1× is full resolution (biggest, slowest).
-- `Illumination fusion: max|mean|leonardo` — combines the two light-sheet sides
+- `Illumination fusion: max|mean|split|blend|content|leonardo` — combines the
+  two light-sheet sides
   **within** a tile (not tile-to-tile). `separate (...)` instead means the sides
   were NOT combined: each light path becomes its own output channel, so the
   output has twice the channels and each one still carries that side's
   illumination falloff across the mosaic.
+  `max` takes the brighter sample of the two, which on a scattering sample
+  prefers out-of-focus blur (bright and smooth) over the in-focus signal
+  beneath it. `split` gives each sheet its own half of the frame and discards
+  the far half; `blend` is the same with a smoothstep handover band
+  (`illumination_pure_frac`, default 0.35); `content` weights each sheet by
+  local high-frequency energy, which rejects blur however bright it is.
+  `split` and `blend` need `illumination_low_side` (which side lights the low
+  end of the illumination axis; -1 = unset) and fall back to `max` without it,
+  saying so at the START of the run. CLI: `--illumination-fusion`,
+  `--illum-low-side`, `--illum-pure-frac`, `--illum-axis`.
 - `Tile overlap fusion: max|blend` — combines **adjacent tiles**. See [§7](#7-tile-overlap-fusion-max-vs-blend-and-why-seams-look-the-way-they-do).
 - `Flat-field correction: True|False` — BaSiC shading + baseline correction.
 - `Output format`, `Frame size (AOI)`, `Objective … → effective pixel ~X µm`.

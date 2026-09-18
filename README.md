@@ -128,7 +128,7 @@ can leave all of them alone.** Everything more specialized lives in the collapse
   - **Per-microscope fallback.** For systems that don't record the objective in
     `ScopeSettings.txt`, a per-microscope `objective_magnification` in
     `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
-    (23.8×) → ~0.273 µm/px.
+    (25.48×, measured on a calibration standard) → ~0.255 µm/px.
 - **What kind of processing should we do?** — the choices that affect the output:
   *Downsample* (make the result smaller/faster), how the two light-sheet sides are
   combined, and how overlapping tiles are blended. The defaults are a good start.
