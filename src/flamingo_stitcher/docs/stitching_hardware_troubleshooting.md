@@ -282,10 +282,15 @@ no-GPU alternative.
 
 ### Symptom: Imaris install path unclear to new users
 
-`PyImarisWriter` is Windows-only and requires a wheel from Bitplane.
-See §8 of `lightsheet_stitching_options.md` for the install recipe.
-The Imaris option in the format dropdown disables itself when
-`import PyImarisWriter` fails.
+`PyImarisWriter` is Windows-only. Install it with the packaged extra:
+
+```
+pip install "flamingo-stitcher[imaris]"
+```
+
+The Imaris entry in the output-format dropdown disables itself whenever
+`import PyImarisWriter` fails, so a greyed-out entry means the package is
+missing rather than that the format is unsupported.
 
 ### Symptom: visible seams — a sharp step in brightness along tile borders
 
@@ -406,8 +411,6 @@ probe re-runs *after* `_restore_settings`. This is commit `a11edd4`.
 break ngff-zarr's zarr_format selection when writing OME-Zarr v0.4
 (produces zarr v3 silently — Fiji can't open). Track
 [ngff-zarr PR #480](https://github.com/fideus-labs/ngff-zarr/pull/480).
-See `claude-reports/lightsheet_stitching_options.md` and the TODO in
-`memory/MEMORY.md`.
 
 ---
 

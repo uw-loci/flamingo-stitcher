@@ -286,11 +286,9 @@ blending:
   # computation time significantly.
   content_based: false
 
-# Illumination fusion method for dual-sided illumination data.
-# "max"      — maximum intensity (good for fluorescence, preserves signal)
-# "mean"     — arithmetic mean (reduces noise, may reduce contrast)
-# "leonardo" — Leonardo toolset FUSE_illu (requires isolated environment)
-illumination_fusion: "max"
+# (Dual-illumination fusion is configured in the `illumination:` block near the
+# top of this file. A top-level `illumination_fusion:` key from an older config
+# is still honoured, and the block overrides it.)
 
 # ============================================================
 # Output format

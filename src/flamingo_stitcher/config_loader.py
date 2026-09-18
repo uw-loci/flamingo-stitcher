@@ -293,17 +293,6 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
     if v is not None:
         config_obj.pixel_size_um = float(v)
 
-    # Illumination fusion
-    illum = cfg.get("illumination", {})
-    if illum.get("fusion") is not None:
-        config_obj.illumination_fusion = str(illum["fusion"])
-    if illum.get("low_side") is not None:
-        config_obj.illumination_low_side = int(illum["low_side"])
-    if illum.get("pure_frac") is not None:
-        config_obj.illumination_pure_frac = float(illum["pure_frac"])
-    if illum.get("axis") is not None:
-        config_obj.illumination_axis = str(illum["axis"])
-
     # Registration
     reg = cfg.get("registration", {})
     if reg.get("skip") is not None:
@@ -383,10 +372,24 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
     if blend.get("content_based") is not None:
         config_obj.content_based_fusion = bool(blend["content_based"])
 
-    # Illumination fusion
+    # Illumination fusion. The legacy TOP-LEVEL `illumination_fusion:` key is
+    # read first so a user's existing config still works, then the documented
+    # `illumination:` block overrides it. Order matters: when this ran last it
+    # silently clobbered the block, so `illumination.fusion: content` in the
+    # shipped YAML resolved to "max" and nothing said so.
     v = gv("illumination_fusion", cfg=cfg)
     if v is not None:
         config_obj.illumination_fusion = str(v)
+
+    illum = cfg.get("illumination", {})
+    if illum.get("fusion") is not None:
+        config_obj.illumination_fusion = str(illum["fusion"])
+    if illum.get("low_side") is not None:
+        config_obj.illumination_low_side = int(illum["low_side"])
+    if illum.get("pure_frac") is not None:
+        config_obj.illumination_pure_frac = float(illum["pure_frac"])
+    if illum.get("axis") is not None:
+        config_obj.illumination_axis = str(illum["axis"])
 
     # Output
     out = cfg.get("output", {})
