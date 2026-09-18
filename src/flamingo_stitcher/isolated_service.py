@@ -11,7 +11,7 @@ The isolated venv lives at:
     Windows: %APPDATA%/Flamingo/preprocessing_env
     Linux:   ~/.flamingo/preprocessing_env
 
-Setup via the 'Setup Preprocessing...' button in the stitching dialog,
+Setup via the 'Set up flat-field…' button in the stitching dialog,
 which runs scripts/create_preprocessing_env.bat (or .sh).
 """
 

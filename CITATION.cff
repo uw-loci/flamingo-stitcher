@@ -1,0 +1,34 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with the methods it builds on (see README, 'Methods and how to cite')."
+title: "Flamingo Stitcher"
+abstract: "Standalone light-sheet tile stitching pipeline and GUI for Flamingo T-SPIM data."
+type: software
+authors:
+  - family-names: "Nelson"
+    given-names: "Michael S."
+version: "0.13.2"
+license: "GPL-3.0-or-later"
+repository-code: "https://github.com/uw-loci/flamingo-stitcher"
+keywords:
+  - light-sheet microscopy
+  - image stitching
+  - OME-Zarr
+  - OME-TIFF
+# No DOI yet. Minting one (e.g. via Zenodo on a tagged release) would let users
+# cite a fixed version; add `doi:` here when there is one.
+references:
+  - type: article
+    title: "BigStitcher: reconstructing high-resolution image datasets of cleared and expanded samples"
+    authors:
+      - family-names: "Hörl"
+        given-names: "David"
+    journal: "Nature Methods"
+    volume: 16
+    start: 870
+    end: 874
+    year: 2019
+    notes: "Global optimisation with iterative edge pruning, and cosine-weighted blending, as implemented in multiview-stitcher."
+  - type: software
+    title: "multiview-stitcher"
+    repository-code: "https://github.com/multiview-stitcher/multiview-stitcher"
+    notes: "The registration and fusion engine."

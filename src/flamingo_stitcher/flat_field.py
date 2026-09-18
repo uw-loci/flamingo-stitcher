@@ -82,7 +82,8 @@ def estimate_flat_fields(
 
         logger.warning(
             "basicpy not available (direct or isolated). "
-            "Use 'Setup Preprocessing...' in the stitching dialog to install."
+            "Use the 'Set up flat-field…' button in the stitching dialog to "
+            "install it."
         )
         return {}
 

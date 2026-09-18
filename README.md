@@ -27,9 +27,16 @@ offers a one-click install when one exists.
 
 ### 2. Stitch your first dataset
 
-You'll see three tabs: **Multi-Acquisition**, **Single Workflow**, and **Updates**.
-Pick the tab that matches your data (see [Which tab?](#which-tab-do-i-use) below — if
-you're unsure, just try one). Then:
+You'll see five tabs: **Multi-Acquisition**, **Single Workflow**, **Multi-View**,
+**Options**, and **Updates**. For a first run you want one of the first two —
+[Which tab?](#which-tab-do-i-use) tells you which, by looking at your folder. Then:
+
+<!-- SCREENSHOT NEEDED -> docs/images/tabs.png
+     Capture: the app window, the five tabs along the top clearly readable.
+     Why: readers need to recognise the tab strip before they can choose.
+     To publish it, drop the file in and uncomment the line below.
+![The five tabs across the top of Flamingo Stitcher: Multi-Acquisition, Single Workflow, Multi-View, Options, Updates](docs/images/tabs.png)
+-->
 
 1. **Add your data.** Click **Add…** and select your acquisition folder. (You can add
    several and stitch them back-to-back.)
@@ -47,13 +54,54 @@ usually don't need to change anything in steps 2–3.
 
 ### Which tab do I use?
 
-| Your acquisition looks like… | Use this tab |
-|---|---|
-| One folder full of `.raw` files named like `...X000_Y000...` | **Single Workflow** |
-| Each tile in its own subfolder, **or** you want to stitch many acquisitions at once | **Multi-Acquisition** |
+The tab names describe **how the microscope software wrote your files**, not anything
+you chose at the scope. So open your acquisition folder and look at it:
 
-Not sure? Pick one and click **Discover Tiles**. If it finds **0 tiles**, switch to the
-other tab and try again.
+| What you see in the folder | Use this tab | Why |
+|---|---|---|
+| Image files sitting loose in one folder, named `…_X000_Y000_C03_I0_…` | **Single Workflow** | The microscope's own control software writes every tile into one folder. This is the usual case, and where most people are. |
+| One subfolder per tile, named for its stage position — `X4.00_Y12.00` | **Multi-Acquisition** | The Py2Flamingo layout. Also use this tab to queue several acquisitions and stitch them back to back. |
+| Several acquisitions of one sample at different rotation angles | **Multi-View** | Fuses the angles into one volume. The rotation conventions are not yet confirmed on an instrument — check the result before trusting it. |
+
+Tile files may be `.raw`, `.tif`, `.tiff` or `.btf` — the extension does not decide the
+tab; the folder shape does.
+
+The two layouts look more alike than you'd expect: a tile **file** is `X000_Y000`
+(zero-padded counts) and a tile **folder** is `X4.00_Y12.00` (stage millimetres). If in
+doubt, the test that settles it is whether the images are loose in the folder you
+selected, or one level down inside per-tile subfolders.
+
+<!-- SCREENSHOT NEEDED -> docs/images/layout-single-workflow.png
+     Capture: Windows Explorer on a Single Workflow acquisition folder — loose
+     image files with names like S000_t000000_V000_R0000_X000_Y000_C03_I0_D0_P00643.raw
+     Why: this one picture answers the question faster than the table does.
+![Windows Explorer showing a Single Workflow acquisition: image files loose in one folder, each named with X and Y tile numbers](docs/images/layout-single-workflow.png)
+-->
+
+<!-- SCREENSHOT NEEDED -> docs/images/layout-multi-acquisition.png
+     Capture: Windows Explorer on a Multi-Acquisition dataset — one subfolder per
+     tile, named like X4.00_Y12.00, inside a date folder.
+     Why: the contrast with the picture above is the whole decision.
+![Windows Explorer showing a Multi-Acquisition dataset: one subfolder per tile, each named for its stage position](docs/images/layout-multi-acquisition.png)
+-->
+
+Still unsure? Add the folder and click **Discover Tiles**. **0 tiles** means the layout
+doesn't match that tab — try the other one.
+
+### The other two tabs
+
+**Options** holds the registration settings, saved per microscope and objective, so a
+value you tune once is reused by every future run from that instrument. You don't need
+it for a first run. Go there when the registration report says seams were rejected, or
+when you want to set which illumination side lights the left of the frame.
+
+<!-- SCREENSHOT NEEDED -> docs/images/options-tab.png
+     Capture: the Options tab with a microscope selected, controls visible.
+     Why: nothing user-facing has ever documented this tab; people do not know it exists.
+![The Options tab, showing per-microscope registration settings](docs/images/options-tab.png)
+-->
+
+**Updates** checks for a newer version on launch and installs it in one click.
 
 ---
 
@@ -148,6 +196,94 @@ trust the result.
 
 ---
 
+## What the run writes
+
+Each acquisition gets its own `..._stitched` folder containing:
+
+| File | What it is |
+|---|---|
+| `<name>.ome.tif` / `.ome.zarr` / `.ims` | the stitched volume |
+| `stitch_metadata.json` | the record worth keeping. Software version and git hash, voxel size, channels, tile count, every per-tile position, the world frame, and every processing setting the run used |
+| `registration_report.txt` | the human summary — read this first |
+| `registration_report.csv` | one row per tile: the correction applied, in µm |
+| `registration_seams.csv` | one row per expected neighbour pair, and what became of it |
+
+Stitching the same acquisition twice with different settings also writes a
+second copy of each report under a name carrying those settings
+(`..._flatfield_registration_report.csv`), so a later run cannot overwrite an
+earlier run's evidence. The plain names always hold the most recent run.
+
+`stitch_metadata.json` carries a `world_frame` block. Read it before converting
+stitched coordinates back to stage coordinates — some acquisitions negate world
+X, so an origin can legitimately be a large negative number, and treating it as
+a stage coordinate places the volume mirrored and displaced.
+
+## Reusing a setup on another machine
+
+Tune a stitch once, then apply exactly that treatment to more datasets — on the
+microscope computer, or on your own laptop.
+
+- **Save Configuration…** writes the current settings to a file.
+- **Load Configuration…** reads one back, or reads the `stitch_metadata.json`
+  from any finished run.
+
+It carries everything that shapes the output: processing options, destripe
+tuning, deconvolution parameters, registration thresholds, border QC.
+
+It deliberately does not carry pixel size, Z spacing or frame size — Discover
+measures those from your own data — nor the machine's memory ceiling, worker
+counts or scratch path. A PSF file is used only if that file exists on your
+machine, and the app says so plainly when it doesn't.
+
+## Limitations, and when not to trust the result
+
+Stitching can succeed on part of a mosaic and fail on the rest. Several gates
+exist to stop a half-registered result being presented as a good one. When one
+fires, tiles are placed by their recorded stage positions instead, and the
+registration report names which gate fired and for which tiles.
+
+| Gate | Default | What it means when it fires |
+|---|---|---|
+| Minimum tile overlap to attempt registration | 5% of a frame | Too little shared content to measure a shift |
+| Minimum share of seams that must register | 50% | Not enough of the mosaic agreed; the whole result falls back to stage positions |
+| Minimum tile structure | 0.15 | A tile has nothing to align on — empty medium, or bright but featureless gel |
+| Seam quality threshold | 0.4 | That seam's correlation was too weak to believe |
+| Maximum lateral / axial correction | auto | A proposed shift was larger than the geometry allows |
+
+Two further limits:
+
+- **Multi-view rotation is not instrument-validated.** The rotation sign and
+  centre conventions are checked on synthetic data only. Verify with a two-angle
+  test acquisition, and flip the sign if the views come out mirrored.
+- **There is no per-tile intensity equalisation.** Tiles that were genuinely
+  brighter stay brighter; flat-field correction addresses the illumination
+  profile within a tile, not tile-to-tile differences.
+
+<!-- SCREENSHOT NEEDED -> docs/images/registration-report.png
+     Capture: registration_report.txt open in a text editor, the seam summary
+     line visible ("Seams: N registered · N pruned · ...").
+     Why: users are told to read this file and have never been shown one.
+![The registration report, showing how many seams registered and why others did not](docs/images/registration-report.png)
+-->
+
+## Methods and how to cite
+
+Registration and fusion are performed by
+[multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher).
+Two of its algorithms are the ones a methods section should name:
+
+- **Global optimisation with iterative edge pruning**, and **cosine-weighted
+  blending** across tile overlaps — after BigStitcher: Hörl et al., *BigStitcher:
+  reconstructing high-resolution image datasets of cleared and expanded samples*,
+  Nature Methods 16, 870–874 (2019).
+- **Content-based fusion weighting** — Preibisch et al., local-variance weighting
+  of each tile's contribution in overlap regions.
+
+Flat-field correction uses [BaSiCPy](https://github.com/peng-lab/BaSiCPy);
+destriping uses a vendored copy of the pystripe wavelet filter.
+
+To cite the software itself, see `CITATION.cff` in the repository root.
+
 ## For developers / Python users
 
 ```bash
@@ -159,7 +295,7 @@ Optional backends:
 
 ```bash
 pip install "flamingo-stitcher[imaris]"    # direct .ims output (Windows only)
-pip install pystripe==1.3.1 --no-deps      # destriping (avoid resolver backtracking)
+pip install "flamingo-stitcher[destripe]"  # destriping (vendored filter + PyWavelets)
 pip install "flamingo-stitcher[deconv]"    # RedLionfish GPU deconvolution (OpenCL)
 conda install -c conda-forge pycudadecon   # NVIDIA GPU deconvolution
 ```

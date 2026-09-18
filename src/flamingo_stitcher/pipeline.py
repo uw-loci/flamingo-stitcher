@@ -3370,8 +3370,11 @@ def _fuse_leonardo(left: np.ndarray, right: np.ndarray) -> np.ndarray:
         logger.warning(f"Leonardo fusion via isolated env failed: {e}")
 
     logger.warning(
-        "leonardo-toolset not available, falling back to max fusion. "
-        "Use 'Setup Preprocessing...' in the stitching dialog to install."
+        "leonardo-toolset not available, falling back to max fusion. It needs a "
+        "separate GPU environment — the 'Set up flat-field…' button does NOT "
+        "install it. If the sample is scattering, try the 'content' illumination "
+        "fusion mode instead: it weights each sheet by local detail, needs no "
+        "GPU, and rejects the out-of-focus blur that max prefers."
     )
     return np.maximum(left, right)
 
@@ -5962,7 +5965,7 @@ class StitchingPipeline:
             self.logger.warning(
                 "Flat-field correction requested but basicpy is unavailable "
                 "(direct or isolated env) — output will NOT be flat-fielded. "
-                "Use 'Setup Preprocessing…' in the dialog to install."
+                "Use the 'Set up flat-field…' button in the dialog to install it."
             )
             return {}
 

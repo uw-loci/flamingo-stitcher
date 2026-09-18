@@ -17,7 +17,12 @@ symptoms appear; remove items that no longer reproduce after code fixes.
 | Full-resolution TB-scale (500+ GB raw)       | 64 GB   | **128+ GB** |
 | With content-based fusion + multi-channel    | 64 GB   | **192+ GB** |
 
-The pipeline **streams** by default when output exceeds ~60% of RAM —
+The pipeline **streams** by default when the estimated **in-memory peak**
+exceeds ~60% of system RAM (`memory.auto_streaming_threshold` in
+`stitching_config.yaml`, default 0.6) — note that is the in-memory
+estimate, NOT the output size, and it runs several times larger: a run
+that writes 187 GB of output estimated 622 GB in memory. Size a machine
+against the in-memory figure the run log prints, not against output —
 it spills tile and fused data to disk, so RAM pressure stays low (the
 auto-picker targets ~10 GB peak for streaming mode regardless of
 output size). Systems down to 16 GB can run streaming jobs, they just
@@ -253,18 +258,27 @@ without a None check; we now pass the default `{sigma_1: 5, sigma_2: 11}`
 explicitly. A fallback in `_fuse_with_fallback` also retries without
 content-based if it crashes for any other reason.
 
-### Symptom: "pystripe not installed, skipping destriping" on every tile
+### Symptom: the run stops with "Destriping was requested (Destripe is ON) but its backend failed to load"
 
-Harmless if destripe is genuinely off. If it's on (the dialog should
-have prevented that — see commit `a11edd4`), install pystripe:
+Destriping needs `pywt` (PyWavelets) alongside scipy and scikit-image.
+The run **stops** rather than quietly writing un-destriped tiles, so this
+is a hard failure, not a warning you can ignore.
 
 ```
-pip install pystripe
+pip install "flamingo-stitcher[destripe]"
 ```
 
-Same for `basicpy` (flat-field) and `leonardo-toolset` (dual-illum
-fusion) — both require an isolated env via the "Setup Preprocessing..."
-button because they pin incompatible scipy/jax versions.
+The stripe filter itself is vendored into the package, so there is
+nothing called `pystripe` to install — installing that package has no
+effect.
+
+Flat-field correction (`basicpy`) is different: it needs an isolated
+environment, because it pins scipy versions that conflict with the rest
+of the stack. Build it with the **Set up flat-field…** button at the
+bottom of the stitching dialog. Leonardo dual-illumination fusion needs a
+separate GPU environment that this button does **not** install; for a
+scattering sample the `content` illumination-fusion mode is the
+no-GPU alternative.
 
 ### Symptom: Imaris install path unclear to new users
 
@@ -442,11 +456,14 @@ Channel fuse-store dominated (162 + 181 min). Imaris write was 11 min.
 2. **In-memory mode** (Streaming OFF). Skips the 215 GB `fused.dat`
    round-trip on the output drive. Saves ~20–25 min per channel. Only
    safe when the green memory pill stays green at full settings.
-3. **Raise `fuse_workers` to 8.** Edit `stitching_config.yaml`
-   (no UI yet). Helps modestly because some tasks block on tile-memmap
-   reads; numpy/scipy contention caps the gain at ~5–15%.
-4. **Raise `preprocess_workers` to 8.** Same YAML. Tiny win — preprocess
-   is already <5% of total wall-time.
+3. **Raise `fuse_workers` to 8.** Helps modestly because some tasks block
+   on tile-memmap reads; numpy/scipy contention caps the gain at ~5–15%.
+   There is no YAML key for this one — set it from the GUI or the Python
+   API (`StitchingConfig.fuse_workers`).
+4. **Raise `preprocess_workers` to 8.** Tiny win on its own — preprocess
+   is usually a small share of wall-time, though destriping changes that
+   (it forces one tile at a time by design). From the CLI:
+   `flamingo-stitch /data/acq --preprocess-workers 8`.
 
 **What more RAM does NOT help:**
 
@@ -464,16 +481,3 @@ Channel fuse-store dominated (162 + 181 min). Imaris write was 11 min.
 - *Tight RAM (≤64 GB)*: defaults. The auto-pickers are tuned for this case.
 
 ---
-
-## 6. TODOs for Docs / Code
-
-* [ ] `StitchingConfig.temp_dir` — let users put `.stitch_tmp/` on a
-      separate fast drive from the output drive.
-* [ ] Per-chunk progress during `da.store` (a dask `Callback` firing
-      every ~5% of chunks). Closes the "silent 2-hour wall" diagnostic
-      gap we hit.
-* [ ] User-facing requirements doc in the repo itself (currently lives
-      in `claude-reports/`). Candidate path: `docs/stitching_hardware.md`.
-* [ ] "Setup Preprocessing..." button documentation — how isolated env
-      at `%APPDATA%/Flamingo/preprocessing_env` works, when it's needed,
-      how to reset.

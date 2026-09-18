@@ -6473,8 +6473,8 @@ class MultiViewStitchingDialog(StitchingDialog):
         """
         banner = QLabel(
             "⚠ Multi-view (rotation) stitching — fuses several rotation "
-            "angles into one volume. For normal single-angle acquisitions use the "
-            "‘Tile Stitching’ tab instead."
+            "angles into one volume. For normal single-angle acquisitions use "
+            "the ‘Single Workflow’ or ‘Multi-Acquisition’ tab instead."
         )
         banner.setWordWrap(True)
         banner.setStyleSheet(
