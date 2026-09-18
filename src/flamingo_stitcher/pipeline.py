@@ -3190,6 +3190,11 @@ def load_tile_volume(
     return load_raw_volume(path, n_planes, frame_width, frame_height)
 
 
+# Said once per process, not once per tile: the 2026-09-18 run logged this
+# identical line more than fifty times and buried everything else.
+_WARNED_NO_LOW_SIDE = False
+
+
 def _smoothstep(t: np.ndarray) -> np.ndarray:
     """Hermite 3t^2-2t^3 on [0,1]. Continuous first derivative at both ends,
     so the handover leaves no visible slope break the way a linear ramp does."""
@@ -3288,11 +3293,15 @@ def fuse_illumination_sides(
 
     if method in ("split", "blend"):
         if low_side is None or low_side not in volumes:
-            logger.warning(
-                f"Illumination fusion '{method}' needs to know which side "
-                f"lights the low end of the frame; got low_side={low_side!r} "
-                f"with sides {sides}. Falling back to max."
-            )
+            global _WARNED_NO_LOW_SIDE
+            if not _WARNED_NO_LOW_SIDE:
+                _WARNED_NO_LOW_SIDE = True
+                logger.warning(
+                    f"Illumination fusion '{method}' needs to know which side "
+                    f"lights the low end of the frame; got low_side={low_side!r} "
+                    f"with sides {sides}. Falling back to max. (Said once; the "
+                    f"pipeline refuses this before the run starts.)"
+                )
             return np.maximum(left, right)
         low = np.asarray(volumes[low_side])
         high = np.asarray(volumes[[s for s in sides if s != low_side][0]])
@@ -4660,7 +4669,7 @@ class StitchingPipeline:
         self.logger.info(f"=== Stitching Pipeline Start ===")
         for _line in environment_summary():
             self.logger.info(_line)
-        self._warn_if_illumination_fusion_is_unusable()
+        self._check_illumination_fusion_is_usable()
         # Loud, before anything expensive: an old multiview-stitcher silently
         # writes black lines through the output, and finding that out after a
         # 10-hour fuse is the worst possible time.
@@ -6440,24 +6449,33 @@ class StitchingPipeline:
         )
         return self._detect_destripe_direction_from_content(volume)
 
-    def _warn_if_illumination_fusion_is_unusable(self) -> None:
-        """Say ONCE, at the start, if split/blend cannot run as configured.
+    def _check_illumination_fusion_is_usable(self) -> None:
+        """Stop before the run if split/blend cannot do what was asked.
 
-        Without a low-end side these fall back to max, and the fallback is
-        otherwise invisible until someone reads a per-tile warning buried in
-        hours of log — by which point the run has already produced max output.
+        These need to know which sheet lights the low end of the frame. Without
+        it they fall back to max — and a run whose settings echo says `split`
+        while its output is max is exactly the failure this package already
+        rejected for destriping ("Refusing to continue and silently write
+        un-destriped tiles"). The operator cannot tell from the output that
+        they did not get what they asked for, and on the 2026-09-18 run that
+        cost 45 minutes before anyone read the warning.
+
+        Raised here, before any tile is touched, so the cost is seconds.
         """
         method = getattr(self.config, "illumination_fusion", "max")
         if method not in ("split", "blend"):
             return
         if int(getattr(self.config, "illumination_low_side", -1)) >= 0:
             return
-        self.logger.warning(
-            f"Illumination fusion '{method}' needs to know which illumination "
-            f"side lights the LOW end of the frame, and none is set — so this "
-            f"run will fall back to MAX. Set 'Illumination side lighting the "
-            f"LOW end of the frame' in the Options tab (on n7 it is 1), or "
-            f"pass --illum-low-side."
+        raise ValueError(
+            f"Illumination fusion is set to '{method}', which needs to know "
+            f"which illumination side lights the LOW end of the frame — and "
+            f"none is set. Refusing to run and silently produce 'max' output "
+            f"under a '{method}' label.\n\n"
+            f"Set 'Illumination side lighting the LOW end of the frame' in the "
+            f"Options tab (on n7 it is 1), or pass --illum-low-side. If you "
+            f"don't know which side it is, use 'content' instead: it weights "
+            f"each sheet by local detail and needs no geometry."
         )
 
     def _resolve_illumination_axis(self, volume) -> int:

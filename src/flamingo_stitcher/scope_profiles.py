@@ -43,6 +43,9 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 _PROFILES_FILE = "scope_profiles.json"
+# Microscopes an acquisition has been stitched from, so the Options tab can
+# offer them without the user retyping a name that has to match exactly.
+_SEEN_FILE = "seen_microscopes.json"
 
 # Objective key meaning "every objective on this microscope".
 ANY_OBJECTIVE = "*"
@@ -317,6 +320,78 @@ def profile_key(microscope_name: Optional[str], objective: Any) -> str:
 
 def profiles_path() -> Path:
     return Path.home() / ".flamingo_stitcher" / _PROFILES_FILE
+
+
+def seen_path() -> Path:
+    """Where the set of microscopes we have ever stitched from is kept.
+
+    A separate file from the profiles, deliberately: a name here means only
+    "an acquisition from this instrument has been through the app", which is
+    not the same claim as "this instrument has tuned settings". Mixing the two
+    would make an untuned microscope look configured.
+    """
+    return Path.home() / ".flamingo_stitcher" / _SEEN_FILE
+
+
+def _read_seen() -> set:
+    try:
+        path = seen_path()
+        if not path.is_file():
+            return set()
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:  # noqa: BLE001 - a convenience list must never fail
+        logger.debug("Could not read seen microscopes: %s", e)
+        return set()
+    if isinstance(data, dict):  # tolerate {"microscopes": [...]}
+        data = data.get("microscopes", [])
+    if not isinstance(data, list):
+        return set()
+    return {n for n in (_norm_scope(x) for x in data) if n}
+
+
+def remember_microscope(microscope_name: Optional[str]) -> bool:
+    """Record that an acquisition from this microscope has been seen.
+
+    Returns True when the name was new. A SET by construction: names are
+    normalised the same way lookups are (`_norm_scope`, lower-cased and
+    stripped), so the same instrument cannot land in the list twice under
+    different spacing or case.
+
+    Never raises. Failing to remember a name for the Options dropdown must not
+    be able to affect a stitching run.
+    """
+    name = _norm_scope(microscope_name)
+    if not name:
+        return False
+    try:
+        seen = _read_seen()
+        if name in seen:
+            return False
+        seen.add(name)
+        path = seen_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(sorted(seen), indent=2), encoding="utf-8"
+        )
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.debug("Could not remember microscope %r: %s", microscope_name, e)
+        return False
+
+
+def known_microscopes() -> List[str]:
+    """Every microscope the Options tab should offer, sorted.
+
+    The union of instruments with SAVED settings and instruments merely seen
+    during a run, so a microscope becomes selectable the first time one of its
+    acquisitions is stitched rather than only after someone types its name in
+    by hand.
+    """
+    names = {
+        _norm_scope(key.split("|", 1)[0]) for key in _read_all()
+    }
+    names |= _read_seen()
+    return sorted(n for n in names if n)
 
 
 def _read_all() -> Dict[str, dict]:

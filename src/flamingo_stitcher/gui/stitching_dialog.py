@@ -3794,6 +3794,104 @@ class StitchingDialog(PersistentDialog):
             box.exec_()
         return False
 
+    def _confirm_illumination_low_side(self, pending, config) -> bool:
+        """Block the run if Split/Blend has no low-end side to work from.
+
+        Without it these fall back to Max, so the run would spend its whole
+        length producing Max output under a Split label — the operator cannot
+        tell from the result that they did not get what they asked for. The
+        pipeline refuses too, but refusing here costs seconds instead of the
+        minutes it takes to reach the first tile, and this is the only place
+        that can actually SHOW the user where the setting lives.
+
+        Answering "which side?" is the part a person genuinely cannot guess, so
+        the message names the way to find out rather than only the way to set
+        it.
+        """
+        method = getattr(config, "illumination_fusion", "max")
+        if method not in ("split", "blend"):
+            return True
+
+        from flamingo_stitcher import scope_profiles
+
+        unset = {}  # scope name -> objective, for the ones still missing it
+        for it in pending or []:
+            path = it.get("path")
+            if not path:
+                continue
+            try:
+                # (microscope, objective, values, source_key)
+                scope, _obj, values, _src = scope_profiles.resolve_for_acquisition(
+                    Path(path)
+                )
+            except Exception:  # noqa: BLE001 - resolve is best-effort
+                scope, values = None, {}
+            if int((values or {}).get("illumination_low_side", -1)) >= 0:
+                continue
+            unset[scope or "(unnamed microscope)"] = None
+
+        if not unset:
+            return True
+
+        label = dict(
+            split="Split (each sheet owns its half)",
+            blend="Blend (split with a soft handover)",
+        )[method]
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Which illumination side lights the left?")
+        box.setText(
+            f"Illumination fusion is set to “{label}”, but no illumination "
+            f"side has been chosen for: {', '.join(sorted(unset))}.\n\n"
+            "Split and Blend give each light sheet its own half of the frame, "
+            "so they need to know which side lights the LEFT half. Without it "
+            "the run would quietly fall back to Max."
+        )
+        box.setInformativeText(
+            "To set it: the Options tab → pick this microscope → "
+            "“Illumination side lighting the LOW end of the frame” → Save. "
+            "It is remembered per microscope and objective, so this is once "
+            "per instrument.\n\n"
+            "To find out which side it is: run once with Illumination fusion "
+            "set to “Separate (keep light paths)”. That writes each sheet as "
+            "its own channel, so you can flip between them and see which one "
+            "is sharp on the left. That side's I number is the value.\n\n"
+            "Or choose “Content (weight by local detail)” instead — it needs "
+            "no geometry at all, and on a scattering sample it is the mode "
+            "that rejects out-of-focus blur."
+        )
+        open_btn = box.addButton("Open Options…", QMessageBox.AcceptRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec_()
+        if box.clickedButton() is open_btn:
+            self._open_options_tab()
+        return False
+
+    def _open_options_tab(self) -> None:
+        """Bring the Options tab forward, when this dialog lives in the tabbed
+        standalone app. A no-op inside Py2Flamingo, where the dialog is not in
+        that tab widget — the message has already named the path either way."""
+        try:
+            from PyQt5.QtWidgets import QTabWidget
+
+            w = self.parentWidget()
+            while w is not None:
+                if isinstance(w, QTabWidget):
+                    for i in range(w.count()):
+                        if w.tabText(i) == "Options":
+                            w.setCurrentIndex(i)
+                            return
+                w = w.parentWidget()
+            # Standalone: the tab widget is a sibling, reachable from the window.
+            win = self.window()
+            for tabs in win.findChildren(QTabWidget):
+                for i in range(tabs.count()):
+                    if tabs.tabText(i) == "Options":
+                        tabs.setCurrentIndex(i)
+                        return
+        except Exception:  # noqa: BLE001 - convenience only
+            pass
+
     def _confirm_pixel_size(self, pending, config) -> bool:
         """Block the run if the XY pixel size badly mismatches the objective.
 
@@ -3904,6 +4002,12 @@ class StitchingDialog(PersistentDialog):
         # orientation. A new microscope has none — force the selection (via the
         # preview) instead of stitching with a guessed default.
         if not self._confirm_orientation_known(pending):
+            return
+
+        # Pre-flight: Split/Blend cannot run without knowing which sheet
+        # lights the left of the frame, and silently becoming Max is the one
+        # outcome the operator cannot see in the output.
+        if not self._confirm_illumination_low_side(pending, config):
             return
 
         # Pre-flight: block if the XY pixel size clashes with the objective
@@ -4545,6 +4649,16 @@ class StitchingDialog(PersistentDialog):
         except Exception as e:  # noqa: BLE001 - never block a run on this
             self._log(f"⚠ Could not resolve stitching options by microscope: {e}")
             return item_config
+
+        # Remember the instrument so the Options tab can offer it. The name has
+        # to match the acquisition's own "Microscope name" exactly or a saved
+        # profile silently never applies, so having it typed FOR the user is
+        # the point. Best-effort: a dropdown convenience must never affect a run.
+        if scope_profiles.remember_microscope(scope):
+            self._log(
+                f"  First run from microscope '{scope}' — it is now listed in "
+                f"the Options tab, where its stitching settings can be saved."
+            )
 
         applied, message = scope_profiles.describe_resolution(
             scope, objective, values, source

@@ -227,11 +227,29 @@ class OptionsPanel(QWidget):
     # Selection
     # ------------------------------------------------------------------ #
 
+    def showEvent(self, event):  # noqa: N802 - Qt naming
+        """Re-read the microscope list whenever this tab comes forward.
+
+        A run can discover a new instrument while this panel is already built,
+        and the panel is constructed once for the life of the app. Without this
+        the newly-seen microscope would not appear until a restart.
+        """
+        super().showEvent(event)
+        try:
+            current = self._current_scope()
+            self._reload_scopes(select=current)
+        except Exception:  # noqa: BLE001 - a refresh must never break the tab
+            pass
+
     def _reload_scopes(self, select: str = "") -> None:
         self._loading = True
         try:
-            profiles = scope_profiles.list_profiles()
-            scopes = sorted({key.split("|")[0] for key in profiles})
+            # Every microscope we know of: ones with saved settings AND ones
+            # merely seen during a run. Before this, a new instrument never
+            # appeared here until someone typed its name in by hand — and it
+            # has to match the acquisition's own "Microscope name" exactly or
+            # the profile silently never applies.
+            scopes = scope_profiles.known_microscopes()
             self._scope_combo.clear()
             for scope in scopes:
                 self._scope_combo.addItem(scope, scope)
