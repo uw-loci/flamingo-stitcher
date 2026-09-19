@@ -112,6 +112,12 @@ class StitchingTimingKey:
     # the same effect one level down, and without it a refined run and a plain
     # one average into a number that fits neither.
     z_refine: bool = False
+    # Illumination fusion mode. "content" costs ~40x "split" per tile
+    # (98 s vs 2.2 s on a 643-plane 2048^2 tile), so a content run and a split
+    # run sharing one cache entry average two costs that differ by an order of
+    # magnitude. Same reasoning as destripe above; this axis was simply missed
+    # when split/blend/content were added in v0.13.2.
+    illumination_fusion: str = "max"
 
     def serialize(self) -> str:
         return (
@@ -133,6 +139,11 @@ class StitchingTimingKey:
             # Appended only when set, so every key string already in a user's
             # cache stays valid and their learned timings survive this change.
             + ("|zr=1" if self.z_refine else "")
+            + (
+                f"|if={self.illumination_fusion}"
+                if self.illumination_fusion and self.illumination_fusion != "max"
+                else ""
+            )
         )
 
 

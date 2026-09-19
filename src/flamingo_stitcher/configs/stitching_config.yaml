@@ -54,6 +54,14 @@ illumination:
   # handover. 0.5 is a hard split.
   pure_frac: 0.35
 
+  # Measure from the data which sheet actually lights the low end, and refuse
+  # to start when the measurement confidently contradicts `low_side`. Running
+  # with `low_side` backwards keeps the FAR half of each sheet -- the blurred,
+  # attenuated end that split/blend exist to discard -- and the output still
+  # looks smooth and plausible, so nothing downstream catches it. Set false to
+  # trust `low_side` unchecked.
+  verify: true
+
   # Sheet propagation axis in the camera frame. "auto" derives it from the tile
   # orientation, the same way destriping does.
   axis: auto

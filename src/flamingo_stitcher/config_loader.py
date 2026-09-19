@@ -388,6 +388,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.illumination_low_side = int(illum["low_side"])
     if illum.get("pure_frac") is not None:
         config_obj.illumination_pure_frac = float(illum["pure_frac"])
+    if illum.get("verify") is not None:
+        config_obj.illumination_verify = bool(illum["verify"])
     if illum.get("axis") is not None:
         config_obj.illumination_axis = str(illum["axis"])
 

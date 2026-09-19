@@ -96,6 +96,7 @@ _PRIVATE_CONFIG_FIELDS = frozenset(
 # NOT the gate -- see below.
 _CONFIG_FIELD_ORDER = (
     "illumination_fusion",
+    "illumination_verify",
     "split_illumination",
     "tile_overlap_fusion",
     "output_format",
@@ -491,6 +492,37 @@ except Exception:
 _ROUGH_LOAD_MBPS = 200.0
 _ROUGH_S_PER_TILE_CH = 1.5
 _ROUGH_S_PER_OUT_UNIT = 0.08
+#   _ROUGH_S_PER_REG_MPAIRVOX: registration, seconds per MILLION overlap voxels
+#                          in ONE seam. Registration is the one phase the prior
+#                          used to ignore entirely -- its cost hid inside
+#                          _ROUGH_S_PER_TILE_CH's 1.5 s/tile, which on the
+#                          2026-09-18 7x7 predicted 74 s for a phase that took
+#                          6h43m (71.8% of the run). Pairwise registrations run
+#                          SERIALLY for 3-D data (multiview-stitcher sets
+#                          n_parallel_pairwise_regs=1), so the cost is the
+#                          per-seam cost times the seam count, with no
+#                          concurrency to divide it by.
+#                          Calibrated from that run: 24187 s over an 84-seam
+#                          7x7 grid at 643 planes x 2048^2 x 15% overlap
+#                          = 288 s per seam over 404 Mvoxel = 0.71 s/Mvoxel.
+#                          ONE measurement on ONE machine at default
+#                          registration binning -- the cache supersedes it as
+#                          soon as any run of this config completes.
+_ROUGH_S_PER_REG_MPAIRVOX = 0.71
+
+# Global-progress percent boundaries for the pipeline phases. The estimator
+# turns this percent into a whole-run ETA by linear extrapolation
+# (remaining = elapsed * (1-f)/f), so a phase that occupies few percentage
+# points while taking most of the wall clock makes the ETA run AWAY from the
+# truth for as long as it lasts. Registration used to emit a single 45 and
+# nothing more: on the 2026-09-18 7x7 the fraction sat at 0.45 for 6h41m while
+# the displayed "done at" slid from 17:58 to 08:49 against a true 02:42.
+# The band below is sized from that run's measured shares (register 72%, fuse
+# 25%) and registration now emits per seam inside it.
+_PCT_REGISTER = 45
+_PCT_FUSE = 70
+_PCT_WRITE = 90
+_PCT_METADATA = 95
 
 
 def _drive_root(path) -> str:
@@ -541,6 +573,9 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
         # A second pairwise pass is the same class of cost swing as
         # registration on/off, one level down.
         z_refine=bool(getattr(config, "registration_z_refine", False)),
+        illumination_fusion=str(
+            getattr(config, "illumination_fusion", "max") or "max"
+        ),
         planes_per_tile=planes,
         downsample_xy=int(getattr(config, "downsample_xy", 1) or 1),
         downsample_z=int(getattr(config, "downsample_z", 1) or 1),
@@ -585,7 +620,102 @@ def rough_run_seconds(tiles, config) -> float:
 
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
     fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
-    return load_register + fuse_write
+    return load_register + _rough_register_seconds(tiles, config) + fuse_write
+
+
+# Stage positions that differ by less than this are the same row or column.
+# Tile pitches are ~1-2 mm and stage repeatability is sub-micron, so 10 um sits
+# far below any real step and far above any jitter. Rounding to a fixed number
+# of decimals does NOT work here: a coordinate sitting on the rounding boundary
+# splits one row into two, which silently halves the seam count.
+_GRID_POSITION_TOL_MM = 0.01
+
+
+def _count_distinct(values, tol: float) -> int:
+    """How many clusters the sorted values fall into, at `tol` separation."""
+    vs = sorted(float(v) for v in values)
+    if not vs:
+        return 0
+    groups = 1
+    last = vs[0]
+    for v in vs[1:]:
+        if v - last > tol:
+            groups += 1
+            last = v
+    return groups
+
+
+def _grid_shape(tiles) -> Tuple[int, int]:
+    """(rows, cols) of the tile grid, clustered from the stage positions."""
+    cols = _count_distinct(
+        (getattr(t, "x_mm", 0.0) for t in tiles), _GRID_POSITION_TOL_MM
+    )
+    rows = _count_distinct(
+        (getattr(t, "y_mm", 0.0) for t in tiles), _GRID_POSITION_TOL_MM
+    )
+    return max(1, rows), max(1, cols)
+
+
+def _rough_overlap_fraction(tiles, config) -> float:
+    """Tile overlap along X, measured from the stage positions.
+
+    Falls back to 15% when the layout cannot be read (one tile, or positions
+    that do not form a grid). Clamped: a nonsense value here would swing the
+    registration term by more than the term is worth.
+    """
+    default = 0.15
+    try:
+        xs = sorted(float(t.x_mm) for t in tiles)
+        xs = [
+            x for i, x in enumerate(xs)
+            if i == 0 or x - xs[i - 1] > _GRID_POSITION_TOL_MM
+        ]
+        if len(xs) < 2:
+            return default
+        steps = [b - a for a, b in zip(xs, xs[1:]) if b > a]
+        if not steps:
+            return default
+        step_mm = float(np.median(steps))
+        width_px = int(getattr(tiles[0], "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+        px_um = float(getattr(config, "pixel_size_um", 0.0) or 0.0)
+        if px_um <= 0.0:
+            return default
+        frame_mm = width_px * px_um / 1000.0
+        if frame_mm <= 0.0:
+            return default
+        return min(0.5, max(0.02, 1.0 - step_mm / frame_mm))
+    except Exception:  # noqa: BLE001 - a prior must never fail a run
+        return default
+
+
+def _rough_register_seconds(tiles, config) -> float:
+    """Cold-start estimate for the pairwise registration phase.
+
+    Seam count from the grid shape, overlap volume from the frame and the
+    measured overlap, and a per-voxel constant. Zero when registration is off.
+    """
+    if getattr(config, "skip_registration", False):
+        return 0.0
+    n_tiles = len(tiles)
+    if n_tiles < 2:
+        return 0.0
+    rows, cols = _grid_shape(tiles)
+    # Seams in an R x C grid: horizontal + vertical neighbours.
+    n_seams = rows * max(0, cols - 1) + cols * max(0, rows - 1)
+    if n_seams <= 0:
+        n_seams = n_tiles - 1  # a strip, or a layout we could not read
+    overlap = _rough_overlap_fraction(tiles, config)
+    t0 = tiles[0]
+    fw = int(getattr(t0, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+    fh = int(getattr(t0, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
+    planes = max((t.n_planes for t in tiles), default=1)
+    # Overlap strip: the full frame in one lateral axis, `overlap` of the other.
+    mvox_per_seam = (planes * fh * fw * overlap) / 1e6
+    seconds = _ROUGH_S_PER_REG_MPAIRVOX * mvox_per_seam * n_seams
+    # A second pairwise pass over the same seams, at finer Z.
+    if getattr(config, "registration_z_refine", False):
+        seconds *= 2.0
+    return seconds
 
 
 # Tile file extensions the discovery + loader understand. The acquisition can
@@ -1157,6 +1287,10 @@ class StitchingConfig:
     # Share of the illumination axis each sheet owns outright under "blend".
     # The rest is the handover band. 0.5 or more degenerates to a hard split.
     illumination_pure_frac: float = 0.35
+    # Measure which sheet actually lights the low end and refuse to run when
+    # the measurement confidently contradicts illumination_low_side. Off means
+    # the typed-in value is trusted unchecked.
+    illumination_verify: bool = True
     # Illumination (sheet propagation) axis in the camera frame: "auto" derives
     # it from the same place destriping does — a per-microscope constant mapped
     # back through the tile orientation — so there is no second copy of that
@@ -4761,6 +4895,10 @@ class StitchingPipeline:
         # --- Resolve / verify acquisition geometry (frame size, optics, flags) ---
         self._apply_and_log_geometry(tiles, acquisition_dir)
 
+        # Split/blend keep one sheet per half of the frame. Which sheet owns
+        # which half is a typed-in number until this point; measure it.
+        self._verify_illumination_geometry(tiles)
+
         # --- Build the multi-phase ETA estimator ---
         # Built after discover so we know tile count + planes. The
         # progress hook already started the "discover" phase when the
@@ -4962,7 +5100,7 @@ class StitchingPipeline:
 
         # --- Step 3: Register using reference channel ---
         if self.config.skip_registration:
-            self._progress_fn(45, "Skipping registration (using stage positions)...")
+            self._progress_fn(_PCT_REGISTER, "Skipping registration (using stage positions)...")
             self.logger.info(
                 "Step 3: Skipping registration — using stage positions only"
             )
@@ -4991,7 +5129,7 @@ class StitchingPipeline:
                 ref_ch = process_channels[0]
             ref_tile_data = channel_tile_data[ref_ch]
 
-            self._progress_fn(45, f"Registering tiles (channel {ref_ch})...")
+            self._progress_fn(_PCT_REGISTER, f"Registering tiles (channel {ref_ch})...")
             self.logger.info(
                 f"Step 3: Registering on reference channel {ref_ch} "
                 f"({len(ref_tile_data)} tiles)..."
@@ -5140,7 +5278,7 @@ class StitchingPipeline:
             self.logger.info("Pipeline cancelled by user")
             return output_path
 
-        self._progress_fn(75, "Writing multi-channel output...")
+        self._progress_fn(_PCT_WRITE, "Writing multi-channel output...")
         self.logger.info("Step 6: Writing multi-channel output...")
         basename = self._build_output_basename(acquisition_dir)
         self.logger.info(f"  Output basename: {basename}")
@@ -5150,7 +5288,7 @@ class StitchingPipeline:
         )
 
         # --- Step 7: Write metadata ---
-        self._progress_fn(95, "Writing metadata...")
+        self._progress_fn(_PCT_METADATA, "Writing metadata...")
         origin_um = channel_origins[0]
         self._write_stitch_metadata_v2(
             output_path,
@@ -5385,7 +5523,7 @@ class StitchingPipeline:
         # produces (it materialises the reference channel without a side).
         reg_reuse_side = None
         if self.config.skip_registration:
-            self._progress_fn(45, "Skipping registration (using stage positions)...")
+            self._progress_fn(_PCT_REGISTER, "Skipping registration (using stage positions)...")
             self.logger.info(
                 "Step 3: Skipping registration \u2014 using stage positions only"
             )
@@ -5442,7 +5580,7 @@ class StitchingPipeline:
                 self.logger.info("Pipeline cancelled by user")
                 return output_path
 
-            self._progress_fn(45, f"Registering tiles (channel {ref_ch})...")
+            self._progress_fn(_PCT_REGISTER, f"Registering tiles (channel {ref_ch})...")
             self.logger.info(
                 f"Step 3: Registering on reference channel {ref_ch} "
                 f"({len(ref_tile_data)} tiles)..."
@@ -5569,7 +5707,7 @@ class StitchingPipeline:
                     shutil.rmtree(tmp_root, ignore_errors=True)
                     return output_path
 
-                fuse_pct = 50 + int(35 * (ch_idx + 0.5) / n_out)
+                fuse_pct = _PCT_FUSE + int((_PCT_WRITE - _PCT_FUSE) * (ch_idx + 0.5) / n_out)
                 self._progress_fn(
                     fuse_pct,
                     f"Fusing channel {ch_id} "
@@ -5612,7 +5750,7 @@ class StitchingPipeline:
                         shutil.rmtree(ch_tmp_dir, ignore_errors=True)
                     continue
 
-                compute_pct = 50 + int(35 * (ch_idx + 0.8) / n_out)
+                compute_pct = _PCT_FUSE + int((_PCT_WRITE - _PCT_FUSE) * (ch_idx + 0.8) / n_out)
                 self._progress_fn(
                     compute_pct,
                     f"Computing channel {ch_id} "
@@ -5774,7 +5912,9 @@ class StitchingPipeline:
                         # spans ~50–85%; give each channel an equal slice and
                         # interpolate by completed regions within it.
                         ch_frac = (ridx + 1) / max(len(regions), 1)
-                        region_pct = 50 + int(35 * (ch_idx + ch_frac) / n_out)
+                        region_pct = _PCT_FUSE + int(
+                            (_PCT_WRITE - _PCT_FUSE) * (ch_idx + ch_frac) / n_out
+                        )
                         self._progress_fn(
                             region_pct,
                             f"Channel {ch_id}: fused region "
@@ -5897,7 +6037,7 @@ class StitchingPipeline:
                 shutil.rmtree(tmp_root, ignore_errors=True)
             return output_path
 
-        self._progress_fn(85, "Writing multi-channel output...")
+        self._progress_fn(_PCT_WRITE, "Writing multi-channel output...")
         basename = self._build_output_basename(acquisition_dir)
         self.logger.info(f"  Output basename: {basename}")
         channel_names = [f"Channel_{ch_id}" for ch_id in fused_channel_ids]
@@ -5949,7 +6089,7 @@ class StitchingPipeline:
                 shutil.rmtree(tmp_root, ignore_errors=True)
 
         # --- Step 7: Write metadata ---
-        self._progress_fn(95, "Writing metadata...")
+        self._progress_fn(_PCT_METADATA, "Writing metadata...")
         origin_um = channel_origins[0]
         self._write_stitch_metadata_v2(
             output_path,
@@ -6516,6 +6656,99 @@ class StitchingPipeline:
         )
         return self._detect_destripe_direction_from_content(volume)
 
+    # Tiles to try before giving up on measuring the illumination geometry.
+    # Rim tiles are often empty medium and cannot answer; a handful reaches
+    # sample on any real acquisition.
+    _ILLUM_VERIFY_TILES = 6
+
+    def _verify_illumination_geometry(self, tiles) -> None:
+        """Measure which sheet lights the low end, and check the setting.
+
+        Only ``split``/``blend`` care. Getting ``illumination_low_side``
+        backwards keeps the FAR half of each sheet -- the blurred, attenuated
+        end the split exists to discard -- and nothing downstream can tell:
+        every voxel is still real data, so the output stays smooth and
+        plausible. The 2026-09-18 7x7 ran 9h21m before the stitched image was
+        the first sign of trouble.
+
+        Measured on the raw sides of real tiles, before any preprocessing, so
+        this costs one subsampled read of two files. It stops the run only when
+        the measurement is CONFIDENT and disagrees; an uncertain measurement
+        (uniform sample, sheets that genuinely overlap) says so and continues.
+        """
+        method = getattr(self.config, "illumination_fusion", "max")
+        if method not in ("split", "blend"):
+            return
+        if not getattr(self.config, "illumination_verify", True):
+            self.logger.info(
+                "  Illumination geometry check skipped (illumination_verify off)."
+            )
+            return
+        configured = int(getattr(self.config, "illumination_low_side", -1))
+        if configured < 0:
+            return  # _check_illumination_fusion_is_usable already refused
+
+        from flamingo_stitcher import illumination_geometry
+
+        # Try tiles in turn: an empty rim tile cannot answer, a tile with
+        # sample can. Stop at the first confident reading.
+        result = None
+        for tile in tiles[: self._ILLUM_VERIFY_TILES]:
+            for ch_id, illum_files in sorted(tile.raw_files.items()):
+                if len(illum_files) < 2:
+                    continue
+                try:
+                    volumes = {
+                        side: load_tile_volume(
+                            path, tile.n_planes, tile.frame_width, tile.frame_height
+                        )
+                        for side, path in sorted(illum_files.items())[:2]
+                    }
+                    axis = self._resolve_illumination_axis(
+                        next(iter(volumes.values()))
+                    )
+                    measured = illumination_geometry.measure(volumes, axis=axis)
+                except Exception as exc:  # noqa: BLE001 - diagnostic only
+                    self.logger.debug(f"Illumination geometry probe failed: {exc}")
+                    continue
+                if measured is not None and measured.confident:
+                    result = measured
+                    break
+            if result is not None:
+                break
+
+        if result is None:
+            self.logger.info(
+                "  Illumination geometry: could not be measured from the first "
+                f"{self._ILLUM_VERIFY_TILES} tiles (too uniform, or the two "
+                f"sheets look alike). Using the configured "
+                f"illumination_low_side={configured} unchecked."
+            )
+            return
+
+        if result.low_side == configured:
+            self.logger.info(
+                f"  Illumination geometry confirmed: {result.describe()} — "
+                f"matches the configured illumination_low_side={configured}."
+            )
+            return
+
+        raise ValueError(
+            f"Illumination fusion '{method}' is set to keep side {configured} "
+            f"over the low end of the frame, but the data says the opposite: "
+            f"{result.describe()}.\n\n"
+            f"Running like this keeps the FAR half of each light sheet — the "
+            f"blurred, attenuated end that '{method}' exists to discard. The "
+            f"output would still look smooth and plausible, so this is caught "
+            f"here rather than after the run.\n\n"
+            f"To fix it: open the Options tab and set 'Illumination side "
+            f"lighting the low end of the frame' to {result.low_side} "
+            f"(currently {configured}). If you believe {configured} is right, "
+            f"set illumination_verify: false in the stitching config to run "
+            f"anyway — but look at one raw tile from each side first and check "
+            f"which half of the frame is in focus."
+        )
+
     def _check_illumination_fusion_is_usable(self) -> None:
         """Stop before the run if split/blend cannot do what was asked.
 
@@ -6993,6 +7226,10 @@ class StitchingPipeline:
                         reg_msims,
                         reg_channel_index=0,
                         pairs=gate_pairs,
+                        pairwise_reg_func=self._seam_progress_func(
+                            len(gate_pairs) if gate_pairs is not None else
+                            max(1, len(reg_msims) * 2)
+                        ),
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
                         registration_binning=self._effective_registration_binning(
@@ -7355,6 +7592,46 @@ class StitchingPipeline:
             f"so tiles are placed by stage position instead. Re-acquire with ~10% "
             f"tile overlap."
         )
+
+    def _seam_progress_func(self, n_pairs: int):
+        """Wrap multiview-stitcher's pairwise registration to report progress.
+
+        multiview-stitcher runs 3-D pairwise registrations SERIALLY
+        (``n_parallel_pairwise_regs=1``) inside one opaque ``register()`` call,
+        so without this the whole phase is a single progress emit and the ETA
+        has nothing to extrapolate from for hours. Wrapping the per-seam
+        function is exact -- one call per seam, and we know the seam count --
+        where counting dask tasks would also pick up the adjacency graph and
+        the groupwise solve.
+
+        ``functools.wraps`` matters: multiview-stitcher decides which arguments
+        to pass by inspecting the function's signature
+        (``dask.utils.has_keyword``), and an unwrapped ``*args, **kwargs``
+        wrapper advertises none of them, which silently changes how the
+        registration is called.
+        """
+        import functools
+        from multiview_stitcher import registration as _mvs_reg
+
+        inner = _mvs_reg.phase_correlation_registration
+        total = max(1, int(n_pairs))
+        state = {"done": 0}
+
+        @functools.wraps(inner)
+        def _counting(*args, **kwargs):
+            try:
+                return inner(*args, **kwargs)
+            finally:
+                state["done"] += 1
+                done = state["done"]
+                frac = min(1.0, done / total)
+                pct = _PCT_REGISTER + int((_PCT_FUSE - _PCT_REGISTER) * frac)
+                try:
+                    self._progress_fn(pct, f"Registering seam {done}/{total}...")
+                except Exception:  # noqa: BLE001 - progress must never fail a run
+                    pass
+
+        return _counting
 
     @staticmethod
     def _pairwise_reg_kwargs(upsample_factor) -> Optional[Dict[str, Any]]:
