@@ -1284,8 +1284,12 @@ class StitchingConfig:
     # built from the worse half of every frame. On n7 this is side 1 (I1 is the
     # left-hand sheet).
     illumination_low_side: int = -1  # -1 = not set
-    # Share of the illumination axis each sheet owns outright under "blend".
-    # The rest is the handover band. 0.5 or more degenerates to a hard split.
+    # Share of the illumination axis each sheet owns outright under "blend",
+    # measured across the WHOLE ACQUISITION rather than across each frame. The
+    # rest is the handover band; 0.5 or more degenerates to a hard split, which
+    # puts one line down the middle of the mosaic -- on a tile seam for an even
+    # column count, mid-tile for an odd one. Changed in v0.13.5: it used to be
+    # a share of each frame, which drew a seam down every tile column.
     illumination_pure_frac: float = 0.35
     # Measure which sheet actually lights the low end and refuse to run when
     # the measurement confidently contradicts illumination_low_side. Off means
@@ -3336,29 +3340,55 @@ def _smoothstep(t: np.ndarray) -> np.ndarray:
     return t * t * (3.0 - 2.0 * t)
 
 
-def side_weight_profile(n: int, pure_frac: float = 0.0) -> np.ndarray:
+def side_weight_profile(
+    n: int,
+    pure_frac: float = 0.0,
+    *,
+    span: Optional[int] = None,
+    offset: int = 0,
+) -> np.ndarray:
     """Weight of the LOW-end side across `n` samples of the illumination axis.
 
     1.0 where the low-end sheet owns the image outright, 0.0 where the high-end
     sheet does, smoothstep between. ``pure_frac`` is the share of the axis each
-    side owns outright; 0.5 (or more) degenerates to a hard split at the
-    midline, which is the cheapest option and the one usually asked for first.
+    side owns outright; 0.5 (or more) degenerates to a hard split, which is the
+    cheapest option and the one usually asked for first.
+
+    ``span`` and ``offset`` place this tile inside the WHOLE acquisition: the
+    profile is built across ``span`` samples and the window
+    ``[offset, offset + n)`` is returned. That is what makes one split line for
+    the mosaic rather than one per tile.
+
+    Which sheet wins is not a per-frame question on a tiled sample. A sheet
+    entering from the left has to cross every millimetre of tissue to the left
+    of the current tile before it arrives, so over a 12 mm sample the left sheet
+    is the good one for left tiles and the right sheet for right tiles. Splitting
+    each tile at its own midline instead discards the good sheet over half of
+    every edge tile and substitutes the one that just crossed the entire sample
+    -- and draws a seam down every tile column while doing it.
+
+    Defaults (``span=None, offset=0``) give the single-FOV behaviour unchanged:
+    a mosaic of one tile is the special case.
     """
     n = max(1, int(n))
+    span = max(1, int(span)) if span else n
+    offset = max(0, int(offset))
+    if offset + n > span:  # a window that does not fit describes nothing
+        span = offset + n
     frac = min(0.5, max(0.0, float(pure_frac)))
-    pure = int(round(frac * n))
-    if pure * 2 >= n:  # hard split — no band left to ramp across
-        w = np.zeros(n, dtype=np.float32)
-        w[: n // 2] = 1.0
-        return w
-    w = np.empty(n, dtype=np.float32)
+    pure = int(round(frac * span))
+    if pure * 2 >= span:  # hard split — no band left to ramp across
+        w = np.zeros(span, dtype=np.float32)
+        w[: span // 2] = 1.0
+        return w[offset: offset + n]
+    w = np.empty(span, dtype=np.float32)
     w[:pure] = 1.0
-    w[n - pure:] = 0.0
-    band = n - 2 * pure
+    w[span - pure:] = 0.0
+    band = span - 2 * pure
     # 1 -> 0 across the band, endpoints excluded so the joins are flat.
     t = (np.arange(band, dtype=np.float32) + 0.5) / band
-    w[pure: n - pure] = 1.0 - _smoothstep(t)
-    return w
+    w[pure: span - pure] = 1.0 - _smoothstep(t)
+    return w[offset: offset + n]
 
 
 # How far the detail measure may be decimated before it stops measuring
@@ -3443,6 +3473,8 @@ def fuse_illumination_sides(
     axis: int = -1,
     low_side: Optional[int] = None,
     pure_frac: float = 0.0,
+    span: Optional[int] = None,
+    offset: int = 0,
 ) -> np.ndarray:
     """Fuse the two illumination volumes of one tile.
 
@@ -3487,7 +3519,12 @@ def fuse_illumination_sides(
         low = np.asarray(volumes[low_side])
         high = np.asarray(volumes[[s for s in sides if s != low_side][0]])
         n = low.shape[axis]
-        w = side_weight_profile(n, 0.5 if method == "split" else pure_frac)
+        w = side_weight_profile(
+            n,
+            0.5 if method == "split" else pure_frac,
+            span=span,
+            offset=offset,
+        )
 
         # Where a weight is exactly 1 or 0 the answer is one side's own voxels,
         # so COPY them. Only the handover band needs arithmetic. Under `split`
@@ -4895,8 +4932,12 @@ class StitchingPipeline:
         # --- Resolve / verify acquisition geometry (frame size, optics, flags) ---
         self._apply_and_log_geometry(tiles, acquisition_dir)
 
-        # Split/blend keep one sheet per half of the frame. Which sheet owns
-        # which half is a typed-in number until this point; measure it.
+        # Split/blend hand one sheet one end of the illumination axis. The
+        # whole tile set is needed to place each frame inside that handover
+        # (one per ACQUISITION, not one per tile), and which sheet lights which
+        # end is a typed-in number until this point -- measure it.
+        self._illum_tiles = list(tiles)
+        self._illum_span_logged = False
         self._verify_illumination_geometry(tiles)
 
         # --- Build the multi-phase ETA estimator ---
@@ -6324,7 +6365,7 @@ class StitchingPipeline:
             volume = fuse_illumination_sides(
                 illum_volumes,
                 method=self.config.illumination_fusion,
-                **self._illumination_fuse_kwargs(_first),
+                **self._illumination_fuse_kwargs(_first, tile),
             )
         else:
             volume = np.asarray(list(illum_volumes.values())[0])
@@ -6808,18 +6849,119 @@ class StitchingPipeline:
         except Exception:  # noqa: BLE001 - never fail a run over an axis guess
             return -1
 
-    def _illumination_fuse_kwargs(self, volume) -> Dict[str, Any]:
+    def _orientation_maps_frame_axis(self, axis: int):
+        """Where the frame's illumination axis lands after tile orientation.
+
+        Returns ``(output_axis, reversed)``. Probed by orienting a ramp rather
+        than read from a table of orientation names: a transposing orientation
+        moves the illumination axis onto the other output axis, and a flipping
+        one reverses it, and a lookup table for that is one more place to get a
+        sign silently wrong.
+        """
+        from flamingo_stitcher.orientation import MosaicOrientation
+
+        ori_name = self.config.tile_orientation or (
+            "flip_h" if self.config.camera_x_inverted else "identity"
+        )
+        probe = np.zeros((1, 4, 5), dtype=np.int32)
+        if axis == -1:
+            probe[0] = np.arange(5, dtype=np.int32)[None, :]
+        else:
+            probe[0] = np.arange(4, dtype=np.int32)[:, None]
+        out = np.asarray(MosaicOrientation.from_name(ori_name).apply_volume_xy(probe))
+        along_x = int(out[0, 0, -1]) - int(out[0, 0, 0])
+        along_y = int(out[0, -1, 0]) - int(out[0, 0, 0])
+        if abs(along_x) >= abs(along_y):
+            return -1, along_x < 0
+        return -2, along_y < 0
+
+    def _illumination_mosaic_window(self, tile, volume, axis: int):
+        """``(span, offset)`` placing this tile's frame inside the acquisition.
+
+        `split` and `blend` hand one sheet the low end of the illumination axis
+        and the other the high end. That question is asked of the ACQUISITION,
+        not of each frame: the sheet entering from one side has to cross all the
+        tissue before the current tile to reach it, so over a 12 mm sample one
+        sheet is the good one for one side of the mosaic and the other for the
+        other side. One handover, not one per tile.
+
+        Returns ``(None, 0)`` when the acquisition is a single tile along this
+        axis, which is the single-FOV case and leaves the fusion exactly as it
+        was.
+        """
+        tiles = getattr(self, "_illum_tiles", None)
+        if not tiles or len(tiles) < 2:
+            return None, 0
+        try:
+            out_axis, flipped = self._orientation_maps_frame_axis(axis)
+            attr = "x_mm" if out_axis == -1 else "y_mm"
+            reverse = bool(
+                getattr(
+                    self.config,
+                    "reverse_x_tiles" if out_axis == -1 else "reverse_y_tiles",
+                    False,
+                )
+            )
+            coords = [float(getattr(t, attr)) for t in tiles]
+            lo, hi = min(coords), max(coords)
+            px_um = float(getattr(self.config, "pixel_size_um", 0) or 0)
+            if px_um <= 0 or hi - lo <= 0:
+                return None, 0
+            mm_per_px = px_um / 1000.0
+            frame_px = int(volume.shape[axis])
+            span = int(round((hi - lo) / mm_per_px)) + frame_px
+
+            here = float(getattr(tile, attr))
+            # Same stage->output placement every other part of the pipeline
+            # uses (orientation.apply_*: (x_max - x) when the tile ORDER is
+            # reversed, else (x - x_min)).
+            out_off = int(round(((hi - here) if reverse else (here - lo)) / mm_per_px))
+            # `low_side` names the low end of the FRAME, so count the offset in
+            # frame-axis direction; a flipping orientation reverses the two.
+            offset = (span - frame_px - out_off) if flipped else out_off
+            offset = max(0, min(offset, span - frame_px))
+            self._log_illumination_span_once(span, frame_px, len(tiles), attr, reverse, flipped)
+            return span, offset
+        except Exception as exc:  # noqa: BLE001 - never fail a run over placement
+            self.logger.debug(f"Illumination mosaic window unavailable: {exc}")
+            return None, 0
+
+    def _log_illumination_span_once(self, span, frame_px, n_tiles, attr, reverse, flipped):
+        if getattr(self, "_illum_span_logged", False):
+            return
+        self._illum_span_logged = True
+        self.logger.info(
+            f"  Illumination {self.config.illumination_fusion}: ONE handover "
+            f"across the whole acquisition — {span} px along the illumination "
+            f"axis ({frame_px} px per frame, {n_tiles} tiles, stage {attr[0].upper()}"
+            f"{', reversed order' if reverse else ''}"
+            f"{', frame axis flipped by orientation' if flipped else ''}). "
+            f"Side {self.config.illumination_low_side} owns the low end. "
+            f"Splitting each tile at its own midline instead would draw a seam "
+            f"down every tile column and hand half of every edge tile to the "
+            f"sheet that just crossed the entire sample."
+        )
+
+    def _illumination_fuse_kwargs(self, volume, tile=None) -> Dict[str, Any]:
         """Extra arguments for `fuse_illumination_sides` on this acquisition."""
         method = getattr(self.config, "illumination_fusion", "max")
         if method not in ("split", "blend"):
             return {}
+        axis = self._resolve_illumination_axis(volume)
+        span, offset = (
+            self._illumination_mosaic_window(tile, volume, axis)
+            if tile is not None
+            else (None, 0)
+        )
         return {
-            "axis": self._resolve_illumination_axis(volume),
+            "axis": axis,
             "low_side": (
                 _low if (_low := getattr(self.config, "illumination_low_side", -1)) >= 0
                 else None
             ),
             "pure_frac": float(getattr(self.config, "illumination_pure_frac", 0.35)),
+            "span": span,
+            "offset": offset,
         }
 
     def _detect_destripe_direction_from_content(self, volume: np.ndarray) -> str:

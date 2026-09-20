@@ -50,8 +50,17 @@ illumination:
   # On n7 this is 1 (I1 is the left-hand sheet).
   low_side: -1
 
-  # Share of the frame each sheet owns outright under `blend`; the rest is the
-  # handover. 0.5 is a hard split.
+  # Share of the ACQUISITION each sheet owns outright under `blend`; the rest
+  # is the handover band. 0.5 is a hard split.
+  #
+  # Measured across the whole mosaic, not across each frame: the sheet entering
+  # from one side has to cross every millimetre of tissue before the current
+  # tile to reach it, so on a 12 mm sample one sheet is the good one for one
+  # side of the mosaic and the other for the other side. There is ONE handover
+  # per acquisition. (Before v0.13.5 this was a share of each FRAME, which put
+  # a seam down every tile column and handed half of every edge tile to the
+  # sheet that had just crossed the entire sample.) A single-FOV acquisition is
+  # the special case where the mosaic is one tile, and is unaffected.
   pure_frac: 0.35
 
   # Measure from the data which sheet actually lights the low end, and refuse
