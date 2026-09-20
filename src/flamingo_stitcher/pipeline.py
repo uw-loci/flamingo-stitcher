@@ -5864,7 +5864,18 @@ class StitchingPipeline:
                     _alloc_stacked(full_shape)
                     dest_idx = len(fused_channel_ids)
                     regions = list(
-                        self._iter_superblock_regions(full_props, superblock)
+                        self._iter_superblock_regions(
+                            full_props,
+                            superblock,
+                            # The chunk size FUSION will actually use, not the
+                            # configured one: `resolve_output_chunksize` caps XY
+                            # at a tile pitch, so at heavy downsample the two
+                            # differ and regions stepped by the configured size
+                            # stop being chunk-aligned -- which is the whole
+                            # premise of regioned fusion matching whole-output
+                            # fusion.
+                            chunksize=fuse_kwargs.get("output_chunksize"),
+                        )
                     )
                     self.logger.info(
                         f"  {describe_channel(ch_id).capitalize()}: shape={full_shape} "
@@ -9360,15 +9371,25 @@ class StitchingPipeline:
             sims, params=params, spacing=spacing, mode="union"
         )
 
-    def _iter_superblock_regions(self, full_props, region_chunks: int):
+    def _iter_superblock_regions(
+        self, full_props, region_chunks: int, chunksize: Optional[Dict[str, int]] = None
+    ):
         """Yield ``(region_props, (z0,z1,y0,y1,x0,x1))`` covering the full
         output in chunk-aligned regions of ``region_chunks`` output-chunks per
         axis. Chunk alignment is what makes each region fuse bit-identically to
-        the whole output (see tests/test_superblock_fusion.py)."""
+        the whole output (see tests/test_superblock_fusion.py).
+
+        ``chunksize`` must be the size FUSION is called with. It defaults to the
+        configured ``output_chunksize`` only for callers that have nothing
+        better, and those two are NOT always the same: ``resolve_output_chunksize``
+        caps XY near one tile pitch, so a heavily downsampled run fuses at a
+        smaller chunk than the config names. Stepping the regions by the
+        configured size then puts every boundary off the fusion grid.
+        """
         sp = full_props["spacing"]
         org = full_props["origin"]
         shp = full_props["shape"]
-        cs = self.config.output_chunksize
+        cs = chunksize or self.config.output_chunksize
         step = {
             d: max(1, int(cs.get(d, 256))) * max(1, int(region_chunks))
             for d in ("z", "y", "x")

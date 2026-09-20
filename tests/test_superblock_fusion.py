@@ -115,3 +115,58 @@ class TestSuperblockIdentical(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(_HAVE_MVS, "needs multiview_stitcher")
+class TestRegionsUseTheFusionChunkSize(unittest.TestCase):
+    """The region step must come from the chunk size FUSION uses.
+
+    `resolve_output_chunksize` caps XY near one tile pitch, so a heavily
+    downsampled run fuses at a smaller chunk than `config.output_chunksize`
+    names. Stepping the regions by the configured value then puts every region
+    boundary off the fusion grid, and the bit-identical guarantee above no
+    longer applies to anything.
+    """
+
+    def _pipeline(self, configured, resolved):
+        from types import SimpleNamespace
+        from flamingo_stitcher.pipeline import StitchingPipeline
+
+        p = StitchingPipeline.__new__(StitchingPipeline)
+        p.config = SimpleNamespace(output_chunksize=configured)
+        self.resolved = resolved
+        return p
+
+    def _props(self):
+        return {
+            "origin": {"z": 0.0, "y": 0.0, "x": 0.0},
+            "shape": {"z": 16, "y": 1024, "x": 1024},
+            "spacing": {"z": 5.0, "y": 1.0, "x": 1.0},
+        }
+
+    def test_the_passed_chunksize_wins_over_the_configured_one(self):
+        p = self._pipeline({"z": 8, "y": 256, "x": 256}, {"z": 8, "y": 64, "x": 64})
+        regions = list(
+            p._iter_superblock_regions(self._props(), 2, chunksize=self.resolved)
+        )
+        starts_x = sorted({r[1][4] for r in regions})
+        # 64 * 2 = 128 px steps, every one a multiple of the fusion chunk (64).
+        self.assertEqual(starts_x, list(range(0, 1024, 128)))
+        for s in starts_x:
+            self.assertEqual(s % self.resolved["x"], 0)
+
+    def test_it_falls_back_to_the_configured_size(self):
+        p = self._pipeline({"z": 8, "y": 256, "x": 256}, None)
+        regions = list(p._iter_superblock_regions(self._props(), 2))
+        starts_x = sorted({r[1][4] for r in regions})
+        self.assertEqual(starts_x, [0, 512])
+
+    def test_regions_tile_the_output_exactly(self):
+        p = self._pipeline({"z": 8, "y": 256, "x": 256}, {"z": 8, "y": 96, "x": 96})
+        regions = list(
+            p._iter_superblock_regions(self._props(), 3, chunksize=self.resolved)
+        )
+        covered = np.zeros((16, 1024, 1024), dtype=np.uint8)
+        for _rprops, (z0, z1, y0, y1, x0, x1) in regions:
+            covered[z0:z1, y0:y1, x0:x1] += 1
+        self.assertTrue((covered == 1).all(), "regions must partition the output")
