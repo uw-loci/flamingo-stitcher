@@ -182,6 +182,84 @@ def measure(
     )
 
 
+@dataclass(frozen=True)
+class AcquisitionGeometry:
+    """What a whole acquisition says, pooled over several tiles."""
+
+    low_side: Optional[int]
+    votes: Dict[int, int]
+    rows: list
+    """(tile name, channel, low_side or None, margin, tilts) per probed tile."""
+
+    @property
+    def agreed(self) -> int:
+        return self.votes.get(self.low_side, 0) if self.low_side is not None else 0
+
+    @property
+    def total(self) -> int:
+        return sum(self.votes.values())
+
+    @property
+    def split(self) -> bool:
+        """True when probed tiles disagreed — which should not happen on one
+        acquisition, and means the illumination axis or the tile orientation is
+        wrong before split/blend can mean anything."""
+        return len(self.votes) > 1
+
+    def summary(self) -> str:
+        if self.low_side is None:
+            return (
+                "No tile gave a confident answer. The sample may be too uniform, "
+                "or the two sheets may genuinely look alike. Open one raw file "
+                "from each side and look at which half of the frame is in focus."
+            )
+        text = (
+            f"Side {self.low_side} lights the LOW end of the frame "
+            f"({self.agreed}/{self.total} tiles agree)."
+        )
+        if self.split:
+            text += (
+                f"\n\nNOTE: tiles disagreed ({dict(self.votes)}). That should not "
+                f"happen on one acquisition — check the tile orientation and the "
+                f"illumination axis before trusting split or blend."
+            )
+        return text
+
+
+def measure_acquisition(
+    acquisition_dir, max_tiles: int = 6, axis: int = -1
+) -> AcquisitionGeometry:
+    """Probe up to `max_tiles` of an acquisition and pool the answers.
+
+    Shared by the CLI and the Options tab's "Measure from data" button so the
+    two cannot drift. Reads only a subsampled slice of each raw file.
+    """
+    from flamingo_stitcher.pipeline import discover_tiles, load_tile_volume
+
+    tiles = discover_tiles(str(acquisition_dir))
+    votes: Dict[int, int] = {}
+    rows = []
+    for tile in (tiles or [])[:max_tiles]:
+        for ch_id, illum_files in sorted(tile.raw_files.items()):
+            if len(illum_files) < 2:
+                continue
+            volumes = {
+                side: load_tile_volume(
+                    path, tile.n_planes, tile.frame_width, tile.frame_height
+                )
+                for side, path in sorted(illum_files.items())[:2]
+            }
+            g = measure(volumes, axis=axis)
+            if g is None:
+                continue
+            name = getattr(tile.folder, "name", str(tile.folder))
+            rows.append((name, ch_id, g.low_side, g.margin, dict(g.tilts)))
+            if g.confident:
+                votes[g.low_side] = votes.get(g.low_side, 0) + 1
+    winner = max(votes, key=votes.get) if votes else None
+    return AcquisitionGeometry(low_side=winner, votes=votes, rows=rows)
+
+
 def main(argv=None) -> int:
     """``python -m flamingo_stitcher.illumination_geometry <acquisition_dir>``
 
@@ -213,62 +291,29 @@ def main(argv=None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
-    from flamingo_stitcher.pipeline import discover_tiles, load_tile_volume
-
-    tiles = discover_tiles(args.acquisition_dir)
-    if not tiles:
-        print(f"No tiles found in {args.acquisition_dir}")
+    result = measure_acquisition(
+        args.acquisition_dir, max_tiles=args.tiles, axis=args.axis
+    )
+    if not result.rows:
+        print(f"No two-sided tiles found in {args.acquisition_dir}")
         return 1
 
-    print(f"{len(tiles)} tiles; probing up to {args.tiles} on axis {args.axis}\n")
-    print(f"{'tile':<34}{'ch':>4}{'says':>7}{'margin':>9}  tilts")
+    print(f"probing up to {args.tiles} tiles on axis {args.axis}\n")
+    print(f"{'tile':<34}{'ch':>4}{'says':>8}{'margin':>9}  tilts")
     print("-" * 78)
-
-    votes: Dict[int, int] = {}
-    for tile in tiles[: args.tiles]:
-        for ch_id, illum_files in sorted(tile.raw_files.items()):
-            if len(illum_files) < 2:
-                continue
-            volumes = {
-                side: load_tile_volume(
-                    path, tile.n_planes, tile.frame_width, tile.frame_height
-                )
-                for side, path in sorted(illum_files.items())[:2]
-            }
-            g = measure(volumes, axis=args.axis)
-            if g is None:
-                continue
-            tilt = " ".join(f"{k}:{v:+.3f}" for k, v in sorted(g.tilts.items()))
-            says = "unclear" if g.low_side is None else str(g.low_side)
-            name = tile.folder.name if hasattr(tile.folder, "name") else str(tile.folder)
-            print(f"{name[:33]:<34}{ch_id:>4}{says:>7}{g.margin:>9.3f}  {tilt}")
-            if g.confident:
-                votes[g.low_side] = votes.get(g.low_side, 0) + 1
+    for name, ch_id, low_side, margin, tilts in result.rows:
+        says = "unclear" if low_side is None else str(low_side)
+        tilt = " ".join(f"{k}:{v:+.3f}" for k, v in sorted(tilts.items()))
+        print(f"{name[:33]:<34}{ch_id:>4}{says:>8}{margin:>9.3f}  {tilt}")
 
     print()
-    if not votes:
-        print(
-            "No tile gave a confident answer. The sample may be too uniform, or "
-            "the two sheets may genuinely look alike. Open one raw file from "
-            "each side and look at which half of the frame is in focus."
-        )
+    print(result.summary())
+    if result.low_side is None:
         return 2
-    winner = max(votes, key=votes.get)
-    total = sum(votes.values())
     print(
-        f"Side {winner} lights the LOW end of the frame "
-        f"({votes[winner]}/{total} tiles agree)."
+        f"\nSet 'Illumination side lighting the LOW end of the frame' to "
+        f"{result.low_side} in the Options tab."
     )
-    print(
-        f"Set 'Illumination side lighting the low end of the frame' to "
-        f"{winner} in the Options tab."
-    )
-    if len(votes) > 1:
-        print(
-            f"NOTE: tiles disagreed ({votes}). That should not happen on one "
-            f"acquisition; check the tile orientation / illumination axis "
-            f"before trusting split or blend."
-        )
     return 0
 
 

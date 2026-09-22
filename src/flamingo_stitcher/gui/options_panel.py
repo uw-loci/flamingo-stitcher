@@ -21,9 +21,11 @@ from typing import Any, Dict, Optional
 
 from PyQt5.QtCore import Qt
 from PyQt5.QtWidgets import (
+    QApplication,
     QCheckBox,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -54,6 +56,7 @@ class OptionsPanel(QWidget):
         # assuming a spin box.
         self._spins: Dict[str, QWidget] = {}
         self._loading = False
+        self._last_measure_dir = ""
         self._build()
         self._reload_scopes()
 
@@ -220,8 +223,99 @@ class OptionsPanel(QWidget):
         layout = QVBoxLayout(holder)
         layout.setContentsMargins(0, 0, 0, 8)
         layout.addWidget(spin)
+        if tunable.field == "illumination_low_side":
+            # This one is not a preference — it is a fact about the instrument,
+            # and typing it in backwards is silent (the run keeps the far,
+            # blurred half of every sheet and still looks plausible). The
+            # frozen build has no Python on PATH, so the command-line probe
+            # cannot be run on the microscope PC; this is the way in.
+            measure_btn = QPushButton("Measure from data…")
+            measure_btn.setToolTip(
+                "Pick an acquisition folder and read the answer off the images "
+                "instead of typing it. Takes a few seconds — only a subsampled "
+                "slice of each raw file is read."
+            )
+            measure_btn.clicked.connect(self._on_measure_illumination_side)
+            layout.addWidget(measure_btn)
         layout.addWidget(help_label)
         return QLabel(tunable.label + ":"), holder
+
+    def _on_measure_illumination_side(self) -> None:
+        """Measure which sheet lights the low end, and offer to apply it."""
+        from flamingo_stitcher import illumination_geometry
+
+        folder = QFileDialog.getExistingDirectory(
+            self, "Pick an acquisition to measure", self._last_measure_dir
+        )
+        if not folder:
+            return
+        self._last_measure_dir = folder
+
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            result = illumination_geometry.measure_acquisition(folder)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the tab
+            logger.exception("Illumination geometry measurement failed")
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(
+                self, "Could not measure",
+                f"Reading {folder} failed:\n\n{exc}",
+            )
+            return
+        finally:
+            if QApplication.overrideCursor() is not None:
+                QApplication.restoreOverrideCursor()
+
+        if not result.rows:
+            QMessageBox.information(
+                self, "Nothing to measure",
+                f"No two-sided tiles found in:\n{folder}\n\n"
+                "Split and Blend need both illumination sides of a tile. A "
+                "single-sided acquisition has nothing to choose between.",
+            )
+            return
+
+        detail = "\n".join(
+            f"  {name[:40]}  ch{ch}  "
+            f"{'unclear' if side is None else 'side ' + str(side)}  "
+            f"(margin {margin:.2f})"
+            for name, ch, side, margin, _t in result.rows
+        )
+        if result.low_side is None:
+            QMessageBox.information(
+                self, "Measurement inconclusive",
+                result.summary() + "\n\nPer tile:\n" + detail,
+            )
+            return
+
+        spin = self._spins.get("illumination_low_side")
+        current = int(spin.value()) if spin is not None else -1
+        agrees = current == result.low_side
+        box = QMessageBox(self)
+        box.setWindowTitle("Illumination geometry")
+        box.setIcon(QMessageBox.Information if agrees else QMessageBox.Warning)
+        box.setText(result.summary())
+        box.setInformativeText(
+            f"The setting is already {current}. Nothing to change."
+            if agrees else
+            f"The setting is currently {current}. Set it to {result.low_side}?\n\n"
+            "Running with it backwards keeps the FAR half of each light sheet — "
+            "the blurred, attenuated end that Split and Blend exist to discard — "
+            "and the output still looks smooth, so nothing downstream catches it."
+        )
+        box.setDetailedText("Per tile:\n" + detail)
+        if agrees:
+            box.setStandardButtons(QMessageBox.Ok)
+            box.exec_()
+            return
+        box.setStandardButtons(QMessageBox.Apply | QMessageBox.Cancel)
+        box.setDefaultButton(QMessageBox.Apply)
+        if box.exec_() == QMessageBox.Apply and spin is not None:
+            spin.setValue(int(result.low_side))
+            self._status.setText(
+                f"Illumination low side set to {result.low_side} from the data — "
+                f"Save to keep it for this microscope."
+            )
 
     # ------------------------------------------------------------------ #
     # Selection
