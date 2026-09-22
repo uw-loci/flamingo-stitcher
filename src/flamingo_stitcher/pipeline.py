@@ -1039,6 +1039,35 @@ class _CancelCallback(_DaskCallback):
             raise PipelineCancelled()
 
 
+# Suffixes that mark a path as the STORE rather than the folder holding it.
+# `.ome.zarr` ends in `.zarr`, so the final suffix is enough.
+STORE_SUFFIXES = frozenset(
+    {".ims", ".zarr", ".ozx", ".tif", ".tiff", ".btf", ".h5", ".n5"}
+)
+
+
+def run_output_folder(reported) -> Path:
+    """The run's OWN folder, from whatever a finished run reported.
+
+    ``StitchingPipeline.run`` returns the output DIRECTORY, but some call sites
+    report the store inside it instead. The GUI took ``.parent``
+    unconditionally, which is right for a store and one level too high for a
+    directory -- so "Open Output Folder" opened the parent holding every stitch
+    ever written there and left the user hunting for the one they had just
+    made.
+
+    Decided from the suffix, not from disk, so a moved or deleted result still
+    resolves to something sensible.
+
+    Lives here rather than on the dialog because it is path arithmetic, not
+    GUI: in the dialog it could only be tested where PyQt5 is installed, which
+    is neither this environment nor the release workflow -- which is why the
+    bug outlived a file of tests written for it.
+    """
+    p = Path(reported)
+    return p.parent if p.suffix.lower() in STORE_SUFFIXES else p
+
+
 def _scratch_base_dir(config, output_path) -> Path:
     """Directory that holds the ``.stitch_tmp`` scratch folder.
 

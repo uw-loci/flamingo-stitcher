@@ -4991,13 +4991,16 @@ class StitchingDialog(PersistentDialog):
         # Outside the queue-index guard: this is what the run wrote, and the
         # summary needs it whether or not the item is still addressable.
         self._last_success_output = output_path
-        self._log(f"\n\u2713 Completed: {Path(output_path).parent.name}")
+        # Name the run's own folder, not the parent that holds every stitch
+        # written here -- that read "Completed: ScratchTest" on every run.
+        done_name = self._run_output_folder(output_path).name
+        self._log(f"\n\u2713 Completed: {done_name}")
 
         from flamingo_stitcher.gui._compat import get_notification_service
 
         svc = get_notification_service(self)
         if svc is not None:
-            acq_name = Path(output_path).parent.name
+            acq_name = done_name
             svc.notify(
                 "stitching_item_completed",
                 title="Flamingo: stitched acquisition done",
@@ -5167,6 +5170,14 @@ class StitchingDialog(PersistentDialog):
         if self._batch_running:
             self._advance_queue()
 
+    @staticmethod
+    def _run_output_folder(reported):
+        """The run's own folder. Delegates to the Qt-free helper so the rule is
+        testable without PyQt5 installed."""
+        from flamingo_stitcher.pipeline import run_output_folder
+
+        return run_output_folder(reported)
+
     def _last_output_folder(self):
         """Folder the last successful item wrote to, or None if none succeeded.
 
@@ -5188,8 +5199,7 @@ class StitchingDialog(PersistentDialog):
         """
         if not self._last_success_output:
             return None
-        # The worker reports the STORE; its parent is the run's own folder.
-        return str(Path(self._last_success_output).parent)
+        return str(self._run_output_folder(self._last_success_output))
 
     def _on_batch_complete(self):
         """Handle completion of all queue items."""

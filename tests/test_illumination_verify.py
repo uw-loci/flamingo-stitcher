@@ -86,10 +86,14 @@ def test_a_backwards_setting_stops_the_run():
     with pytest.raises(ValueError) as exc:
         _run(p, vols)
     msg = str(exc.value)
-    # The user has to be told where to fix it and what to set it to.
+    # The user has to be told WHERE to fix it, WHAT to set it to, and how to
+    # override -- with the config key spelled as its real YAML path, since
+    # `illumination_verify` is the dataclass field and not something anyone can
+    # type into a config file.
     assert "Options tab" in msg
+    assert "Measure from data" in msg, "the rig has no CLI; name the button"
     assert "to 1" in msg
-    assert "illumination_verify" in msg
+    assert "illumination.verify" in msg
 
 
 def test_max_fusion_is_never_checked():
