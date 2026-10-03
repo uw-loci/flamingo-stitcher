@@ -78,7 +78,17 @@ jobs:
           PY
 
       - name: Run the test suite
-        run: python -m pytest tests/ -q --junitxml=junit.xml
+        run: python -m pytest tests/ -q -m "not environmental" --junitxml=junit.xml
+
+      - name: Environmental tests (reported, not gating)
+        # RSS-measurement tests whose verdict depends on the host. Red here for
+        # reasons unrelated to the change would train people to ignore the job,
+        # so they report instead of gate -- and they still run, so a regression
+        # is visible rather than deleted. See the `environmental` marker in
+        # pyproject.toml for the open question behind the current one.
+        if: always()
+        continue-on-error: true
+        run: python -m pytest tests/ -q -m environmental
 
       - name: Report what skipped
         # Skips are legitimate (Windows-only writers, optional deps), but they

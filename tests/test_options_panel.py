@@ -44,11 +44,27 @@ class TestRoundTrip:
         assert set(panel._spins) == set(sp.TUNABLE_FIELDS)
 
     def test_controls_start_at_the_pipeline_defaults(self, panel):
+        """Every control, whatever kind it is.
+
+        This read `spin.value()` directly, which is a QSpinBox/QDoubleSpinBox
+        API. Once `_control_for` started rendering bool tunables as a QCheckBox
+        -- a 0.00-1.00 spin box for a yes/no reads as a broken control -- that
+        raised AttributeError. Nobody saw it because PyQt5 was installed on
+        neither the developer's machine nor (at the time) CI, so the whole file
+        skipped. Go through the panel's own accessor, which is what the save
+        and load paths use.
+        """
         from flamingo_stitcher.pipeline import StitchingConfig
 
         blank = StitchingConfig()
-        for field, spin in panel._spins.items():
-            assert spin.value() == pytest.approx(float(getattr(blank, field)))
+        assert panel._spins, "no controls were built"
+        for field, widget in panel._spins.items():
+            default = getattr(blank, field)
+            actual = panel._widget_value(widget)
+            if isinstance(default, bool):
+                assert actual is bool(default), field
+            else:
+                assert actual == pytest.approx(float(default)), field
 
     def test_saving_writes_a_profile_a_run_can_load(self, panel):
         panel._new_scope_edit.setText("Liara")
