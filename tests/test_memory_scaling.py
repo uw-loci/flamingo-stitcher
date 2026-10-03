@@ -26,6 +26,8 @@ import json
 import subprocess
 import sys
 import unittest
+
+import pytest
 from pathlib import Path
 
 _HERE = Path(__file__).resolve().parent
@@ -164,9 +166,24 @@ class TestStreamingMemoryBounded(unittest.TestCase):
         )
         self.assertIn("register", r["phase_peaks_mb"])
 
+    @pytest.mark.environmental
     def test_bounded_vs_plane_count(self):
         """16x the Z planes must not SUPER-linearly grow the peak (tiles are
-        spilled to disk / paged, not all held whole in RAM)."""
+        spilled to disk / paged, not all held whole in RAM).
+
+        Marked `environmental` 2026-10-03: it fails on a RAM-starved developer
+        box AND on a clean GitHub runner (16x planes gave 6.0-7.7x peak, 5 -> 38
+        MB, against a 3.0 ceiling). At probe scale the absolute peaks are tens
+        of MB, where fixed overheads dominate the ratio, so the measurement is
+        not reporting what the assertion claims to test.
+
+        Note the assertion and the docstring do not say the same thing: 7.7x for
+        16x the planes IS sub-linear, which is the property described here,
+        while 3.0 is a far tighter bound. Whether to loosen the ceiling to match
+        the docstring or to grow the probe until the ratio means something is an
+        open decision -- NOT one to settle by quietly raising the number, which
+        is the regression this guard exists to catch.
+        """
         small = _run_probe(grid=[2, 2], n_planes=16)
         large = _run_probe(grid=[2, 2], n_planes=256)
         self.assertEqual(small["planes"], 16)

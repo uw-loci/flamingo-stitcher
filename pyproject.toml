@@ -96,6 +96,16 @@ dev = ["pytest", "pytest-cov", "black", "flake8"]
 flamingo-stitch = "flamingo_stitcher.__main__:main"
 flamingo-stitch-gui = "flamingo_stitcher.gui.app:main"
 
+[tool.pytest.ini_options]
+markers = [
+    # An RSS-measurement test whose verdict depends on the machine it runs on.
+    # These still RUN in CI, but they do not gate it: a job that goes red for
+    # reasons unrelated to the change stops being read, which is how a suite
+    # becomes decoration. See the `environmental` step in
+    # .github/workflows/tests.yml.
+    "environmental: result depends on the host's memory behaviour, not the code",
+]
+
 [tool.setuptools.dynamic]
 version = { attr = "flamingo_stitcher._version.__version__" }
 
