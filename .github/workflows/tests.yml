@@ -1,0 +1,112 @@
+name: tests
+
+# Until 2026-09-22 the only workflow here was release.yml, which builds the
+# installer and never runs pytest. The suite ran on one developer's machine,
+# where PyQt5 is not installed — so every test guarded by
+# `importorskip("PyQt5")` skipped silently, in the one place they ran at all.
+# A bug in "Open Output Folder" survived a whole file of tests written for that
+# button: the cases asserted the wrong path shape, and the file had never
+# executed anywhere to say so.
+
+on:
+  push:
+    branches: [main]
+    tags-ignore: ["**"]   # release.yml owns tag pushes
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    env:
+      QT_QPA_PLATFORM: offscreen
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the frozen build in release.yml.
+          python-version: "3.12"
+          cache: pip
+
+      # Qt's offscreen platform plugin still needs xcb shared libs at runtime on
+      # Ubuntu — without these, importing QApplication fails with "could not
+      # load the Qt platform plugin 'xcb'", which `importorskip` would report as
+      # a skip rather than a failure.
+      - name: Install Qt system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libxcb-xinerama0 \
+            libxkbcommon-x11-0 \
+            libxcb-icccm4 \
+            libxcb-image0 \
+            libxcb-keysyms1 \
+            libxcb-randr0 \
+            libxcb-render-util0 \
+            libxcb-shape0 \
+            libxcb-sync1 \
+            libxcb-xfixes0 \
+            libegl1
+
+      - name: Install the package and its test extras
+        run: |
+          python -m pip install --upgrade pip
+          # gui = PyQt5, the whole point of this job. destripe = PyWavelets,
+          # which the vendored stripe filter needs. imaris is win32-only and
+          # resolves to nothing here. preview (napari) is deliberately left out:
+          # heavy, and only the optional live preview depends on it.
+          pip install -e ".[gui,dev,destripe]"
+
+      - name: Qt must really work, not skip
+        # A silent skip is what this job exists to prevent, so prove the GUI
+        # tests CAN run before trusting a green suite. If QApplication cannot be
+        # constructed, every `importorskip("PyQt5")` test would skip and the run
+        # would still be green.
+        run: |
+          python - <<'PY'
+          from PyQt5.QtWidgets import QApplication
+          from PyQt5.QtCore import PYQT_VERSION_STR
+          app = QApplication([])
+          print(f"PyQt5 {PYQT_VERSION_STR}, offscreen platform OK")
+          PY
+
+      - name: Run the test suite
+        run: python -m pytest tests/ -q --junitxml=junit.xml
+
+      - name: Report what skipped
+        # Skips are legitimate (Windows-only writers, optional deps), but they
+        # are not passes. Printing them keeps the number honest and visible
+        # instead of buried in a summary line.
+        if: always()
+        run: |
+          python - <<'PY'
+          import xml.etree.ElementTree as ET, pathlib, collections
+          p = pathlib.Path("junit.xml")
+          if not p.exists():
+              print("no junit.xml — the suite did not get far enough to write one")
+              raise SystemExit(0)
+          root = ET.parse(p).getroot()
+          skipped = collections.Counter()
+          for case in root.iter("testcase"):
+              for s in case.findall("skipped"):
+                  skipped[(case.get("classname") or "?").split(".")[0]] += 1
+          total = sum(skipped.values())
+          print(f"{total} skipped test(s)")
+          for mod, n in sorted(skipped.items(), key=lambda kv: -kv[1]):
+              print(f"  {n:>4}  {mod}")
+          PY
+
+      - name: Upload the test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: junit
+          path: junit.xml
+          if-no-files-found: ignore
