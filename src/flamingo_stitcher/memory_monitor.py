@@ -209,14 +209,24 @@ class MemoryMonitor:
         self.on_exceed = on_exceed
         self.metric = metric
         self.baseline_bytes = 0
+        self.anon_baseline_bytes = 0
         self.peak_bytes = 0
         # Peak resident memory-mapped file pages seen (tile spill + fused.dat).
         # Not part of the threshold — it is disk-backed and reclaimable — but
         # reported, because a scratch disk too slow to absorb write-back is the
         # documented way this pipeline freezes a machine.
         self.peak_mapped_bytes = 0
+        # Peak ANONYMOUS memory, tracked whatever `metric` is chosen. This is
+        # the quantity a data-hold regression moves; the memory-mapped output
+        # grows with the dataset BY DESIGN, so a guard that cannot separate the
+        # two reports the output file getting bigger as if it were a leak.
+        # (Measured 2026-10-06: the plane-axis scaling test was doing exactly
+        # that — peak tracked n_planes at R2=0.998, entirely in fuse/write,
+        # while preprocess stayed flat.)
+        self.peak_anon_bytes = 0
         self._phase: Optional[str] = None
         self._phase_peak: Dict[str, int] = {}
+        self._phase_anon_peak: Dict[str, int] = {}
         self._exceeded = False
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
@@ -228,10 +238,21 @@ class MemoryMonitor:
         """Sample the chosen memory metric, tracking mapped-file residency too."""
         if self._proc is None:
             return 0
+        # The anonymous/mapped split is read on EVERY sample, whatever metric
+        # is reported, so a peak can always be attributed instead of guessed
+        # at. Under "uss" this used to be skipped entirely, which left
+        # `peak_mapped_bytes` at 0 for the whole run — the attribution field
+        # the probe prints was inert exactly where it was needed.
+        private, mapped = memory_split(self._proc)
+        if mapped > self.peak_mapped_bytes:
+            self.peak_mapped_bytes = mapped
+        if private > self.peak_anon_bytes:
+            self.peak_anon_bytes = private
+        if self._phase is not None:
+            prev = self._phase_anon_peak.get(self._phase, 0)
+            if private > prev:
+                self._phase_anon_peak[self._phase] = private
         if self.metric == "private":
-            private, mapped = memory_split(self._proc)
-            if mapped > self.peak_mapped_bytes:
-                self.peak_mapped_bytes = mapped
             return private
         if self._use_uss:
             try:
@@ -249,6 +270,9 @@ class MemoryMonitor:
         if not _HAVE_PSUTIL:
             return self
         self.baseline_bytes = self._rss()
+        # _rss() has just sampled the anon/mapped split as a side effect, so
+        # the anonymous baseline is whatever that sample saw.
+        self.anon_baseline_bytes = self.peak_anon_bytes
         self.peak_bytes = self.baseline_bytes
         self._stop.clear()
         self._thread = threading.Thread(
@@ -314,6 +338,18 @@ class MemoryMonitor:
     def phase_peaks_delta(self) -> Dict[str, int]:
         return {
             p: max(0, v - self.baseline_bytes) for p, v in self._phase_peak.items()
+        }
+
+    @property
+    def peak_anon_delta_bytes(self) -> int:
+        """Peak ANONYMOUS growth: allocation, with the memory-mapped output
+        excluded. The quantity a data-hold regression moves."""
+        return max(0, self.peak_anon_bytes - self.anon_baseline_bytes)
+
+    def phase_anon_peaks_delta(self) -> Dict[str, int]:
+        return {
+            p: max(0, v - self.anon_baseline_bytes)
+            for p, v in self._phase_anon_peak.items()
         }
 
     # -- context manager --------------------------------------------------

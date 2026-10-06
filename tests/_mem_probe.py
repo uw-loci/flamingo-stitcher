@@ -129,8 +129,16 @@ def main() -> None:
             "streaming": cfg.streaming_mode,
             "peak_delta_mb": round(mon.peak_delta_bytes / 1e6, 2),
             "peak_mapped_mb": round(mon.peak_mapped_bytes / 1e6, 2),
+            # Anonymous (allocated) peak, with the memory-mapped output
+            # excluded. USS above counts the dirty pages of `fused.dat`, which
+            # grow with the dataset by construction -- so a scaling guard built
+            # on USS reports the OUTPUT FILE getting bigger and calls it a leak.
+            "peak_anon_mb": round(mon.peak_anon_delta_bytes / 1e6, 2),
             "phase_peaks_mb": {
                 p: round(v / 1e6, 2) for p, v in mon.phase_peaks_delta().items()
+            },
+            "phase_anon_peaks_mb": {
+                p: round(v / 1e6, 2) for p, v in mon.phase_anon_peaks_delta().items()
             },
             "estimate": est,
             "psutil": mon.available,

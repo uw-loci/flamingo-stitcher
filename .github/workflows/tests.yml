@@ -88,7 +88,11 @@ jobs:
         # pyproject.toml for the open question behind the current one.
         if: always()
         continue-on-error: true
-        run: python -m pytest tests/ -q -m environmental
+        # Exit code 5 is "no tests collected" — currently the normal case, since
+        # the one test that needed this was rebuilt rather than suppressed. The
+        # marker and this step stay as the designated home for host-dependent
+        # tests, so the next one has somewhere to go that is not the gate.
+        run: python -m pytest tests/ -q -m environmental || [ $? -eq 5 ]
 
       - name: Report what skipped
         # Skips are legitimate (Windows-only writers, optional deps), but they
