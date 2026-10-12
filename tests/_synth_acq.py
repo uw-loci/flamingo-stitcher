@@ -107,6 +107,37 @@ def _workflow_text(z_start_mm, z_end_mm, z_step_um, w, h) -> str:
     )
 
 
+def _fit_source_field(src, shape):
+    """Make a real volume the exact size the tile grid needs.
+
+    Crops when the source is big enough and TILES it when it is not. Tiling
+    repeats content, which is poison for a registration test -- a repeat gives
+    phase correlation two equally good answers -- so the caller is expected to
+    hand in a field already large enough. The mirror-tiling here is a last
+    resort for the Z axis, where repeating a slab is far less harmful than in
+    XY: a seam is measured across XY, not across Z.
+    """
+    src = np.asarray(src)
+    if src.ndim != 3:
+        raise ValueError(f"source field must be 3-D (Z, Y, X), got {src.shape}")
+    out = np.empty(shape, dtype=src.dtype)
+    nz, ny, nx = shape
+    for axis, want, have in ((0, nz, src.shape[0]), (1, ny, src.shape[1]),
+                             (2, nx, src.shape[2])):
+        if want > have and axis in (1, 2):
+            raise ValueError(
+                f"source field is {src.shape} but the grid needs {shape}; "
+                f"repeating content in XY would give phase correlation two "
+                f"equally good answers. Build a bigger field instead."
+            )
+    # Z may be extended by mirroring, which avoids a hard seam at the join.
+    z = src
+    while z.shape[0] < nz:
+        z = np.concatenate([z, z[::-1]], axis=0)
+    out[:] = z[:nz, :ny, :nx]
+    return out
+
+
 def write_synth_acquisition(
     out_dir,
     *,
@@ -127,6 +158,7 @@ def write_synth_acquisition(
     featureless_tiles: Optional[Sequence] = None,
     featureless_level: float = 3000.0,
     z_texture: bool = False,
+    source_field=None,
 ) -> Path:
     """Write a tiny synthetic raw acquisition. Returns the acquisition dir.
 
@@ -188,9 +220,14 @@ def write_synth_acquisition(
     # Grow the field so the most-offset tile still has real content to slice,
     # rather than running off the end and reading zeros.
     field_planes = max_planes + max([0, *tile_z_offset_planes.values()])
-    field = _phantom_field(
-        (field_planes, field_h, field_w), seed=seed, z_texture=z_texture
-    )
+    if source_field is not None:
+        field = _fit_source_field(
+            np.asarray(source_field), (field_planes, field_h, field_w)
+        )
+    else:
+        field = _phantom_field(
+            (field_planes, field_h, field_w), seed=seed, z_texture=z_texture
+        )
 
     fov_mm_x = pixel_size_um / 1000.0 * w
     fov_mm_y = pixel_size_um / 1000.0 * h

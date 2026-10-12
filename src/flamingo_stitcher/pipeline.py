@@ -2413,6 +2413,16 @@ _MIN_TILES_FOR_CONSENSUS = 3
 _Z_CLAMP_MIN_STEPS = 8
 _Z_CLAMP_FLOOR_UM = 25.0
 _Z_CLAMP_STACK_FRACTION = 0.25
+# Stage/focus drift is PHYSICAL — micrometres — and accumulates with how deep
+# the stack is. Sizing the bound only from the voxel (8 steps) made it tighter
+# the more finely Z was sampled, which is backwards: the 2026-10-07 rig runs
+# sampled Z at 2.5 um, fell through to the 25 um floor, and that is 0.33% of a
+# 7497 um stack where the 2026-09-18 run at a 10 um step got 80 um = 1.24%.
+# Sampling four times more finely bought a tolerance 3.7x tighter on the same
+# instrument, and 23 of 70 seams were rejected as "implausible" — twelve of them
+# at quality >= 0.85, with shifts forming the smooth 30-195 um distribution that
+# real drift makes.
+_Z_CLAMP_DEPTH_FRACTION = 0.01
 
 
 class ClampRecord(NamedTuple):
@@ -9295,7 +9305,15 @@ class StitchingPipeline:
         if configured > 0.0:
             return max(configured, floor), "config"
 
-        bound = max(_Z_CLAMP_MIN_STEPS * vz, _Z_CLAMP_FLOOR_UM)
+        # Widest of: a few binned steps (quantization), an absolute floor for
+        # shallow stacks, and a share of DEPTH (drift accumulates with it).
+        # Strictly wider than the old rule — where 8 steps was already the
+        # biggest term, as at a 10 um step, nothing changes.
+        bound = max(
+            _Z_CLAMP_MIN_STEPS * vz,
+            _Z_CLAMP_FLOOR_UM,
+            _Z_CLAMP_DEPTH_FRACTION * depth_um if depth_um > 0 else 0.0,
+        )
         if depth_um > 0:
             bound = min(bound, _Z_CLAMP_STACK_FRACTION * depth_um)
         return max(bound, floor), "auto"
