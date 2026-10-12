@@ -2477,7 +2477,16 @@ _Z_CLAMP_STACK_FRACTION = 0.25
 # instrument, and 23 of 70 seams were rejected as "implausible" — twelve of them
 # at quality >= 0.85, with shifts forming the smooth 30-195 um distribution that
 # real drift makes.
-_Z_CLAMP_DEPTH_FRACTION = 0.01
+# 1.25% is not a chosen number: it is the tolerance the 2026-09-18 run
+# demonstrably had and worked with (80 um on a 6430 um stack = 1.24%), carried
+# across to any sampling. The 2026-10-07 runs of the SAME instrument fell to the
+# 25 um floor at a 2.5 um step and rejected 16 of 36 Y-seams as "implausible" —
+# seams whose Z shifts are plainly real: six independent columns at one row pair
+# agreed on 65-80 um, and the per-row shifts run monotonically 30 -> 140 um down
+# the grid. That is a systematic Z error between ROWS, which is why rows
+# misalign while columns do not, and the bound was discarding every measurement
+# of it.
+_Z_CLAMP_DEPTH_FRACTION = 0.0125
 
 
 class ClampRecord(NamedTuple):
