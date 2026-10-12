@@ -93,10 +93,35 @@ def test_an_unreadable_layout_falls_back_to_fifteen_percent():
 
 
 def test_the_prior_now_lands_within_a_factor_of_two_of_the_measured_run():
-    """The 2026-09-18 7x7: 33697 s measured, 5237 s predicted before this."""
-    predicted = rough_run_seconds(_grid(), _config())
+    """The 2026-09-18 7x7: 33697 s measured, 5237 s predicted before this.
+
+    Configures the registration binning the run actually used (the n7 profile's
+    {z:1, y:2, x:2}), NOT the dataclass default {z:2, y:4, x:4}. Binning is now
+    part of the model — a default run bins harder and genuinely costs less — so
+    a test asserting against a measured run has to describe that run. It passed
+    with the default before only because the old model ignored binning
+    entirely.
+    """
+    cfg = _config()
+    cfg.registration_binning = {"z": 1, "y": 2, "x": 2}
+    for t in (tiles := _grid()):
+        t.z_step_mm = 0.010  # 10 um, as acquired
+    predicted = rough_run_seconds(tiles, cfg)
     assert 33697 / predicted < 2.0, f"{predicted:.0f}s is still far low"
     assert predicted / 33697 < 2.0, f"{predicted:.0f}s now overshoots"
+
+
+def test_binning_harder_makes_the_estimate_smaller():
+    """A default run bins 4x in XY where the n7 profile bins 2x, so it really
+    does register on fewer voxels. The model has to say so."""
+    tiles = _grid()
+    for t in tiles:
+        t.z_step_mm = 0.010
+    light = _config()
+    light.registration_binning = {"z": 1, "y": 2, "x": 2}
+    heavy = _config()
+    heavy.registration_binning = {"z": 2, "y": 4, "x": 4}
+    assert _rough_register_seconds(tiles, heavy) < _rough_register_seconds(tiles, light)
 
 
 def test_registration_dominates_the_prior_for_a_large_mosaic():
@@ -187,3 +212,104 @@ def test_the_config_reaches_the_key():
     key = build_timing_key(_grid(), cfg, acquisition_dir="D:/a", output_dir="G:/b")
     assert key.illumination_fusion == "split"
     assert "|if=split" in key.serialize()
+
+
+# --------------------------------------------------------------------------
+# Recalibration, 2026-10-12: the term must MOVE with downsample
+# --------------------------------------------------------------------------
+
+
+class _T:
+    """A tile with a real Z step, which the binning rule needs."""
+
+    def __init__(self, x, y, planes, z_step_um, frame=2048):
+        self.x_mm, self.y_mm = x, y
+        self.n_planes = planes
+        self.frame_width = self.frame_height = frame
+        self.channels = [3]
+        self.illumination_sides = [0, 1]
+        self.z_step_mm = z_step_um / 1000.0
+
+
+def _acq(cols, rows, planes, pitch_mm, z_step_um):
+    return [
+        _T(1.0 + c * pitch_mm, 1.0 + r * pitch_mm, planes, z_step_um)
+        for r in range(rows)
+        for c in range(cols)
+    ]
+
+
+def _cfg(ds_xy=1, ds_z=1, **kw):
+    cfg = _config(**kw)
+    cfg.downsample_xy, cfg.downsample_z = ds_xy, ds_z
+    cfg.registration_binning = {"z": 1, "y": 2, "x": 2}
+    return cfg
+
+
+# The three runs the constant is fitted to. Overlap differs between them and is
+# read from the stage positions, not assumed.
+RUN_0918 = (_acq(7, 7, 643, 1.8235, 10.0), 1, 1, 24187)
+RUN_1007_2X = (_acq(6, 7, 2999, 1.93, 2.5), 2, 1, 5242)
+RUN_1007_8X = (_acq(6, 7, 2999, 1.93, 2.5), 8, 1, 1184)
+
+
+@pytest.mark.parametrize(
+    "tiles_, ds_xy, ds_z, measured",
+    [RUN_0918, RUN_1007_2X, RUN_1007_8X],
+    ids=["2026-09-18 XY=1", "2026-10-07 XY=2", "2026-10-07 XY=8"],
+)
+def test_the_term_is_within_a_small_factor_of_every_measured_run(
+    tiles_, ds_xy, ds_z, measured
+):
+    """Before this, the same model gave 6.4x, 3.2x and 9.2x."""
+    predicted = _rough_register_seconds(tiles_, _cfg(ds_xy, ds_z))
+    assert 0.6 < predicted / measured < 1.7, (
+        f"predicted {predicted:.0f}s against {measured}s measured"
+    )
+
+
+def test_downsample_actually_changes_the_estimate():
+    """The bug: two runs of the same acquisition at XY=2 and XY=8 differed by
+    2.9x in reality and by 3% in the prior, because the term had no downsample
+    in it at all."""
+    tiles_ = _acq(6, 7, 2999, 1.93, 2.5)
+    at2 = _rough_register_seconds(tiles_, _cfg(2, 1))
+    at8 = _rough_register_seconds(tiles_, _cfg(8, 1))
+    assert at2 / at8 > 2.0, f"XY=2 {at2:.0f}s vs XY=8 {at8:.0f}s is barely a change"
+    # ...but not the naive ds^2 = 16x either: registration bins LESS hard when
+    # the strip is already thin, which partly cancels the downsample.
+    assert at2 / at8 < 8.0
+
+
+def test_registration_always_works_at_about_the_reference_z_step():
+    """Z binning is a physical target, so the compared plane count is stack
+    depth / 10 um whatever the sampling. A 2.5 um stack and a 10 um stack of the
+    same DEPTH must cost the same."""
+    fine = _acq(6, 7, 2999, 1.93, 2.5)      # 7497 um deep
+    coarse = _acq(6, 7, 750, 1.93, 10.0)    # 7500 um deep
+    a = _rough_register_seconds(fine, _cfg(1, 1))
+    b = _rough_register_seconds(coarse, _cfg(1, 1))
+    assert a == pytest.approx(b, rel=0.01)
+
+
+def test_a_z_downsample_reduces_it_only_while_z_is_finer_than_the_reference():
+    """At a 2.5 um step, Z=4 lands exactly on the 10 um target, so registration
+    was ALREADY binning to that and the estimate must not fall further."""
+    tiles_ = _acq(6, 7, 2999, 1.93, 2.5)
+    assert _rough_register_seconds(tiles_, _cfg(8, 4)) == pytest.approx(
+        _rough_register_seconds(tiles_, _cfg(8, 1)), rel=0.01
+    )
+
+
+def test_the_whole_run_prior_is_now_within_a_factor_of_two():
+    for tiles_, ds_xy, ds_z, _reg, total in (
+        (*RUN_0918[:3], RUN_0918[3], 33697),
+        (*RUN_1007_2X[:3], RUN_1007_2X[3], 23573),
+        (*RUN_1007_8X[:3], RUN_1007_8X[3], 8071),
+    ):
+        cfg = _cfg(ds_xy, ds_z)
+        cfg.output_format = "imaris" if ds_xy == 1 else "ome-zarr"
+        prior = rough_run_seconds(tiles_, cfg)
+        assert 0.5 < prior / total < 2.0, (
+            f"XY={ds_xy}: prior {prior:.0f}s against {total}s measured"
+        )

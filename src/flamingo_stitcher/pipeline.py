@@ -492,23 +492,46 @@ except Exception:
 _ROUGH_LOAD_MBPS = 200.0
 _ROUGH_S_PER_TILE_CH = 1.5
 _ROUGH_S_PER_OUT_UNIT = 0.08
-#   _ROUGH_S_PER_REG_MPAIRVOX: registration, seconds per MILLION overlap voxels
-#                          in ONE seam. Registration is the one phase the prior
-#                          used to ignore entirely -- its cost hid inside
-#                          _ROUGH_S_PER_TILE_CH's 1.5 s/tile, which on the
-#                          2026-09-18 7x7 predicted 74 s for a phase that took
-#                          6h43m (71.8% of the run). Pairwise registrations run
-#                          SERIALLY for 3-D data (multiview-stitcher sets
+#   _ROUGH_S_PER_REG_MVOXEL: registration, seconds per MILLION voxels actually
+#                          compared. Pairwise registrations run SERIALLY for
+#                          3-D data (multiview-stitcher sets
 #                          n_parallel_pairwise_regs=1), so the cost is the
-#                          per-seam cost times the seam count, with no
-#                          concurrency to divide it by.
-#                          Calibrated from that run: 24187 s over an 84-seam
-#                          7x7 grid at 643 planes x 2048^2 x 15% overlap
-#                          = 288 s per seam over 404 Mvoxel = 0.71 s/Mvoxel.
-#                          ONE measurement on ONE machine at default
-#                          registration binning -- the cache supersedes it as
-#                          soon as any run of this config completes.
-_ROUGH_S_PER_REG_MPAIRVOX = 0.71
+#                          per-seam cost times the seam count with no
+#                          concurrency to divide by.
+#
+# Recalibrated 2026-10-12 against THREE measured runs after the first version —
+# fitted to one — came out 3.2x high at XY=2 and 9.2x high at XY=8 on a 42-tile
+# acquisition. It ignored downsample entirely, so the two priors differed by 3%
+# while the runs differed by 2.9x. That is also what made the LIVE estimate
+# swing: below 25% progress the ETA is blended toward the prior, so a prior 10x
+# high slides the displayed finish by hours as real progress takes over.
+#
+# What the model has to include is not just the downsample but the registration
+# binning the pipeline then CHOOSES, which partly cancels it:
+#   * XY bins as hard as the configured value allows while keeping the overlap
+#     strip at REGISTRATION_OVERLAP_TARGET_PX, so a heavier downsample is met
+#     with lighter binning.
+#   * Z is a physical target (REFERENCE_Z_STEP_UM), so registration always runs
+#     at ~10 um effective Z — the compared plane count is stack DEPTH / 10 um
+#     whatever the sampling.
+#
+# Per-run fits: 2.85 / 3.74 / 3.38 s per Mvoxel across
+#   2026-09-18  49 tiles   643 planes  XY=1  15% overlap   24187 s
+#   2026-10-07  42 tiles  2999 planes  XY=2  10% overlap    5242 s
+#   2026-10-07  42 tiles  2999 planes  XY=8  10% overlap    1184 s
+# (the overlap differs between acquisitions and is read from the stage
+# positions, not assumed — using 15% for all three is what made a first fit
+# of this look 30% off.)
+#
+# The constant is their GEOMETRIC mean, not a least-squares fit. Least squares
+# minimises absolute seconds, so the 24187 s run would set it almost alone and
+# the short configs would stay 20%+ low; a prior is judged by its RATIO to the
+# truth, which is what weighting the runs equally in log space optimises.
+# Resulting ratios: 1.16x / 0.88x / 0.98x — against 6.4x, 3.2x and 9.2x before.
+#
+# Still one machine, so still an order-of-magnitude prior — but one that now
+# MOVES with the settings. The cache supersedes it for any config that has run.
+_ROUGH_S_PER_REG_MVOXEL = 3.3
 
 # Global-progress percent boundaries for the pipeline phases. The estimator
 # turns this percent into a whole-run ETA by linear extrapolation
@@ -691,8 +714,10 @@ def _rough_overlap_fraction(tiles, config) -> float:
 def _rough_register_seconds(tiles, config) -> float:
     """Cold-start estimate for the pairwise registration phase.
 
-    Seam count from the grid shape, overlap volume from the frame and the
-    measured overlap, and a per-voxel constant. Zero when registration is off.
+    Models the voxels registration actually compares: the overlap strip after
+    BOTH the pipeline's downsample and the registration binning it then picks,
+    which partly cancels the downsample (see _effective_registration_binning).
+    Zero when registration is off.
     """
     if getattr(config, "skip_registration", False):
         return 0.0
@@ -700,18 +725,48 @@ def _rough_register_seconds(tiles, config) -> float:
     if n_tiles < 2:
         return 0.0
     rows, cols = _grid_shape(tiles)
-    # Seams in an R x C grid: horizontal + vertical neighbours.
     n_seams = rows * max(0, cols - 1) + cols * max(0, rows - 1)
     if n_seams <= 0:
-        n_seams = n_tiles - 1  # a strip, or a layout we could not read
-    overlap = _rough_overlap_fraction(tiles, config)
+        n_seams = n_tiles - 1
+
     t0 = tiles[0]
     fw = int(getattr(t0, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
     fh = int(getattr(t0, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
     planes = max((t.n_planes for t in tiles), default=1)
-    # Overlap strip: the full frame in one lateral axis, `overlap` of the other.
-    mvox_per_seam = (planes * fh * fw * overlap) / 1e6
-    seconds = _ROUGH_S_PER_REG_MPAIRVOX * mvox_per_seam * n_seams
+    overlap = _rough_overlap_fraction(tiles, config)
+    ds_xy = max(1, int(getattr(config, "downsample_xy", 1) or 1))
+    ds_z = max(1, int(getattr(config, "downsample_z", 1) or 1))
+
+    # XY: bin as hard as configured allows while keeping the strip usable.
+    strip_px = overlap * fw / ds_xy
+    try:
+        cfg_bin = max(1, int((config.registration_binning or {}).get("x", 1) or 1))
+    except Exception:
+        cfg_bin = 1
+    bin_xy = cfg_bin
+    while bin_xy > 1 and strip_px / bin_xy < REGISTRATION_OVERLAP_TARGET_PX:
+        bin_xy -= 1
+
+    # Z: a physical target, so the compared plane count is stack depth divided
+    # by the reference step, whatever the sampling.
+    z_step_um = 0.0
+    try:
+        z_step_um = float(t0.z_step_mm) * 1000.0
+    except Exception:
+        pass
+    reg_planes = planes / ds_z
+    if z_step_um > 0:
+        try:
+            want = max(1, int((config.registration_binning or {}).get("z", 1) or 1))
+        except Exception:
+            want = 1
+        bin_z = max(1, int(round(want * REFERENCE_Z_STEP_UM / (z_step_um * ds_z))))
+        reg_planes = reg_planes / bin_z
+
+    mvox_per_seam = (
+        reg_planes * (fh / (ds_xy * bin_xy)) * (strip_px / bin_xy)
+    ) / 1e6
+    seconds = _ROUGH_S_PER_REG_MVOXEL * mvox_per_seam * n_seams
     # A second pairwise pass over the same seams, at finer Z.
     if getattr(config, "registration_z_refine", False):
         seconds *= 2.0
