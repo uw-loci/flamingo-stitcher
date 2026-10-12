@@ -8502,9 +8502,16 @@ class StitchingPipeline:
             [t for _v, t in tile_data], nx * vx, ny * vy, vx, vy
         )
         bound_z, source_z = self._axial_shift_bound(nz * vz, vz)
+        # Name the control, not just the value: the bound decides which seams
+        # survive, and "(auto)" alone does not tell anyone it can be changed.
+        z_hint = (
+            ""
+            if source_z == "config"
+            else " — set per microscope with 'Max registration shift Z' in Options"
+        )
         self.logger.info(
             f"  Pairwise shift bounds: xy {bound_xy:.1f} µm ({source_xy}), "
-            f"z {bound_z:.1f} µm ({source_z}) — a seam proposing more than this "
+            f"z {bound_z:.1f} µm ({source_z}){z_hint} — a seam proposing more than this "
             f"is dropped before the global solve, not clamped after it."
         )
 
@@ -10671,6 +10678,70 @@ class StitchingPipeline:
                     )
         except Exception as e:
             self.logger.debug(f"Capture/angle check skipped: {e}")
+
+        self._log_measured_overlap(tiles)
+
+    def _log_measured_overlap(self, tiles: List[RawTileInfo]) -> None:
+        """Report the tile overlap this run will actually use, at the START.
+
+        The overlap drives everything downstream — the lateral shift bound is
+        sized from it, registration bins to keep a usable strip of it, and a
+        mosaic whose real overlap is far from the intended one will not
+        register. It was only ever reported in the STAGE GEOMETRY block at the
+        END of registration, by which point the operator has already spent
+        anywhere from fifteen minutes to several hours. Measured here, from the
+        stage positions and the resolved frame extent, so it can be checked and
+        the run stopped while stopping is cheap.
+        """
+        try:
+            t0 = tiles[0]
+            px = float(self.config.pixel_size_um or 0.0)
+            if px <= 0 or len(tiles) < 2:
+                return
+            extent_x = float(t0.frame_width) * px
+            extent_y = float(t0.frame_height) * px
+            layout = tile_geometry.grid_overlap(
+                tiles, extent_x_um=extent_x, extent_y_um=extent_y
+            )
+        except Exception as exc:  # noqa: BLE001 - reporting must never stop a run
+            self.logger.debug(f"Could not measure tile overlap: {exc}")
+            return
+
+        parts = []
+        fractions = {}
+        for axis in ("x", "y"):
+            ov = layout.get(axis)
+            if ov is None or ov.fraction is None:
+                parts.append(f"{axis.upper()}: single column")
+                continue
+            fractions[axis] = ov.fraction
+            parts.append(
+                f"{axis.upper()}: {ov.fraction:.1%} "
+                f"({ov.overlap_um:.0f} µm of {ov.extent_um:.0f} µm, "
+                f"pitch {ov.pitch_um:.0f} µm)"
+            )
+        self.logger.info(f"Tile overlap (measured from the stage positions) — {'; '.join(parts)}")
+
+        # Two axes that disagree is worth saying out loud: it is the shape of a
+        # stage-pitch error, and it lands on one axis of seams only.
+        if len(fractions) == 2:
+            fx, fy = fractions["x"], fractions["y"]
+            if abs(fx - fy) >= 0.02:
+                self.logger.warning(
+                    f"  X and Y overlap differ by {abs(fx - fy):.1%}. Seams on "
+                    f"the thinner axis have less to correlate on, so that axis "
+                    f"registers worse — which looks like one direction of the "
+                    f"mosaic failing while the other is fine."
+                )
+        floor = float(getattr(self.config, "min_registration_overlap_frac", 0.0) or 0.0)
+        thin = [a.upper() for a, f in fractions.items() if floor > 0 and f < floor]
+        if thin:
+            self.logger.warning(
+                f"  {' and '.join(thin)} overlap is below the "
+                f"{floor:.0%} registration floor "
+                f"('Minimum registration overlap' in the Options tab). Those "
+                f"seams will be skipped rather than registered."
+            )
 
     def _log_preflight(
         self,
