@@ -60,6 +60,112 @@ _Z_PRESETS = [
 ]
 
 
+class OrientationZoomDialog(QDialog):
+    """One orientation panel, big enough to read.
+
+    The grid shows eight panels at _CELL_PX, but the arrays behind them are
+    rendered at ``orientation_previews(target_long_px=...)`` — roughly four
+    times that — with the tile labels burned in. So the detail needed to tell
+    which panel has the tiles connected correctly is already there and was
+    simply being thrown away by the thumbnail scale. This shows it at 1:1 and
+    lets it be scaled further, which is what the MIP overview gets for free by
+    living in napari.
+    """
+
+    _STEPS = (0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0)
+
+    def __init__(self, name: str, arr: np.ndarray, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"Orientation: {name}")
+        self._arr = arr
+        self._zoom_idx = self._STEPS.index(1.0)
+        self.chosen = False
+
+        outer = QVBoxLayout(self)
+        hint = QLabel(
+            "Ctrl + mouse wheel to zoom, drag the scrollbars to pan. "
+            "Pick the panel where neighbouring tiles CONNECT."
+        )
+        hint.setStyleSheet("color: palette(mid); font-size: 11px;")
+        outer.addWidget(hint)
+
+        self._label = QLabel()
+        self._label.setAlignment(Qt.AlignCenter)
+        self._label.setStyleSheet("background:#111;")
+        self._scroll = QScrollArea()
+        self._scroll.setWidget(self._label)
+        self._scroll.setWidgetResizable(False)
+        self._scroll.setAlignment(Qt.AlignCenter)
+        outer.addWidget(self._scroll, 1)
+
+        row = QHBoxLayout()
+        for text, delta in (("−", -1), ("Reset", 0), ("+", +1)):
+            b = QPushButton(text)
+            b.setFixedWidth(70)
+            b.clicked.connect(lambda _c, d=delta: self._zoom(d))
+            row.addWidget(b)
+        self._zoom_label = QLabel()
+        row.addWidget(self._zoom_label)
+        row.addStretch(1)
+        use = QPushButton(f"Use {name}")
+        use.setDefault(True)
+        use.clicked.connect(self._accept_choice)
+        row.addWidget(use)
+        close = QPushButton("Close")
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        outer.addLayout(row)
+
+        h, w = arr.shape[:2]
+        self.resize(min(1400, w + 80), min(950, h + 150))
+        self._render()
+
+    def _zoom(self, delta: int) -> None:
+        self._zoom_idx = (
+            self._STEPS.index(1.0)
+            if delta == 0
+            else max(0, min(len(self._STEPS) - 1, self._zoom_idx + delta))
+        )
+        self._render()
+
+    def _render(self) -> None:
+        factor = self._STEPS[self._zoom_idx]
+        h, w = self._arr.shape[:2]
+        pix = _to_qpixmap(self._arr, max_px=max(w, h))
+        if factor != 1.0:
+            # Fast transform when enlarging: smoothing a burned-in label past
+            # 1:1 blurs the very text this dialog exists to make readable.
+            mode = Qt.FastTransformation if factor > 1.0 else Qt.SmoothTransformation
+            pix = pix.scaled(int(w * factor), int(h * factor), Qt.KeepAspectRatio, mode)
+        self._label.setPixmap(pix)
+        self._label.resize(pix.size())
+        self._zoom_label.setText(f"{factor:g}x")
+
+    def _accept_choice(self) -> None:
+        self.chosen = True
+        self.accept()
+
+    def wheelEvent(self, event):  # noqa: N802 - Qt naming
+        if event.modifiers() & Qt.ControlModifier:
+            self._zoom(1 if event.angleDelta().y() > 0 else -1)
+            event.accept()
+            return
+        super().wheelEvent(event)
+
+
+class _ClickableLabel(QLabel):
+    """A preview cell that opens the full-size view when clicked."""
+
+    def __init__(self, on_click):
+        super().__init__()
+        self._on_click = on_click
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mousePressEvent(self, event):  # noqa: N802 - Qt naming
+        self._on_click()
+        super().mousePressEvent(event)
+
+
 def _to_qpixmap(arr01: np.ndarray, max_px: int = _CELL_PX) -> QPixmap:
     """Convert a float [0, 1] 2-D array to a grayscale QPixmap, scaled to fit."""
     a = np.ascontiguousarray((np.clip(arr01, 0.0, 1.0) * 255).astype(np.uint8))
@@ -362,12 +468,18 @@ class OrientationPreviewDialog(QDialog):
             cell = QWidget()
             v = QVBoxLayout(cell)
             v.setContentsMargins(2, 2, 2, 2)
-            img_label = QLabel()
+            img_label = _ClickableLabel(
+                lambda k=key, a=arr: self._open_zoom(k, a)
+            )
             img_label.setAlignment(Qt.AlignCenter)
             if arr is not None and arr.size:
                 img_label.setPixmap(_to_qpixmap(arr))
             img_label.setStyleSheet("background:#111; border:1px solid #444;")
             img_label.setMinimumSize(_CELL_PX, _CELL_PX)
+            img_label.setToolTip(
+                f"Click to view '{key}' full size — the tile labels are "
+                f"unreadable at thumbnail scale."
+            )
             radio = QRadioButton(f"{i + 1}. {key}")
             radio.setProperty("orientation_name", key)
             if key == self._selected_name:
@@ -377,6 +489,21 @@ class OrientationPreviewDialog(QDialog):
             v.addWidget(radio, alignment=Qt.AlignCenter)
             self._grid.addWidget(cell, i // cols, i % cols)
         self._apply_btn.setEnabled(self._selected_name is not None)
+
+    def _open_zoom(self, name: str, arr) -> None:
+        """Show one panel full size; selecting there selects it here too."""
+        if arr is None or not getattr(arr, "size", 0):
+            return
+        dlg = OrientationZoomDialog(name, arr, self)
+        dlg.exec_()
+        if not dlg.chosen:
+            return
+        self._selected_name = name
+        for button in self._radio_group.buttons():
+            if button.property("orientation_name") == name:
+                button.setChecked(True)
+                break
+        self._apply_btn.setEnabled(True)
 
     def _on_radio_selected(self, button) -> None:
         self._selected_name = button.property("orientation_name")

@@ -471,12 +471,21 @@ def _load_tile_mips(
     if pixel_size_um is None:
         pixel_size_um = _guess_pixel_size_um(acquisition_dir)
 
+    # Grid indices for the labels. `tile_index` only exists for the flat
+    # filename layout; a FOLDER-layout acquisition — which is what the
+    # microscope writes — has none, so `_tile_label` returned "" and those
+    # previews carried no labels at all. Derive them from the stage positions
+    # instead, so every acquisition can be read.
+    derived = _derive_tile_indices(tiles)
+
     loaded: List[Tuple[float, float, np.ndarray, str]] = []
     for t in tiles:
         mip = _tile_mip(t, channel, z_range, illum_side)
         if mip is None:
             continue
-        loaded.append((float(t.x_mm), float(t.y_mm), mip, _tile_label(t)))
+        loaded.append(
+            (float(t.x_mm), float(t.y_mm), mip, _tile_label(t, derived.get(id(t))))
+        )
     if not loaded:
         logger.warning("Orientation preview: no MIPs could be read")
     return loaded, float(pixel_size_um)
@@ -542,7 +551,73 @@ def _composite_tiles(
         for label, cy, cx in label_spots:
             if label:
                 _draw_label(canvas, label, cy, cx, scale)
+        # Axis indices go in a GUTTER, not on the tiles. The per-tile labels
+        # above are ~2 px tall once the panel is shown at thumbnail size, so
+        # nobody can tell which way X and Y run without opening the zoom view —
+        # but drawing them big enough to survive that downscale would cover the
+        # very image being judged. A margin costs a little area and obstructs
+        # nothing.
+        canvas = _add_axis_gutters(canvas, label_spots)
     return canvas
+
+
+def _add_axis_gutters(canvas: np.ndarray, label_spots) -> np.ndarray:
+    """Pad the mosaic and write the column/row indices into the margins.
+
+    Reading "which tile is that?" off the edges leaves the image untouched, and
+    the labels can be as large as they need to be to survive the thumbnail.
+    """
+    parsed = []
+    for label, cy, cx in label_spots:
+        if not label:
+            continue
+        m = re.fullmatch(r"X(\d+)Y(\d+)", label)
+        if m:
+            parsed.append((int(m.group(1)), int(m.group(2)), cy, cx))
+    if not parsed:
+        return canvas
+
+    h, w = canvas.shape
+    margin = max(28, int(max(h, w) // 8))
+    out = np.zeros((h + margin, w + margin), dtype=canvas.dtype)
+    out[margin:, margin:] = canvas
+
+    seen_cols, seen_rows = {}, {}
+    for xi, yi, cy, cx in parsed:
+        seen_cols.setdefault(xi, cx + margin)
+        seen_rows.setdefault(yi, cy + margin)
+    for xi, cx in seen_cols.items():
+        text = f"X{xi}"
+        _draw_label(out, text, margin // 2, cx, _gutter_scale(text, margin))
+    for yi, cy in seen_rows.items():
+        text = f"Y{yi}"
+        scale = _gutter_scale(text, margin)
+        # Centre the row label on the space it actually occupies, not on the
+        # middle of the gutter: a label wider than the gutter's half-width
+        # would otherwise hang over the edge and its dark backing plate would
+        # darken the image this preview exists to show.
+        half = _label_box_px(text, scale) // 2
+        _draw_label(out, text, cy, min(max(half, margin // 2), margin - half), scale)
+    return out
+
+
+def _label_box_px(text: str, scale: int) -> int:
+    """Full width of a drawn label including its backing plate."""
+    return (len(text) * 4 - 1) * scale + 2 * scale
+
+
+def _gutter_scale(text: str, margin: int) -> int:
+    """Largest glyph scale whose label fits inside a `margin`-wide gutter.
+
+    Sizing by a fixed fraction of the margin works until a label is one
+    character longer than expected -- "Y10" on a ten-row mosaic -- and then the
+    plate hangs into the image. Solving for the text that will actually be
+    drawn cannot.
+    """
+    scale = max(2, int(margin // 6))
+    while scale > 2 and _label_box_px(text, scale) > margin:
+        scale -= 1
+    return scale
 
 
 def orientation_previews(
@@ -768,11 +843,52 @@ def _mip_from_stack(
         return None
 
 
-def _tile_label(tile) -> str:
-    """A short reference label for a tile — its grid index, e.g. ``X0Y0``."""
+# Stage positions closer than this are the same row or column. Tile pitches are
+# ~1-2 mm and stage repeatability is sub-micron, so 10 um separates real steps
+# from jitter without rounding two neighbours together.
+_GRID_TOL_MM = 0.01
+
+
+def _derive_tile_indices(tiles) -> "Dict[int, Tuple[int, int]]":
+    """``{id(tile): (x_index, y_index)}`` clustered from the stage positions.
+
+    Only needed because the folder layout carries millimetres rather than
+    indices. Clustering rather than rounding: a coordinate sitting on a
+    rounding boundary would split one row in two and misnumber everything below
+    it.
+    """
+    out: Dict[int, Tuple[int, int]] = {}
+    try:
+        def axis_index(values):
+            uniq = []
+            for v in sorted(values):
+                if not uniq or v - uniq[-1] > _GRID_TOL_MM:
+                    uniq.append(v)
+            return uniq
+
+        xs = axis_index([float(t.x_mm) for t in tiles])
+        ys = axis_index([float(t.y_mm) for t in tiles])
+        for t in tiles:
+            xi = min(range(len(xs)), key=lambda i: abs(xs[i] - float(t.x_mm)))
+            yi = min(range(len(ys)), key=lambda i: abs(ys[i] - float(t.y_mm)))
+            out[id(t)] = (xi, yi)
+    except Exception as exc:  # noqa: BLE001 - labels must never break a preview
+        logger.debug("Could not derive tile indices: %s", exc)
+    return out
+
+
+def _tile_label(tile, derived=None) -> str:
+    """A short reference label for a tile — its grid index, e.g. ``X0Y0``.
+
+    Prefers the acquisition's own `tile_index`; falls back to the index derived
+    from stage positions, which is the only thing a folder-layout acquisition
+    has.
+    """
     idx = getattr(tile, "tile_index", None)
     if idx and len(idx) == 2:
         return f"X{int(idx[0])}Y{int(idx[1])}"
+    if derived and len(derived) == 2:
+        return f"X{int(derived[0])}Y{int(derived[1])}"
     return ""
 
 
