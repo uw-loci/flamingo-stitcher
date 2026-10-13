@@ -20,7 +20,7 @@ equally and cancels.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Optional
 
 import numpy as np
@@ -45,6 +45,10 @@ _EDGE_BANDS = 2
 # saying anything: the sample is too uniform, or the sheets genuinely overlap.
 _MIN_MARGIN = 0.04
 
+# Below this |bow| the centre of the frame is no sharper than its ends, i.e.
+# there is no detectable light-sheet waist to correct for. See _focus_bow.
+_MIN_BOW = 0.03
+
 
 @dataclass(frozen=True)
 class IlluminationGeometry:
@@ -61,6 +65,28 @@ class IlluminationGeometry:
 
     axis: int
 
+    bows: Dict[int, float] = field(default_factory=dict)
+    """Per-side focus bow: positive means sharper MID-frame. See _focus_bow."""
+
+    profiles: Dict[int, tuple] = field(default_factory=dict)
+    """Per-side raw `_N_BANDS` focus profile, low end of the axis first."""
+
+    @property
+    def bowed(self) -> bool:
+        """True when BOTH sheets read sharper mid-frame by more than _MIN_BOW.
+
+        Requiring both is what makes this about the sheet rather than the tilt:
+        attenuation pushes the two sides in opposite directions, so it cannot
+        make both of them bow the same way.
+        """
+        vals = list(self.bows.values())
+        return len(vals) >= 2 and all(v >= _MIN_BOW for v in vals)
+
+    @property
+    def bow(self) -> float:
+        vals = list(self.bows.values())
+        return float(np.mean(vals)) if vals else 0.0
+
     @property
     def confident(self) -> bool:
         return self.low_side is not None and self.margin >= _MIN_MARGIN
@@ -76,8 +102,22 @@ class IlluminationGeometry:
             )
         return (
             f"side {self.low_side} lights the LOW end of axis {self.axis} "
-            f"({parts}; margin {self.margin:.3f})"
+            f"({parts}; margin {self.margin:.3f}){self.describe_bow()}"
         )
+
+    def describe_bow(self) -> str:
+        """The sheet-waist half of the measurement, as a log suffix."""
+        if not self.bows:
+            return ""
+        parts = ", ".join(
+            f"side {s} bow {b:+.3f}" for s, b in sorted(self.bows.items())
+        )
+        if self.bowed:
+            return (
+                f"; sharper MID-frame on both sheets ({parts}) -- a light-sheet "
+                f"waist mid-frame, which side selection cannot correct"
+            )
+        return f"; no mid-frame sharpness peak ({parts})"
 
 
 def _focus_profile(data: np.ndarray, axis: int) -> Optional[np.ndarray]:
@@ -136,6 +176,50 @@ def _focus_profile(data: np.ndarray, axis: int) -> Optional[np.ndarray]:
         return None
 
 
+def _focus_bow(profile: np.ndarray) -> float:
+    """How much sharper the MIDDLE of the frame is than its two ends.
+
+    `_focus_profile`'s tilt (low end vs high end) measures the ANTIsymmetric
+    part of the sheet: attenuation and scattering, which grow with how far the
+    sheet has travelled, so one end is always worse. That is the part split and
+    blend fusion already exploit by preferring each sheet's near half.
+
+    This measures the SYMMETRIC part instead. A static Gaussian sheet is
+    thinnest at its beam waist and spreads either side of it, so if the waist
+    sits mid-frame the axial blur is worst at BOTH ends. Choosing a side cannot
+    fix that -- with both waists mid-frame the two sheets are spread at the same
+    places -- so a positive bow is blur that nothing in our current fusion
+    addresses.
+
+    Returns a normalised contrast in (-1, 1): positive means sharpest mid-frame
+    (a waist), ~0 means flat, negative means sharpest at the ends.
+
+    Two confounds, both breakable, neither handled here:
+      * Sample shape. A blob is thickest mid-frame, so it carries more detail
+        there. Normalising each band by its own mean intensity helps but does
+        not remove it.
+      * Both confounds and the real effect are SYMMETRIC, so unlike the tilt
+        they cannot be separated within one tile. They separate across tiles:
+        the waist is fixed in the TILE frame (the illumination optics are rigid
+        with respect to the detection objective and the sample is scanned), so a
+        sheet bow repeats identically in every tile wherever it sits in the
+        mosaic, while a sample bow moves with the sample. Compare
+        `AcquisitionGeometry.bow_mean` against `bow_spread`.
+    """
+    p = np.asarray(profile, dtype=np.float64)
+    if p.size < 4:
+        return 0.0
+    mid = p.size // 2
+    # Middle two bands against the outer two at each end, for _N_BANDS = 6.
+    take = max(1, (p.size - 2) // 4)
+    centre = float(np.mean(p[mid - 1 : mid + 1]))
+    ends = float(np.mean(np.concatenate([p[:take + 1], p[-(take + 1):]])))
+    total = centre + ends
+    if not np.isfinite(total) or total <= 0.0:
+        return 0.0
+    return (centre - ends) / total
+
+
 def measure(
     volumes: Dict[int, np.ndarray], axis: int = -1
 ) -> Optional[IlluminationGeometry]:
@@ -156,6 +240,8 @@ def measure(
         return None
 
     tilts: Dict[int, float] = {}
+    bows: Dict[int, float] = {}
+    profiles: Dict[int, tuple] = {}
     for side in sides:
         sample = _resident_sample(volumes[side])
         if sample is None:
@@ -163,6 +249,8 @@ def measure(
         profile = _focus_profile(sample, axis)
         if profile is None:
             return None
+        profiles[side] = tuple(round(float(v), 6) for v in profile)
+        bows[side] = _focus_bow(profile)
         low = float(np.mean(profile[:_EDGE_BANDS]))
         high = float(np.mean(profile[-_EDGE_BANDS:]))
         total = low + high
@@ -178,7 +266,12 @@ def measure(
     if margin < _MIN_MARGIN:
         low_side = None
     return IlluminationGeometry(
-        low_side=low_side, margin=margin, tilts=tilts, axis=axis
+        low_side=low_side,
+        margin=margin,
+        tilts=tilts,
+        axis=axis,
+        bows=bows,
+        profiles=profiles,
     )
 
 
@@ -189,7 +282,7 @@ class AcquisitionGeometry:
     low_side: Optional[int]
     votes: Dict[int, int]
     rows: list
-    """(tile name, channel, low_side or None, margin, tilts) per probed tile."""
+    """(tile name, channel, low_side or None, margin, tilts, bows) per tile."""
 
     @property
     def agreed(self) -> int:
@@ -200,6 +293,37 @@ class AcquisitionGeometry:
         return sum(self.votes.values())
 
     @property
+    def bow_mean(self) -> Optional[float]:
+        """Mean mid-frame sharpness bow over every probed tile and side.
+
+        See `_focus_bow`. Positive means the frame is sharpest in the middle,
+        which is the signature of a light-sheet beam waist sitting mid-frame.
+        """
+        vals = self._bow_values()
+        return float(np.mean(vals)) if vals else None
+
+    @property
+    def bow_spread(self) -> Optional[float]:
+        """Standard deviation of the bow across tiles.
+
+        This is the discriminator. The illumination optics are rigid with
+        respect to the detection objective and the sample is scanned, so the
+        beam waist sits at the SAME place inside every tile: a sheet bow is
+        large and repeatable, i.e. `bow_mean` well above `bow_spread`. A bow
+        driven by the sample's own shape moves from tile to tile, so it shows up
+        as spread of the same order as the mean.
+        """
+        vals = self._bow_values()
+        return float(np.std(vals)) if len(vals) >= 2 else None
+
+    def _bow_values(self) -> list:
+        out = []
+        for row in self.rows:
+            if len(row) > 5 and row[5]:
+                out.extend(float(v) for v in dict(row[5]).values())
+        return out
+
+    @property
     def split(self) -> bool:
         """True when probed tiles disagreed — which should not happen on one
         acquisition, and means the illumination axis or the tile orientation is
@@ -208,11 +332,18 @@ class AcquisitionGeometry:
 
     def summary(self) -> str:
         if self.low_side is None:
-            return (
-                "No tile gave a confident answer. The sample may be too uniform, "
-                "or the two sheets may genuinely look alike. Open one raw file "
-                "from each side and look at which half of the frame is in focus."
+            # The bow is still worth reporting here. It is a SEPARATE
+            # measurement from the side tilt -- symmetric rather than
+            # antisymmetric -- so two sheets that look alike end-to-end (no
+            # usable tilt) can still both be sharpest mid-frame.
+            text = (
+                "No tile gave a confident answer about which side is which. The "
+                "sample may be too uniform, or the two sheets may genuinely look "
+                "alike. Open one raw file from each side and look at which half "
+                "of the frame is in focus."
             )
+            bow = self.bow_verdict()
+            return text + ("\n\n" + bow if bow else "")
         text = (
             f"Side {self.low_side} lights the LOW end of the frame "
             f"({self.agreed}/{self.total} tiles agree)."
@@ -223,7 +354,47 @@ class AcquisitionGeometry:
                 f"happen on one acquisition — check the tile orientation and the "
                 f"illumination axis before trusting split or blend."
             )
+        bow = self.bow_verdict()
+        if bow:
+            text += "\n\n" + bow
         return text
+
+    def bow_verdict(self) -> str:
+        """Whether a light-sheet beam waist is detectable mid-frame.
+
+        Reported separately from `low_side` because it answers a different
+        question. `low_side` decides split/blend, which handle the sheet's
+        ANTIsymmetric decay. A waist mid-frame is SYMMETRIC blur that no choice
+        of side can remove, because with both waists mid-frame the two sheets
+        are spread in the same places. Correcting it needs either axially swept
+        illumination (ASLM, which removes it optically) or a spatially varying
+        axial deconvolution.
+        """
+        mean, spread = self.bow_mean, self.bow_spread
+        if mean is None:
+            return ""
+        if mean < _MIN_BOW:
+            return (
+                f"Mid-frame sharpness bow {mean:+.3f} (below {_MIN_BOW}): the "
+                f"frame centre is no sharper than its ends, so no light-sheet "
+                f"waist is detectable and there is nothing here for an axial "
+                f"deconvolution to recover."
+            )
+        if spread is not None and spread >= mean:
+            return (
+                f"Mid-frame sharpness bow {mean:+.3f} but spread {spread:.3f} is "
+                f"as large as the mean, so it does NOT repeat from tile to tile. "
+                f"That points at the sample's own shape rather than the light "
+                f"sheet, because the beam waist sits at the same place in every "
+                f"tile. Probe more tiles before reading anything into it."
+            )
+        return (
+            f"Mid-frame sharpness bow {mean:+.3f}, spread {spread if spread is not None else 0.0:.3f}: "
+            f"the frame is consistently sharpest mid-frame across tiles, which "
+            f"is a light-sheet beam waist. Split and blend CANNOT correct this "
+            f"-- both sheets are spread at both ends of the frame. Removing it "
+            f"needs ASLM or a spatially varying axial deconvolution."
+        )
 
 
 def measure_acquisition(
@@ -253,7 +424,9 @@ def measure_acquisition(
             if g is None:
                 continue
             name = getattr(tile.folder, "name", str(tile.folder))
-            rows.append((name, ch_id, g.low_side, g.margin, dict(g.tilts)))
+            rows.append(
+                (name, ch_id, g.low_side, g.margin, dict(g.tilts), dict(g.bows))
+            )
             if g.confident:
                 votes[g.low_side] = votes.get(g.low_side, 0) + 1
     winner = max(votes, key=votes.get) if votes else None
@@ -299,12 +472,15 @@ def main(argv=None) -> int:
         return 1
 
     print(f"probing up to {args.tiles} tiles on axis {args.axis}\n")
-    print(f"{'tile':<34}{'ch':>4}{'says':>8}{'margin':>9}  tilts")
-    print("-" * 78)
-    for name, ch_id, low_side, margin, tilts in result.rows:
+    print(f"{'tile':<30}{'ch':>4}{'says':>8}{'margin':>8}  {'tilts':<22}bows")
+    print("-" * 94)
+    for name, ch_id, low_side, margin, tilts, bows in result.rows:
         says = "unclear" if low_side is None else str(low_side)
         tilt = " ".join(f"{k}:{v:+.3f}" for k, v in sorted(tilts.items()))
-        print(f"{name[:33]:<34}{ch_id:>4}{says:>8}{margin:>9.3f}  {tilt}")
+        bow = " ".join(f"{k}:{v:+.3f}" for k, v in sorted(bows.items()))
+        print(
+            f"{name[:29]:<30}{ch_id:>4}{says:>8}{margin:>8.3f}  {tilt:<22}{bow}"
+        )
 
     print()
     print(result.summary())

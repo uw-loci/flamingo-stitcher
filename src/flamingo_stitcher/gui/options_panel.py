@@ -279,7 +279,7 @@ class OptionsPanel(QWidget):
             f"  {name[:40]}  ch{ch}  "
             f"{'unclear' if side is None else 'side ' + str(side)}  "
             f"(margin {margin:.2f})"
-            for name, ch, side, margin, _t in result.rows
+            for name, ch, side, margin, *_rest in result.rows
         )
         if result.low_side is None:
             QMessageBox.information(
