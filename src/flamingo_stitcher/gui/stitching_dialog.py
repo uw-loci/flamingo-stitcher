@@ -621,7 +621,9 @@ class StitchingDialog(PersistentDialog):
         self._z_step_spin.setValue(0.0)
         self._z_step_spin.setSpecialValueText("Auto")
         self._z_step_spin.setToolTip(
-            "0 = auto-detect from Workflow.txt Z range and plane count"
+            "Leave as detected: each queued acquisition then uses its OWN Z step,\n"
+            "from its data. Type a value only to override it, and that value then\n"
+            "applies to every queued acquisition this session."
         )
         settings_layout.addWidget(self._z_step_spin, 0, 3)
 
@@ -2263,7 +2265,14 @@ class StitchingDialog(PersistentDialog):
         # through and squished/stretched the volume along Z. We now re-detect
         # unless the user deliberately set Z by hand this session.
         detected_z = None
-        first_item = next((it for it in self._queue if it.get("tiles")), None)
+        # The box only DISPLAYS a detected value now (each entry resolves its
+        # own at run time, see _build_config), but it should still show the
+        # acquisition about to run rather than one already stitched.
+        first_item = next(
+            (it for it in self._queue
+             if it.get("tiles") and it.get("status") == "pending"),
+            None,
+        ) or next((it for it in self._queue if it.get("tiles")), None)
         if first_item:
             tiles0 = first_item["tiles"]
             # Prefer the authoritative Workflow.txt "Plane spacing (um)" field;
@@ -3219,7 +3228,16 @@ class StitchingDialog(PersistentDialog):
         # objective at run time (so a batch mixing objectives is correct). The
         # spin value is kept only as a fallback when an objective can't be read.
         config.auto_pixel_size = not self._pixel_size_user_set
-        config.z_step_um = z_step if z_step > 0 else None
+        # Per entry, like the pixel size above: unless the user TYPED a Z step
+        # this session, every queued acquisition takes its own from its data.
+        # The box is one value for the whole dialog, filled by auto-detect from
+        # whichever queue item it looked at and restored from the last session,
+        # so passing it on applied one acquisition's Z step to another: the
+        # 2026-10-14 run of a 2.5 um acquisition went out at 1.0 um (output
+        # squashed 2.5x in Z, registration binned Z twice as hard) with nobody
+        # having touched the box -- most likely carried over from an ASLM
+        # dataset stitched earlier.
+        config.z_step_um = z_step if (z_step > 0 and self._z_step_user_set) else None
         # Frame (AOI) override: None = auto-detect from file size.
         _frame = self._frame_size_combo.currentData()
         config.frame_width = _frame

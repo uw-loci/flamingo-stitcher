@@ -213,6 +213,36 @@ def read_microscope_name(acquisition_dir: Path) -> Optional[str]:
     return None
 
 
+def microscope_names_found(acquisition_dir: Path) -> List[Tuple[Path, str]]:
+    """Every ``Microscope name`` in an acquisition's metadata, with its file.
+
+    `read_microscope_name` returns the FIRST one, and everything per-microscope
+    keys on it: tile orientation, the Options profile, the bundled presets.
+    After the 2026-10 reinstall both rigs wrote the default name "princess" in
+    some files and their own name in others, so which settings an acquisition
+    got depended on which file happened to be read first. This lists them all
+    so the run can say when they disagree.
+    """
+    acquisition_dir = Path(acquisition_dir)
+    found: List[Tuple[Path, str]] = []
+    for base in [acquisition_dir, *_child_dirs(acquisition_dir)]:
+        files = [base / "ScopeSettings.txt"]
+        try:
+            files.extend(sorted(base.glob("FlamingoMetaData*.txt")))
+        except OSError:
+            pass
+        for f in files:
+            try:
+                if not f.is_file():
+                    continue
+                m = _NAME_RE.search(f.read_text(errors="replace"))
+            except OSError:
+                continue
+            if m and m.group(1).strip():
+                found.append((f, m.group(1).strip()))
+    return found
+
+
 def _child_dirs(d: Path) -> List[Path]:
     try:
         return [c for c in sorted(d.iterdir()) if c.is_dir()]

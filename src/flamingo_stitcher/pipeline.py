@@ -6842,6 +6842,43 @@ class StitchingPipeline:
     # sample on any real acquisition.
     _ILLUM_VERIFY_TILES = 6
 
+    def _log_microscope_identity(self, acquisition_dir) -> None:
+        """Name the microscope this run is keyed on, and say when files disagree.
+
+        Tile orientation, the Options profile and the bundled presets are all
+        looked up by the FIRST "Microscope name" found. After the 2026-10
+        reinstall both rigs wrote the default "princess" in some files and their
+        own name in others, so two different instruments could share one set of
+        per-microscope settings -- or one instrument get the other's -- depending
+        on file order, with nothing in the log to show it.
+        """
+        try:
+            from flamingo_stitcher.orientation import microscope_names_found
+
+            found = microscope_names_found(acquisition_dir)
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            self.logger.debug(f"Microscope name lookup failed: {exc}")
+            return
+        if not found:
+            self.logger.info(
+                "Microscope name: none recorded -- per-microscope settings fall "
+                "back to defaults."
+            )
+            return
+        used_file, used = found[0]
+        distinct = sorted({name for _f, name in found})
+        if len(distinct) == 1:
+            self.logger.info(f"Microscope name: '{used}' (from {used_file.name})")
+            return
+        listing = "; ".join(f"{f.name}: '{n}'" for f, n in found)
+        self.logger.warning(
+            f"  Microscope name DISAGREES between this acquisition's files "
+            f"({listing}). Per-microscope settings -- tile orientation and the "
+            f"Options profile -- are keyed on '{used}' (from {used_file.name}). "
+            f"If that is the wrong instrument, fix 'Microscope name' in the "
+            f"microscope's own ScopeSettings.txt so future acquisitions agree."
+        )
+
     def _check_configured_z_step(self, z_step_um, tiles) -> None:
         """Say so when the Z step in use disagrees with the data's own.
 
@@ -10784,6 +10821,8 @@ class StitchingPipeline:
                     f"  (differs from hardware-config default "
                     f"{FRAME_WIDTH}×{FRAME_HEIGHT} — cropped/binned acquisition)"
                 )
+
+        self._log_microscope_identity(acquisition_dir)
 
         # 2) Pixel size — derive it per-acquisition from this acquisition's own
         #    objective when in auto mode; otherwise sanity-check the configured
