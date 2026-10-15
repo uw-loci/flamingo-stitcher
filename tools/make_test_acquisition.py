@@ -100,18 +100,58 @@ def main(argv=None) -> int:
                          "the 0.01 mm rounding is 15%% of a step, and "
                          "registration correctly reports 4-6 um of lateral error "
                          "that the test author put there.")
+    ap.add_argument("--xy-drift-per-tile-px", default="0,0",
+                    help="DY,DX lateral drift added per tile in ACQUISITION "
+                         "order (see --walk), so it accumulates like a real "
+                         "stage/sample drift. 2026-10-14 rig run: ~2.5 px per "
+                         "X step at 8x, so a raster row-to-row seam carries a "
+                         "whole row of it.")
+    ap.add_argument("--walk", choices=("serpentine", "raster"),
+                    default="serpentine",
+                    help="acquisition order the drift accumulates along. The "
+                         "2026-10-14 rig log is raster: X ascending every row, "
+                         "flying back between rows.")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args(argv)
 
     if not args.source.exists():
         raise SystemExit(f"source volume not found: {args.source}")
 
-    # Largest frame whose grid fits one source quadrant arrangement.
+    # Ground-truth Z drift: accumulates across the grid like a real stage, so
+    # neighbouring tiles differ by a little and far-apart tiles by a lot. The
+    # metadata keeps one z_start for every tile, so the pixels and the metadata
+    # disagree by exactly this -- which is the disagreement registration exists
+    # to measure.
     n = args.grid
-    span = 1.0 + (n - 1) * (1.0 - args.overlap)   # field = span * frame
+    depth_um = args.planes * args.z_step_um
+    per_seam_um = depth_um * args.z_drift_per_seam_percent / 100.0
+    per_seam_planes = per_seam_um / args.z_step_um
+    xy_step = [float(v) for v in str(args.xy_drift_per_tile_px).split(",")]
+    offsets = {}
+    xy_offsets = {}
+    for iy in range(n):
+        for ix in range(n):
+            # Accumulates along the order the stage walks, so adjacent tiles
+            # differ by one step and opposite corners by many.
+            if args.walk == "raster":
+                step = iy * n + ix
+            else:
+                step = iy * n + (ix if iy % 2 == 0 else n - 1 - ix)
+            offsets[(ix, iy)] = int(round(step * per_seam_planes))
+            xy_offsets[(ix, iy)] = (
+                int(round(step * xy_step[0])), int(round(step * xy_step[1]))
+            )
+
+
+    # Largest frame whose grid -- plus the padding a drifted tile needs to still
+    # cut real content -- fits the 512 px field the source can supply without
+    # repeating itself in XY.
+    pad = max([0, *(max(abs(v[0]), abs(v[1])) for v in xy_offsets.values())])
+    span = 1.0 + (n - 1) * (1.0 - args.overlap)
     side_guess = 512
-    frame = args.frame or int(side_guess / span)
-    side = int(round(span * frame))
+    frame = args.frame or int((side_guess - 2 * pad) / span)
+    step_px = max(1, int(round(frame * (1.0 - args.overlap))))
+    side = step_px * (n - 1) + frame + 2 * pad
 
     # Derive the pixel size from the wanted stage step so the step is an exact
     # multiple of 0.01 mm, the resolution of the folder names this format uses.
@@ -123,22 +163,6 @@ def main(argv=None) -> int:
 
     field = build_field(args.source, args.planes, side)
 
-    # Ground-truth Z drift: accumulates across the grid like a real stage, so
-    # neighbouring tiles differ by a little and far-apart tiles by a lot. The
-    # metadata keeps one z_start for every tile, so the pixels and the metadata
-    # disagree by exactly this -- which is the disagreement registration exists
-    # to measure.
-    depth_um = args.planes * args.z_step_um
-    per_seam_um = depth_um * args.z_drift_per_seam_percent / 100.0
-    per_seam_planes = per_seam_um / args.z_step_um
-    offsets = {}
-    for iy in range(n):
-        for ix in range(n):
-            # Accumulates along the serpentine the stage actually walks, so
-            # adjacent tiles differ by one step and opposite corners by many.
-            step = iy * n + (ix if iy % 2 == 0 else n - 1 - ix)
-            offsets[(ix, iy)] = int(round(step * per_seam_planes))
-
     acq = write_synth_acquisition(
         args.out,
         grid=(n, n),
@@ -148,6 +172,7 @@ def main(argv=None) -> int:
         z_step_um=args.z_step_um,
         pixel_size_um=pixel_size_um,
         tile_z_offset_planes=offsets,
+        tile_xy_offset_px=xy_offsets,
         source_field=field,
         seed=args.seed,
     )
@@ -159,7 +184,6 @@ def main(argv=None) -> int:
         "planes": args.planes,
         "overlap": args.overlap,
         "overlap_px": int(round(frame * args.overlap)),
-        "pixel_size_um": pixel_size_um,
         "stage_step_mm": step_mm,
         "overlap_um": overlap_um,
         "z_step_um": args.z_step_um,
@@ -168,6 +192,12 @@ def main(argv=None) -> int:
         "z_drift_per_seam_um": per_seam_um,
         "z_drift_per_seam_planes": per_seam_planes,
         "tile_z_offset_planes": {f"{ix},{iy}": v for (ix, iy), v in offsets.items()},
+        "walk": args.walk,
+        "xy_drift_per_tile_px": xy_step,
+        "tile_xy_offset_px": {
+            f"{ix},{iy}": list(v) for (ix, iy), v in xy_offsets.items()
+        },
+        "pixel_size_um": pixel_size_um,
         "tile_z_offset_um": {
             f"{ix},{iy}": v * args.z_step_um for (ix, iy), v in offsets.items()
         },

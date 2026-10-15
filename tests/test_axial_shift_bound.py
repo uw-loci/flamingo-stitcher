@@ -10,6 +10,11 @@ Measured on two rig runs of the same instrument:
 Sampling four times more finely bought a tolerance 3.7x tighter, and 23 of 70
 seams were rejected as "implausible shift" — twelve at quality >= 0.85, with
 shifts in a smooth 30-195 um spread that is what real drift looks like.
+
+2026-10-15: the fraction went from 1.25% to 2.5%. The same three Y-seams between
+the last two rows (105/105/140 um on 10-07, 100/110/140 um on 10-14) were
+rejected in every stitch of the 2026-10-06 acquisition; a shift that repeats
+across three independent stitches is a measurement.
 """
 
 from __future__ import annotations
@@ -18,7 +23,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from flamingo_stitcher.pipeline import StitchingPipeline
+from flamingo_stitcher.pipeline import _Z_CLAMP_DEPTH_FRACTION, StitchingPipeline
 
 
 def _bound(vz, planes, *, binning_z=1, configured=0.0):
@@ -39,7 +44,7 @@ def test_a_finely_sampled_deep_stack_is_no_longer_punished():
     """The 2026-10-07 run: 2999 planes at 2.5 um."""
     bound, source = _bound(2.5, 2999, binning_z=4)
     assert source == "auto"
-    assert bound == pytest.approx(93.7, rel=1e-2)   # 1.25% of 7497 um
+    assert bound == pytest.approx(187.4, rel=1e-2)   # 2.5% of 7497 um
     assert bound > 25.0, "the old rule fell through to the 25 um floor here"
 
 
@@ -51,41 +56,42 @@ def test_it_admits_the_row_to_row_drift_the_rig_actually_measured():
         003->002  35 40 50
 
     Six independent columns agreeing on 65-80 um at one row pair is a
-    measurement, not a stray correlation peak.
+    measurement, not a stray correlation peak. So is 001->000: the 2026-10-14
+    stitch of the same acquisition measured it again at 100/110/140 um. An
+    earlier version of this test asserted that only 8 of these 10 got through,
+    which pinned the rejection of exactly that row.
     """
     bound, _ = _bound(2.5, 2999, binning_z=4)
-    measured = (30, 35, 40, 45, 50, 65, 70, 80, 105, 140)
+    measured = (30, 35, 40, 45, 50, 65, 70, 80, 100, 105, 110, 140)
     admitted = [z for z in measured if z <= bound]
-    assert len(admitted) == 8, f"only {admitted} admitted of {measured}"
+    assert admitted == list(measured), f"only {admitted} admitted of {measured}"
 
 
-def test_the_physical_fraction_matches_what_the_working_run_had():
-    """The constant is carried from the 2026-09-18 run (80 um / 6430 um =
-    1.24%), which registered these seams fine, rather than picked."""
-    bound, _ = _bound(10.0, 643)
-    assert bound / (643 * 10.0) == pytest.approx(0.0125, rel=0.02)
+def test_the_fraction_has_headroom_over_the_largest_repeatable_shift():
+    """140 um, measured in two independent stitches of one 7497 um stack, is
+    1.87% of depth. The fraction is set from that, with ~1.3x headroom, rather
+    than picked."""
+    largest_repeatable = 140.0 / 7497.0
+    assert _Z_CLAMP_DEPTH_FRACTION >= 1.25 * largest_repeatable
+    assert _Z_CLAMP_DEPTH_FRACTION <= 2.0 * largest_repeatable, (
+        "headroom is for measurement scatter, not for switching the guard off"
+    )
 
 
 def test_it_still_rejects_a_peak_found_far_down_the_stack():
     """Widening is not the same as removing. The point of the bound is a
     correlation peak that landed somewhere unrelated."""
     bound, _ = _bound(2.5, 2999, binning_z=4)
-    for absurd in (195, 400, 1000):
+    for absurd in (200, 400, 1000):
         assert absurd > bound
 
 
-def test_the_coarse_step_run_is_essentially_unchanged():
-    """2026-09-18: 643 planes at 10 um had 80.0 um and registered fine.
-
-    It now gets 80.4 um. The two rules nearly coincide there BY CONSTRUCTION —
-    the depth fraction was taken from this run's own tolerance — so agreement
-    to half a micron is the property worth pinning, not exact equality. A first
-    version of this test asserted 80.0 exactly and failed on the 0.4 um, which
-    is 0.5% and changes no decision.
-    """
+def test_no_earlier_run_gets_a_narrower_bound_than_it_had():
+    """2026-09-18: 643 planes at 10 um had 80 um. Widening the fraction may
+    only admit more of what was measured there, never less."""
     bound, _ = _bound(10.0, 643)
-    assert bound == pytest.approx(80.4, abs=0.5)
-    assert abs(bound - 80.0) < 1.0, "the run that worked must not move materially"
+    assert bound >= 80.0
+    assert bound == pytest.approx(_Z_CLAMP_DEPTH_FRACTION * 6430.0, rel=1e-2)
 
 
 # --------------------------------------------------------------------------
@@ -104,7 +110,7 @@ def test_the_physical_floor_holds_however_finely_z_is_sampled():
     honoured, because drift does not care how finely the stack was sampled.
     """
     depth_um = 6000.0
-    physical = 0.0125 * depth_um
+    physical = _Z_CLAMP_DEPTH_FRACTION * depth_um
     for vz in (10.0, 5.0, 2.5, 1.25, 0.5):
         bound, _ = _bound(vz, depth_um / vz)
         assert bound >= physical - 1e-6, (
@@ -115,11 +121,13 @@ def test_the_physical_floor_holds_however_finely_z_is_sampled():
 
 def test_quantization_may_make_the_bound_wider_but_never_narrower_than_physical():
     """A coarse step keeps its generous quantization allowance."""
-    coarse, _ = _bound(10.0, 600)    # 6000 um: max(80, 25, 75) = 80
-    fine, _ = _bound(2.5, 2400)      # 6000 um: max(20, 25, 75) = 75
-    assert coarse == pytest.approx(80.0)
-    assert fine == pytest.approx(75.0)
-    assert min(coarse, fine) >= 0.0125 * 6000.0
+    # 6000 um at 10 um: max(8 steps = 80, floor 25, depth term)
+    coarse, _ = _bound(10.0, 600)
+    fine, _ = _bound(2.5, 2400)      # same depth, 8 steps = 20
+    physical = _Z_CLAMP_DEPTH_FRACTION * 6000.0
+    assert coarse == pytest.approx(max(80.0, physical))
+    assert fine == pytest.approx(max(25.0, physical))
+    assert min(coarse, fine) >= physical
 
 
 def test_a_deeper_stack_gets_a_wider_bound():

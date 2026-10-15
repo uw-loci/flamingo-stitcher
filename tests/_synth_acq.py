@@ -155,6 +155,7 @@ def write_synth_acquisition(
     inject_border_step: Optional[dict] = None,
     tile_planes: Optional[dict] = None,
     tile_z_offset_planes: Optional[dict] = None,
+    tile_xy_offset_px: Optional[dict] = None,
     featureless_tiles: Optional[Sequence] = None,
     featureless_level: float = 3000.0,
     z_texture: bool = False,
@@ -180,6 +181,11 @@ def write_synth_acquisition(
     disagreement registration exists to find. Distinct from ``tile_planes``,
     which changes a tile's depth rather than its origin.
 
+    ``tile_xy_offset_px`` maps ``(ix, iy)`` to a ``(dy, dx)`` pixel offset
+    applied to where that tile's content is cut from, while its folder name
+    keeps the nominal stage position: a lateral stage or sample drift, the
+    in-plane counterpart of ``tile_z_offset_planes``.
+
     ``featureless_tiles`` is a list of ``(ix, iy)`` written as a BRIGHT,
     smooth constant plus noise instead of phantom content — agarose, mounting
     medium, an empty region of gel. ``featureless_level`` sets how bright, and
@@ -195,6 +201,12 @@ def write_synth_acquisition(
     tile_z_offset_planes = {
         tuple(k): int(v) for k, v in (tile_z_offset_planes or {}).items()
     }
+    tile_xy_offset_px = {
+        tuple(k): (int(v[0]), int(v[1]))
+        for k, v in (tile_xy_offset_px or {}).items()
+    }
+    pad_y = max([0, *(abs(v[0]) for v in tile_xy_offset_px.values())])
+    pad_x = max([0, *(abs(v[1]) for v in tile_xy_offset_px.values())])
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ny, nx = grid
@@ -212,8 +224,9 @@ def write_synth_acquisition(
     overlap = float(np.clip(overlap, 0.0, 0.9))
     step_px_x = max(1, int(round(w * (1.0 - overlap))))
     step_px_y = max(1, int(round(h * (1.0 - overlap))))
-    field_w = step_px_x * (nx - 1) + w
-    field_h = step_px_y * (ny - 1) + h
+    # Padded on both sides so a drifted tile still cuts real content.
+    field_w = step_px_x * (nx - 1) + w + 2 * pad_x
+    field_h = step_px_y * (ny - 1) + h + 2 * pad_y
     # The field must be deep enough for the deepest tile; shallower tiles just
     # take a shorter slice of it, so overlapping tiles still agree plane-wise.
     max_planes = max([n_planes, *tile_planes.values()])
@@ -250,7 +263,9 @@ def write_synth_acquisition(
             (folder / "Workflow.txt").write_text(
                 _workflow_text(z_start_mm, tile_z_end_mm, z_step_um, w, h)
             )
-            y0, x0 = iy * step_px_y, ix * step_px_x
+            dy, dx = tile_xy_offset_px.get((ix, iy), (0, 0))
+            y0 = pad_y + iy * step_px_y + dy
+            x0 = pad_x + ix * step_px_x + dx
             # The Z offset moves where in the field this tile's pixels come
             # from; its Workflow.txt above still claims the shared z_start_mm.
             z0 = tile_z_offset_planes.get((ix, iy), 0)

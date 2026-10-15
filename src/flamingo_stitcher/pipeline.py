@@ -1251,6 +1251,10 @@ class StitchingConfig:
     # Edges with residuals exceeding abs_tol are removed (if graph stays
     # connected) and the optimization re-runs, preventing bad pairwise
     # registrations from corrupting the global solution.
+    # In REGISTRATION PIXELS (lateral), converted to µm before it reaches the
+    # solver by _global_opt_abs_tol_um -- multiview-stitcher compares it with
+    # edge residuals in physical units, and passing 3.5 straight through meant
+    # 3.5 µm: under half a pixel at 8x downsample, which pruned every loop.
     global_opt_abs_tol: float = 3.5  # Max acceptable residual (pixels)
     global_opt_rel_tol: float = 0.01  # Convergence threshold
 
@@ -2486,7 +2490,19 @@ _Z_CLAMP_STACK_FRACTION = 0.25
 # the grid. That is a systematic Z error between ROWS, which is why rows
 # misalign while columns do not, and the bound was discarding every measurement
 # of it.
-_Z_CLAMP_DEPTH_FRACTION = 0.0125
+#
+# Raised to 2.5% on 2026-10-15. 1.25% (9.4 of 750 downsampled planes on that
+# stack) rejected the SAME three Y-seams between the last two rows in every
+# stitch of the 2026-10-06 acquisition: 105/105/140 um on 10-07, 100/110/140 um
+# on 10-14, at quality 0.65-0.85, continuing the 60-80 um of the row pair above.
+# A measurement that repeats across three independent stitches is not a stray
+# peak, and rejecting it left that whole row copied from its neighbours instead
+# of measured. 140 um is 1.87% of 7497 um; 2.5% is ~1.3x headroom over the
+# largest repeatable shift. The bound matters less than it did: with the solver
+# tolerance in the right units (_global_opt_abs_tol_um) a wrong Z peak is pruned
+# for disagreeing with its own loop of seams, so this only has to stop a peak
+# that landed somewhere unrelated -- still anything past ~19 of 750 planes.
+_Z_CLAMP_DEPTH_FRACTION = 0.025
 
 
 class ClampRecord(NamedTuple):
@@ -2514,6 +2530,14 @@ class ClampRecord(NamedTuple):
     clamped_xy: bool = False
     clamped_z: bool = False
     whole_matrix: bool = False
+
+
+class _NeighbourClampPlan(NamedTuple):
+    """Per-tile clamp decisions and the reference each was judged against."""
+
+    clamp_xy: List[bool]
+    clamp_z: List[bool]
+    reference: List[Tuple[float, float, float]]
 
 
 class ClampResult(NamedTuple):
@@ -5072,6 +5096,8 @@ class StitchingPipeline:
         if z_step_um is None:
             z_step_um = tiles[0].z_step_mm * 1000.0
             self.logger.info(f"Z step from data: {z_step_um:.3f} µm")
+        else:
+            self._check_configured_z_step(z_step_um, tiles)
 
         # Resolve iso sentinel (either axis set to ISO_DOWNSAMPLE triggers
         # isotropic auto-selection for both). Writes resolved ints back to
@@ -6816,6 +6842,46 @@ class StitchingPipeline:
     # sample on any real acquisition.
     _ILLUM_VERIFY_TILES = 6
 
+    def _check_configured_z_step(self, z_step_um, tiles) -> None:
+        """Say so when the Z step in use disagrees with the data's own.
+
+        A configured Z step silently overrode the data, and printed nothing:
+        "Z step from data" only appears when NO value is configured. The
+        2026-10-14 run of the 2026-10-06 acquisition used 1.000 µm while its
+        own Z range over its plane count gives 2.500 µm, so the output voxel was
+        written as 4.000 µm instead of 10.000 µm and the volume is squashed
+        2.5x along Z -- with nothing in the log to say a choice had been made.
+
+        Warned, not refused. The data's value is (Z range) / (plane count), and
+        that is itself wrong when the camera duplicated or dropped frames (see
+        the stage-outruns-camera note), which is exactly when an operator
+        overrides it on purpose. So both numbers are printed and the operator
+        decides; the run does not guess.
+        """
+        try:
+            data_um = float(tiles[0].z_step_mm) * 1000.0
+        except (AttributeError, IndexError, TypeError, ValueError):
+            data_um = 0.0
+        if data_um <= 0:
+            self.logger.info(f"Z step (configured): {z_step_um:.3f} µm")
+            return
+        if abs(z_step_um - data_um) <= 0.05 * data_um:
+            self.logger.info(
+                f"Z step (configured): {z_step_um:.3f} µm — agrees with the "
+                f"data ({data_um:.3f} µm)."
+            )
+            return
+        self.logger.warning(
+            f"  Z step {z_step_um:.3f} µm is CONFIGURED, but this acquisition's "
+            f"Z range over its plane count gives {data_um:.3f} µm "
+            f"({z_step_um / data_um:.2f}x). The output's Z scale follows the "
+            f"configured value, so the volume will be "
+            f"{'squashed' if z_step_um < data_um else 'stretched'} "
+            f"{max(z_step_um, data_um) / min(z_step_um, data_um):.2f}x along Z. "
+            f"Set 'Z spacing' to Auto to use the data's value, unless frames "
+            f"were dropped or duplicated during acquisition."
+        )
+
     def _verify_illumination_geometry(self, tiles) -> None:
         """Measure which sheet lights the low end, and check the setting.
 
@@ -7477,6 +7543,17 @@ class StitchingPipeline:
 
             sink: Dict[str, Any] = {}
             reject = self._pairwise_shift_reject(tile_data, voxel_size_um)
+            reg_binning = self._effective_registration_binning(
+                tile_data, tiles, extent_um, voxel_size_um=voxel_size_um
+            )
+            abs_tol_um = self._global_opt_abs_tol_um(voxel_size_um, reg_binning)
+            self._abs_tol_um = abs_tol_um
+            self.logger.info(
+                f"  Global solve tolerance: {self.config.global_opt_abs_tol:g} "
+                f"registration px = {abs_tol_um:.1f} µm. A seam whose placement "
+                f"disagrees with its own measurement by more than this is "
+                f"pruned and the solve re-run."
+            )
             with dask.diagnostics.ProgressBar():
                 with registration_report.capture_prefilter_graph(sink, reject):
                     result = registration.register(
@@ -7489,9 +7566,7 @@ class StitchingPipeline:
                         ),
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
-                        registration_binning=self._effective_registration_binning(
-                            tile_data, tiles, extent_um, voxel_size_um=voxel_size_um
-                        ),
+                        registration_binning=reg_binning,
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=(
                             self.config.quality_threshold
@@ -7500,7 +7575,7 @@ class StitchingPipeline:
                             self.config.registration_upsample_factor
                         ),
                         groupwise_resolution_kwargs=self._groupwise_kwargs(
-                            tiles, index_map
+                            tiles, index_map, abs_tol_um=abs_tol_um
                         ),
                         return_dict=True,
                     )
@@ -7965,6 +8040,13 @@ class StitchingPipeline:
         try:
             import dask.diagnostics
 
+            refine_binning = self._effective_registration_binning(
+                tile_data,
+                [ti for _v, ti in tile_data],
+                self._frame_extent_um(tile_data, voxel_size_um),
+                configured=self.config.registration_z_refine_binning,
+                voxel_size_um=voxel_size_um,
+            )
             with dask.diagnostics.ProgressBar():
                 refined = registration.register(
                     msims,
@@ -7980,13 +8062,7 @@ class StitchingPipeline:
                     # Discounted the same way as the main pass: this
                     # binning is against native tiles too, and the spill it
                     # runs on is already downsampled.
-                    registration_binning=self._effective_registration_binning(
-                        tile_data,
-                        [ti for _v, ti in tile_data],
-                        self._frame_extent_um(tile_data, voxel_size_um),
-                        configured=self.config.registration_z_refine_binning,
-                        voxel_size_um=voxel_size_um,
-                    ),
+                    registration_binning=refine_binning,
                     post_registration_do_quality_filter=True,
                     post_registration_quality_threshold=self.config.quality_threshold,
                     pairwise_reg_func_kwargs=self._pairwise_reg_kwargs(
@@ -8010,7 +8086,11 @@ class StitchingPipeline:
                     # entire point of running it.
                     pre_registration_pruning_method=None,
                     groupwise_resolution_kwargs={
-                        "abs_tol": self.config.global_opt_abs_tol,
+                        # Pixels -> µm, as for the main pass; see
+                        # _global_opt_abs_tol_um.
+                        "abs_tol": self._global_opt_abs_tol_um(
+                            voxel_size_um, refine_binning
+                        ),
                         "rel_tol": self.config.global_opt_rel_tol,
                     },
                 )
@@ -8630,7 +8710,43 @@ class StitchingPipeline:
             getattr(self.config, "stitching_approach", "default") or "default"
         ).strip().lower() in ("center_xy", "center xy", "center_xy_start")
 
-    def _groupwise_kwargs(self, tiles, index_map):
+    def _global_opt_abs_tol_um(self, voxel_size_um, binning) -> float:
+        """`global_opt_abs_tol` (registration pixels) in the µm the solver uses.
+
+        multiview-stitcher's global optimisation compares abs_tol with edge
+        residuals measured in PHYSICAL units -- its own default is one voxel
+        diagonal (param_resolution/global_optimization.py) -- and keeps pruning
+        the worst edge until every survivor is under it. We passed the
+        configured 3.5 through unconverted, so it meant 3.5 µm. At 8x downsample
+        that is 0.42 of an 8.38 µm pixel, which no real loop of seams closes
+        within, so the solver pruned until the graph was a spanning tree: on the
+        2026-10-14 6x7, 19 measured seams (quality up to 0.93) were discarded and
+        every row hung off one or two row-to-row seams -- in two row pairs the
+        one it kept was the outlier, offsetting the whole row by 35-45 µm.
+
+        Converted with the LATERAL registration pixel (voxel x binning), since
+        "3.5 pixels" is a lateral statement and lateral misplacement is what a
+        seam shows. Floored at one full voxel diagonal -- the solver's own
+        default -- so a one-plane Z quantisation difference cannot by itself
+        prune a seam when Z is much coarser than XY.
+        """
+        px = float(getattr(self.config, "global_opt_abs_tol", 3.5) or 3.5)
+        spacing = {}
+        for ax in ("z", "y", "x"):
+            try:
+                v = float((voxel_size_um or {}).get(ax, 0.0) or 0.0)
+                b = float((binning or {}).get(ax, 1) or 1)
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if v > 0:
+                spacing[ax] = v * b
+        lateral = [spacing[a] for a in ("y", "x") if a in spacing]
+        if not lateral:
+            return px  # cannot convert; keep the legacy behaviour
+        diagonal = sum(v * v for v in spacing.values()) ** 0.5
+        return max(px * max(lateral), diagonal)
+
+    def _groupwise_kwargs(self, tiles, index_map, abs_tol_um=None):
         """Solver kwargs, with the gauge anchored at the centre for `center_xy`.
 
         Anchoring is how "start in the middle and build outward" is expressed
@@ -8643,7 +8759,10 @@ class StitchingPipeline:
         view the solver picked as its own reference.
         """
         kwargs = {
-            "abs_tol": self.config.global_opt_abs_tol,
+            "abs_tol": (
+                abs_tol_um if abs_tol_um is not None
+                else self.config.global_opt_abs_tol
+            ),
             "rel_tol": self.config.global_opt_rel_tol,
         }
         if not self._center_out_approach():
@@ -8718,8 +8837,12 @@ class StitchingPipeline:
         instead of being hunted for.
         """
         try:
+            # The SAME µm the solver pruned at (see _global_opt_abs_tol_um).
+            # Reading the raw config value here was the unit slip the solver
+            # had too: 3.5 µm flagged every tile of the 2026-10-14 run.
             tolerance = float(
-                getattr(self.config, "global_opt_abs_tol", None)
+                getattr(self, "_abs_tol_um", None)
+                or getattr(self.config, "global_opt_abs_tol", None)
                 or center_out.DEFAULT_TENSION_UM
             )
             messages = center_out.tension_alerts(
@@ -9160,11 +9283,12 @@ class StitchingPipeline:
         )
         bound_z, source_z = self._axial_shift_bound(depth_um, vz)
 
-        # Judge each tile against where the mosaic AS PLACED put it, not
-        # against its original stage position: a correction every tile shares
-        # slides the whole mosaic and opens no seam. See
-        # _consensus_reference_shift.
-        reference = self._consensus_reference_shift(params)
+        # Judge each tile against the tiles it has to LINE UP WITH -- its grid
+        # neighbours -- not against the mosaic as a whole. See
+        # _neighbour_clamp_plan for why the mosaic-wide median was wrong.
+        plan = self._neighbour_clamp_plan(
+            params, [t for _v, t in tile_data], bound_xy, bound_z
+        )
 
         clamped = []
         records: List[ClampRecord] = []
@@ -9173,8 +9297,9 @@ class StitchingPipeline:
                 arr = _np.asarray(param)
                 mat = arr[0] if arr.ndim == 3 else arr
                 abs_z, abs_y, abs_x = (float(v) for v in mat[:3, 3])  # µm, (z, y, x)
-                # Judge the correction against the mosaic's consensus.
-                ref_z, ref_y, ref_x = reference
+                # Judged against this tile's neighbours (or the mosaic's
+                # consensus, for a tile with none); see _neighbour_clamp_plan.
+                ref_z, ref_y, ref_x = plan.reference[index]
                 dz, dy, dx = abs_z - ref_z, abs_y - ref_y, abs_x - ref_x
                 # Per-axis surgery is only meaningful for a pure translation.
                 # For a general affine the translation column is the motion of
@@ -9189,8 +9314,8 @@ class StitchingPipeline:
                 continue
 
             if translation_only:
-                clamp_xy = max(abs(dy), abs(dx)) > bound_xy
-                clamp_z = abs(dz) > bound_z
+                clamp_xy = plan.clamp_xy[index]
+                clamp_z = plan.clamp_z[index]
                 whole = False
             else:
                 clamp_xy = clamp_z = whole = max(abs(dz), abs(dy), abs(dx)) > max(
@@ -9219,7 +9344,8 @@ class StitchingPipeline:
                 clamped.append(param)
                 continue
 
-            # Revert to the mosaic's CONSENSUS, not to zero.
+            # Revert to the NEIGHBOURS' median (the consensus only for a tile
+            # with no usable neighbour), never to zero.
             #
             # Zero means "this tile's stage position", and that is only the
             # right answer if the rest of the mosaic also stayed there. When the
@@ -9263,6 +9389,145 @@ class StitchingPipeline:
         self.logger.info(result.summary_line())
         return result
 
+    def _neighbour_clamp_plan(self, params, tiles, bound_xy, bound_z):
+        """Which tiles disagree with EVERY grid neighbour, and what to revert to.
+
+        The clamp exists for a tile flung away by a garbage correlation peak.
+        Such a tile is out of line with the tiles around it, so that is the
+        test: a tile's lateral (or axial) correction is rejected only when it
+        sits more than one seam bound away from **every** grid neighbour.
+
+        It used to be judged against the per-axis median of the WHOLE mosaic,
+        and the docstring of _consensus_reference_shift said exactly where that
+        would break: "If a mosaic drifts steadily from one end to the other by
+        much more than an overlap, the extremes still read as outliers." The
+        2026-10-14 6x7 run did that. Its corrections drift 30-180 µm across the
+        grid, so the far corner sat 218-235 µm from the median while each
+        adjacent pair agreed within 21 µm -- and the clamp sent tiles back to
+        the consensus from beside neighbours they had registered to at quality
+        0.95, opening 233 and 239 µm seams in the output.
+
+        Neighbour MEDIANS were rejected there because they collapse at an edge
+        or in a sparse montage, which is where a drift is largest. This uses no
+        median for the decision: each neighbour is tested on its own, against
+        the same bound every seam already had to pass before the global solve
+        (_pairwise_shift_reject). So a tile with one neighbour is judged by that
+        neighbour, and a drift -- where every adjacent difference is a single
+        seam's worth -- cannot trip it however large it accumulates.
+
+        The value a rejected axis falls back to is the median of the neighbours
+        that were NOT themselves rejected; a tile with no grid neighbours, or
+        none left, falls back to the mosaic consensus as before.
+        """
+        import numpy as _np
+
+        n = len(params)
+        trans = []
+        for param in params:
+            try:
+                arr = _np.asarray(param)
+                mat = arr[0] if arr.ndim == 3 else arr
+                trans.append(tuple(float(v) for v in mat[:3, 3]))
+            except Exception:
+                trans.append(None)
+
+        adjacency = {i: set() for i in range(n)}
+        try:
+            from .border_qc import find_neighbor_pairs
+
+            for pair in find_neighbor_pairs(list(tiles or []), include_z=False):
+                a, b = int(pair[0]), int(pair[1])
+                if 0 <= a < n and 0 <= b < n and a != b:
+                    adjacency[a].add(b)
+                    adjacency[b].add(a)
+        except Exception as exc:  # noqa: BLE001 - fall back to consensus
+            self.logger.debug(f"  Clamp neighbour lookup unavailable: {exc}")
+
+        consensus = self._consensus_reference_shift(params)
+
+        clamp_xy = [False] * n
+        clamp_z = [False] * n
+
+        def _judge_against_consensus(flags, part):
+            for i in range(n):
+                if trans[i] is None:
+                    continue
+                flags[i] = _exceeds(trans[i], consensus, part)
+
+        def _exceeds(a, b, part):
+            if part == "z":
+                return abs(a[0] - b[0]) > bound_z
+            return max(abs(a[1] - b[1]), abs(a[2] - b[2])) > bound_xy
+
+        if n < _MIN_TILES_FOR_CONSENSUS:
+            # Two tiles that disagree cannot say which one moved; judge the
+            # absolute displacement, as before (see _consensus_reference_shift).
+            _judge_against_consensus(clamp_xy, "xy")
+            _judge_against_consensus(clamp_z, "z")
+        else:
+            for flags, part in ((clamp_xy, "xy"), (clamp_z, "z")):
+                self._flag_tiles_out_of_line(
+                    flags, part, trans, adjacency, consensus, _exceeds
+                )
+
+        reference = []
+        for i in range(n):
+            good = [
+                j for j in adjacency[i]
+                if trans[j] is not None and not (clamp_xy[j] or clamp_z[j])
+            ]
+            if good and n >= _MIN_TILES_FOR_CONSENSUS:
+                reference.append(self._median_shift(params, sorted(good)))
+            else:
+                reference.append(consensus)
+        return _NeighbourClampPlan(
+            clamp_xy=clamp_xy, clamp_z=clamp_z, reference=reference
+        )
+
+    @staticmethod
+    def _flag_tiles_out_of_line(flags, part, trans, adjacency, consensus, exceeds):
+        """Flag, one at a time, the tile most clearly out of line with its grid.
+
+        A candidate is a tile that disagrees, by more than the seam bound, with
+        EVERY neighbour not already flagged. Candidates are taken in order of
+        how many neighbours they disagree with, so the flung tile in the middle
+        of three goes first -- the two end tiles each disagree only with IT, and
+        once it is set aside they have nothing left to disagree with. Ties go to
+        the tile farthest from the mosaic consensus: in 0, 300, 0, -300, 0 the
+        good centre tile disagrees with both neighbours exactly as strongly as
+        the bad ones do, and only the mosaic as a whole can say which is which.
+
+        A tile left with no unflagged neighbour (an isolated tile, or one whose
+        every neighbour was flagged) is judged against the consensus, as every
+        tile used to be.
+        """
+        n = len(trans)
+        while True:
+            best = None
+            for i in range(n):
+                if flags[i] or trans[i] is None:
+                    continue
+                nbrs = [j for j in adjacency[i] if not flags[j] and trans[j] is not None]
+                if not nbrs or not all(exceeds(trans[i], trans[j], part) for j in nbrs):
+                    continue
+                if part == "z":
+                    far = abs(trans[i][0] - consensus[0])
+                else:
+                    far = max(
+                        abs(trans[i][1] - consensus[1]), abs(trans[i][2] - consensus[2])
+                    )
+                key = (len(nbrs), far)
+                if best is None or key > best[0]:
+                    best = (key, i)
+            if best is None:
+                break
+            flags[best[1]] = True
+        for i in range(n):
+            if flags[i] or trans[i] is None:
+                continue
+            if not any(not flags[j] and trans[j] is not None for j in adjacency[i]):
+                flags[i] = exceeds(trans[i], consensus, part)
+
     def _consensus_reference_shift(self, params):
         """The correction the mosaic as a whole agreed on, as (dz, dy, dx) µm.
 
@@ -9287,6 +9552,12 @@ class StitchingPipeline:
         montage — which is where a drift is largest. If the seam report ever
         shows gradient-driven clamping on real data, that is the evidence to
         revisit this with.
+
+        2026-10-15: it did (233/239 µm seams on a 6x7), and the clamp now judges
+        against grid neighbours one at a time -- see _neighbour_clamp_plan,
+        which answers the edge/sparse objection above. This median remains the
+        fallback for a tile with no usable neighbour, and the tie-break between
+        equally out-of-line candidates.
         """
         import numpy as _np
 
@@ -10079,18 +10350,21 @@ class StitchingPipeline:
             try:
                 import dask.diagnostics
 
+                reg_binning = self._effective_registration_binning(
+                    tile_data,
+                    [ti for _v, ti in tile_data],
+                    self._frame_extent_um(tile_data, voxel_size_um),
+                    voxel_size_um=voxel_size_um,
+                )
+                abs_tol_um = self._global_opt_abs_tol_um(voxel_size_um, reg_binning)
+                self._abs_tol_um = abs_tol_um
                 with dask.diagnostics.ProgressBar():
                     params = registration.register(
                         msims,
                         reg_channel_index=0,
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
-                        registration_binning=self._effective_registration_binning(
-                            tile_data,
-                            [ti for _v, ti in tile_data],
-                            self._frame_extent_um(tile_data, voxel_size_um),
-                            voxel_size_um=voxel_size_um,
-                        ),
+                        registration_binning=reg_binning,
                         post_registration_do_quality_filter=True,
                         post_registration_quality_threshold=self.config.quality_threshold,
                         # Global optimization with iterative edge pruning —
@@ -10099,7 +10373,8 @@ class StitchingPipeline:
                         # removed (preserving graph connectivity) and the
                         # optimization re-runs.
                         groupwise_resolution_kwargs=self._groupwise_kwargs(
-                            [ti for _v, ti in tile_data], None
+                            [ti for _v, ti in tile_data], None,
+                            abs_tol_um=abs_tol_um,
                         ),
                     )
 
