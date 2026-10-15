@@ -1208,8 +1208,16 @@ class StitchingDialog(PersistentDialog):
         self._reg_binning_xy_combo = QComboBox()
         for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
             self._reg_binning_xy_combo.addItem(_label, _value)
+        from flamingo_stitcher.pipeline import (
+            REFERENCE_Z_STEP_UM as _REF_Z_UM,
+            REGISTRATION_OVERLAP_TARGET_PX as _OVERLAP_PX,
+        )
+
         self._reg_binning_xy_combo.setToolTip(
             "How much to bin tiles laterally for phase correlation.\n"
+            f"Applied AFTER the XY downsample, as a maximum: the run lowers it\n"
+            f"so the downsampled tile overlap keeps at least {_OVERLAP_PX} px\n"
+            "(the log shows the value used).\n"
             "Applied to BOTH X and Y — a lateral peak is one joint\n"
             "correlation, so splitting them further would not buy anything.\n\n"
             "Cost scales with the square of this: 2x is a quarter of the work\n"
@@ -1226,11 +1234,12 @@ class StitchingDialog(PersistentDialog):
             self._reg_binning_z_combo.addItem(_label, _value)
         self._reg_binning_z_combo.setToolTip(
             "How much to bin tiles axially for phase correlation, independent\n"
-            "of XY.\n\n"
+            "of XY.\n"
+            f"Not a plane count: each step means about {_REF_Z_UM:g} µm of Z, after\n"
+            f"the Z downsample, so it does not stack with it (1x = ~{_REF_Z_UM:g} µm,\n"
+            f"2x = ~{2 * _REF_Z_UM:g} µm; the log shows the binning used).\n\n"
             "This sets the FLOOR on Z precision: a shift can only be resolved\n"
-            "to about one binned voxel, so at the default 2x that is one raw\n"
-            "plane. The tile offsets this registration exists to fix are 3-6\n"
-            "frames, so there is not much headroom.\n\n"
+            "to about one binned voxel.\n\n"
             "1x doubles the correlation volume but is the cheapest way to\n"
             "improve Z alignment — it costs one axis, where lowering XY costs\n"
             "two. Use it before reaching for 'Refine Z alignment', which runs\n"
