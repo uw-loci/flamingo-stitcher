@@ -124,6 +124,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     preproc_group.add_argument(
+        "--intensity-adjustment",
+        choices=["off", "measure", "apply"],
+        default="off",
+        help=(
+            "Per-tile brightness matching, ported from BigStitcher's Intensity "
+            "Adjustment: fits output = a*input + b per tile from the "
+            "intensities overlapping tiles share. 'measure' logs the fit and "
+            "changes nothing; 'apply' uses it. Its parameters (BigStitcher's, "
+            "with BigStitcher's defaults) are per-microscope settings in the "
+            "Options tab."
+        ),
+    )
+    preproc_group.add_argument(
         "--flat-field",
         action="store_true",
         help="Apply BaSiC flat-field correction (requires basicpy)",
@@ -832,6 +845,7 @@ def main():
         illumination_fusion=args.illumination_fusion,
         split_illumination=args.split_illumination,
         tile_overlap_fusion=args.tile_overlap_fusion,
+        intensity_adjustment=args.intensity_adjustment,
         flat_field_correction=args.flat_field,
         destripe=args.destripe,
         destripe_fast=args.destripe_fast,

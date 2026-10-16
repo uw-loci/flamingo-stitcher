@@ -50,6 +50,7 @@ streaming copy dropping the frame-size arguments and loading cropped tiles at th
 | 11c | Z-refinement pass | `_refine_z_shifts` | `registration_z_refine` |
 | 12 | Multi-view rotation placement | `_tile_metadata_affine` → `_rotation_affine_zyx` | `multiview_fusion` |
 | 13 | Border QC (diagnostic) | `_run_border_qc_streaming` | `border_qc_enabled` |
+| 13a | Intensity adjustment (per-tile `a * v + b`, BigStitcher's method) | `_intensity_adjust_sims` → `intensity_adjust.py` | `intensity_adjustment` = `measure` (log only) or `apply` |
 | 14 | Tile-overlap fusion | `_fuse_channel` (multiview-stitcher) | `tile_overlap_fusion`, `content_based_fusion` |
 | 15 | Background zeroing | in the dask graph | `background_zero_enabled` |
 | 16 | Write + pyramid | format writers | `output_format` |
@@ -186,6 +187,7 @@ throughput line, never the per-tile rate.
 | Z refinement pass | `registration_z_refine` | Shipped, opt-in — a second pairwise pass at full Z resolution, ~2-3x registration time |
 | Tile-overlap fusion | `tile_overlap_fusion` | Shipped |
 | Content-based blending | `content_based_fusion` | Shipped |
+| Intensity adjustment | `intensity_adjustment` + `intensity_adjust_*` | Shipped, off by default. A port of BigStitcher's Intensity Adjustment, checked stage by stage against BigStitcher's own code (`tools/bigstitcher_intensity/`). Fits `output = a * input + b` per tile from the intensities overlapping tiles share, after registration and before tile-overlap fusion. **Measure only** logs every tile's `a` and `b` and fuses unchanged. Parameters and defaults are BigStitcher's, set per microscope in the Options tab. Like BigStitcher it uses every shared voxel, background included, and works on the tiles after the two illumination sides were merged, so it does not match one side against the other |
 | Background zeroing | `background_zero_enabled` | Shipped |
 | Border QC | `border_qc_enabled` | Shipped (diagnostic only). Its seam-alignment search is bounded by `border_qc_max_shift_px` (default 8); a shift AT the limit is a floor, not a measurement, and the report says so since v0.9.17 |
 | Deconvolution | `deconvolution_enabled` | Shipped, GPU Richardson-Lucy |

@@ -263,6 +263,76 @@ TUNABLES: Tuple[Tunable, ...] = (
             "this is the honest place to state what the stage can do."
         ),
     ),
+    # Intensity adjustment (BigStitcher's parameters and defaults). Used only
+    # when the main dialog's "Intensity adjustment" is Measure or Apply.
+    Tunable(
+        field="intensity_adjust_downsampling",
+        label="Intensity adjustment: sample spacing",
+        kind="float",
+        minimum=1.0,
+        maximum=64.0,
+        step=1.0,
+        decimals=1,
+        suffix=" native px",
+        help=(
+            "Overlapping tiles are compared on a grid this many native pixels "
+            "apart, in X, Y and Z. BigStitcher's default is 10. Larger is "
+            "faster with fewer samples; the time the fit took is in the log."
+        ),
+    ),
+    Tunable(
+        field="intensity_adjust_max_matches",
+        label="Intensity adjustment: samples kept per tile pair",
+        kind="int",
+        minimum=10,
+        maximum=1000000,
+        step=1000,
+        help=(
+            "Each pair of overlapping tiles is thinned at random (BigStitcher's "
+            "fixed seed, so a run is repeatable) to one fewer than this. "
+            "BigStitcher's default is 10000."
+        ),
+    ),
+    Tunable(
+        field="intensity_adjust_affine",
+        label="Intensity adjustment: fit scale as well as offset",
+        kind="bool",
+        minimum=0.0,
+        maximum=1.0,
+        step=1.0,
+        help=(
+            "On, each tile gets output = a * input + b. Off, only an offset "
+            "(a = 1). BigStitcher's default is on."
+        ),
+    ),
+    Tunable(
+        field="intensity_adjust_offset_regularization",
+        label="Intensity adjustment: pull toward offset-only",
+        kind="fraction",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        decimals=2,
+        help=(
+            "How strongly the fitted scale is pulled toward an offset-only fit "
+            "(0 = pure scale + offset fit, 1 = offset only). BigStitcher's "
+            "default is 0.1."
+        ),
+    ),
+    Tunable(
+        field="intensity_adjust_identity_regularization",
+        label="Intensity adjustment: pull toward unchanged",
+        kind="fraction",
+        minimum=0.0,
+        maximum=1.0,
+        step=0.05,
+        decimals=2,
+        help=(
+            "How strongly every tile is pulled toward no change (a = 1, b = 0). "
+            "Nothing is held fixed, so this is what keeps the whole mosaic from "
+            "drifting dark or bright. BigStitcher's default is 0.1."
+        ),
+    ),
 )
 
 TUNABLE_FIELDS: Tuple[str, ...] = tuple(t.field for t in TUNABLES)

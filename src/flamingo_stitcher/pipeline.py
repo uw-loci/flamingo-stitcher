@@ -115,6 +115,12 @@ _CONFIG_FIELD_ORDER = (
     "destripe_fast",
     "deconvolution_enabled",
     "content_based_fusion",
+    "intensity_adjustment",
+    "intensity_adjust_downsampling",
+    "intensity_adjust_max_matches",
+    "intensity_adjust_affine",
+    "intensity_adjust_offset_regularization",
+    "intensity_adjust_identity_regularization",
     "downsample_xy",
     "downsample_z",
     "skip_registration",
@@ -1452,6 +1458,19 @@ class StitchingConfig:
     # multiview-stitcher's weights.content_based().  Increases computation
     # time but improves fusion quality in overlap regions with uneven content.
     content_based_fusion: bool = False
+
+    # Per-tile intensity adjustment -- a port of BigStitcher's "Intensity
+    # Adjustment" (see intensity_adjust.py, validated against BigStitcher's
+    # own code). Fits ``v * a + b`` per tile from the intensities overlapping
+    # tiles share, so correctly placed tiles stop meeting at a brightness
+    # step. "off" | "measure" (fit and log, change nothing) | "apply".
+    intensity_adjustment: str = "off"
+    # BigStitcher's parameters, with BigStitcher's defaults.
+    intensity_adjust_downsampling: float = 10.0  # grid step, in NATIVE xy pixels
+    intensity_adjust_max_matches: int = 10000  # per tile pair, after thinning
+    intensity_adjust_affine: bool = True  # scale + offset; False = offset only
+    intensity_adjust_offset_regularization: float = 0.1  # pull toward offset-only
+    intensity_adjust_identity_regularization: float = 0.1  # pull toward unchanged
 
     # Tile-overlap fusion method — how overlapping tiles are combined.
     #   "blend" : weighted-average (cosine) blending — seamless on dense,
@@ -3599,6 +3618,25 @@ def _detail_weights(plane_a, plane_b, sigma_1: float = 5.0, sigma_2: float = 11.
         out[: wa.shape[0], : wa.shape[1]] = wa[:h, :w]
         wa = out
     return wa
+
+
+def _index_to_world_px_affine(sim, transform_key, native_px_um):
+    """3x4 affine: voxel index (x, y, z) -> world position in NATIVE xy pixels
+    (x, y, z), the frame BigStitcher's intensity adjustment works in."""
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    m = np.asarray(si_utils.get_affine_from_sim(sim, transform_key), dtype=np.float64)
+    if m.ndim == 3:
+        m = m[0]
+    spacing = si_utils.get_spacing_from_sim(sim, asarray=True)  # z, y, x
+    origin = si_utils.get_origin_from_sim(sim, asarray=True)
+    lin = m[:3, :3] @ np.diag(spacing)  # index (zyx) -> world um (zyx)
+    off = m[:3, :3] @ origin + m[:3, 3]
+    rev = [2, 1, 0]
+    a = np.zeros((3, 4))
+    a[:, :3] = lin[np.ix_(rev, rev)] / native_px_um
+    a[:, 3] = off[rev] / native_px_um
+    return a
 
 
 def fuse_illumination_sides(
@@ -9897,6 +9935,11 @@ class StitchingPipeline:
 
         sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
 
+        if getattr(self.config, "intensity_adjustment", "off") in ("measure", "apply"):
+            sims = self._intensity_adjust_sims(
+                sims, tile_data, voxel_size_um, transform_key
+            )
+
         fuse_kwargs: Dict[str, Any] = dict(
             transform_key=transform_key,
             output_chunksize=self._fuse_chunksize(tile_data),
@@ -9945,6 +9988,96 @@ class StitchingPipeline:
                     )
 
         return sims, fuse_kwargs
+
+    def _intensity_adjust_sims(self, sims, tile_data, voxel_size_um, transform_key):
+        """Fit (and, in "apply" mode, apply) BigStitcher's per-tile intensity
+        mapping on the tiles as they are placed for fusion.
+
+        Cached per channel: the streaming path rebuilds fusion inputs for every
+        output region, and the fit depends only on the tiles and placement.
+        """
+        from flamingo_stitcher import intensity_adjust as ia
+        from flamingo_stitcher.center_out import tile_label
+
+        mode = self.config.intensity_adjustment
+        key = (transform_key, tuple(id(v) for v, _ in tile_data))
+        cache = self.__dict__.setdefault("_intensity_adjust_cache", {})
+        result = cache.get(key)
+        if result is None:
+            native_px = float(voxel_size_um["x"]) / max(
+                1, int(self.config.downsample_xy or 1)
+            )
+            views = [
+                ia.View(
+                    data=volume,
+                    affine=_index_to_world_px_affine(sim, transform_key, native_px),
+                )
+                for sim, (volume, _ti) in zip(sims, tile_data)
+            ]
+            params = ia.IntensityAdjustParams(
+                downsampling=float(self.config.intensity_adjust_downsampling),
+                max_matches=int(self.config.intensity_adjust_max_matches),
+                affine=bool(self.config.intensity_adjust_affine),
+                offset_regularization=float(
+                    self.config.intensity_adjust_offset_regularization
+                ),
+                identity_regularization=float(
+                    self.config.intensity_adjust_identity_regularization
+                ),
+            )
+            t0 = time.time()
+            try:
+                result = ia.compute(views, params)
+            except Exception as e:  # never fail a stitch over this
+                self.logger.warning(
+                    f"  Intensity adjustment skipped: {e}. Tiles fused unchanged."
+                )
+                cache[key] = False
+                return sims
+            cache[key] = result
+            self._log_intensity_adjustment(
+                result, params, tile_data, native_px, time.time() - t0, tile_label
+            )
+        if result is False or mode != "apply":
+            return sims
+        return [
+            sim.copy(data=ia.apply_uint16(sim.data, float(a), float(b)))
+            for sim, a, b in zip(sims, result.scale, result.offset)
+        ]
+
+    def _log_intensity_adjustment(
+        self, result, params, tile_data, native_px, elapsed, tile_label
+    ):
+        n_pairs = sum(1 for b, _ in result.pair_counts.values() if b)
+        n_before = sum(b for b, _ in result.pair_counts.values())
+        n_after = sum(a for _, a in result.pair_counts.values())
+        mode = self.config.intensity_adjustment
+        self.logger.info(
+            f"  Intensity adjustment ({mode}; BigStitcher method): "
+            f"{n_pairs} overlapping tile pairs, {n_before:,} shared samples on a "
+            f"{params.downsampling:g}-native-px grid "
+            f"({params.downsampling * native_px:.1f} um), thinned to {n_after:,} "
+            f"(at most {params.max_matches - 1} per pair); "
+            f"{'scale + offset' if params.affine else 'offset only'}, regularization "
+            f"toward offset-only {params.offset_regularization:g}, toward "
+            f"unchanged {params.identity_regularization:g}; {elapsed:.1f} s."
+        )
+        self.logger.info(
+            f"    Every offset shifted by {-result.min_offset:+.1f} so the smallest "
+            f"is 0 (BigStitcher does the same). Per tile, output = a * input + b:"
+        )
+        for i, ((_v, ti), a, b, c) in enumerate(
+            zip(tile_data, result.scale, result.offset, result.connected)
+        ):
+            self.logger.info(
+                f"    {tile_label(ti, i):>12s}  a={a:7.4f}  b={b:9.1f}"
+                + ("" if c else "   (no overlap: unchanged)")
+            )
+        if mode == "measure":
+            self.logger.info(
+                "    Measure only: tiles are fused UNCHANGED. Set Intensity "
+                "adjustment to Apply to use these."
+            )
 
     def _fuse_channel(
         self,

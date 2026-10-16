@@ -1162,6 +1162,35 @@ class StitchingDialog(PersistentDialog):
         )
         proc_layout.addWidget(self._tiff_pyramids_cb, 1, 3)
 
+        # Proc Row 7 (added below, with the fusion rows): per-tile intensity
+        # adjustment (BigStitcher's method).
+        self._intensity_adjust_combo = QComboBox()
+        for label, value in (
+            ("Off", "off"),
+            ("Measure only", "measure"),
+            ("Apply", "apply"),
+        ):
+            self._intensity_adjust_combo.addItem(label, value)
+        self._intensity_adjust_combo.setToolTip(
+            "Per-tile brightness matching, ported from BigStitcher's Intensity\n"
+            "Adjustment and checked against BigStitcher's own code.\n\n"
+            "Fits output = a × input + b for each tile from the intensities\n"
+            "that overlapping tiles share, so correctly placed tiles stop\n"
+            "meeting at a brightness step (laser drift over a long run,\n"
+            "bleaching of each overlap by the tile that imaged it first).\n\n"
+            "Measure only: logs a and b for every tile and fuses unchanged.\n"
+            "Apply: fuses the adjusted tiles.\n\n"
+            "Works on the tiles after registration, before tile fusion.\n"
+            "Its parameters (BigStitcher's, with BigStitcher's defaults)\n"
+            "are per-microscope settings in the Options tab."
+        )
+        _ia_box = QHBoxLayout()
+        _ia_box.setContentsMargins(0, 0, 0, 0)
+        _ia_box.addWidget(QLabel("Intensity adjustment:"))
+        _ia_box.addWidget(self._intensity_adjust_combo)
+        _ia_box.addStretch()
+        proc_layout.addLayout(_ia_box, 7, 0, 1, 4)
+
         # Registration gets its own titled box. Previously its controls were
         # spread across the shared grid with each combo stretched to the right
         # edge, so "Reg. binning:" sat a hand's width from the dropdown it
@@ -1463,9 +1492,9 @@ class StitchingDialog(PersistentDialog):
             "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
             "single-pixel steps."
         )
-        proc_layout.addWidget(self._border_qc_cb, 7, 0)
+        proc_layout.addWidget(self._border_qc_cb, 8, 0)
         self._border_qc_label = QLabel("QC detail:")
-        proc_layout.addWidget(self._border_qc_label, 7, 1)
+        proc_layout.addWidget(self._border_qc_label, 8, 1)
         self._border_qc_mode_combo = QComboBox()
         self._border_qc_mode_combo.addItem("MIP length (fast)", "mip")
         self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
@@ -1475,7 +1504,7 @@ class StitchingDialog(PersistentDialog):
             "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
             "Pairs only: just the list of offending tile pairs."
         )
-        proc_layout.addWidget(self._border_qc_mode_combo, 7, 2)
+        proc_layout.addWidget(self._border_qc_mode_combo, 8, 2)
 
         self._reg_report_cb = QCheckBox("Registration report")
         self._reg_report_cb.setChecked(True)
@@ -1490,12 +1519,12 @@ class StitchingDialog(PersistentDialog):
             "Stays on even with Skip registration — the report then says the tiles\n"
             "were never registered, which is the thing worth knowing."
         )
-        proc_layout.addWidget(self._reg_report_cb, 7, 3)
+        proc_layout.addWidget(self._reg_report_cb, 8, 3)
 
         # Proc Row 6: Legend
         legend = QLabel("\u2731 = significantly increases processing time")
         legend.setStyleSheet("color: #FF8C00; font-style: italic; font-size: 11px;")
-        proc_layout.addWidget(legend, 8, 0, 1, 4)
+        proc_layout.addWidget(legend, 9, 0, 1, 4)
 
         self._proc_widget.setLayout(proc_layout)
         self._proc_widget.setVisible(False)
@@ -3272,6 +3301,7 @@ class StitchingDialog(PersistentDialog):
         config.downsample_z = self._downsample_z_combo.currentData()
         config.deconvolution_enabled = self._deconv_cb.isChecked()
         config.content_based_fusion = self._content_fusion_cb.isChecked()
+        config.intensity_adjustment = self._intensity_adjust_combo.currentData()
         config.skip_registration = self._skip_reg_cb.isChecked()
         config.max_registration_shift_um = float(self._max_reg_shift_spin.value())
         config.max_registration_shift_z_um = float(self._max_reg_shift_z_spin.value())
@@ -3603,6 +3633,7 @@ class StitchingDialog(PersistentDialog):
         combo_fields = [
             ("illumination_fusion", self._fusion_combo),
             ("tile_overlap_fusion", self._tile_fusion_combo),
+            ("intensity_adjustment", self._intensity_adjust_combo),
             ("downsample_xy", self._downsample_xy_combo),
             ("downsample_z", self._downsample_z_combo),
             ("streaming_mode", self._streaming_combo),
@@ -6008,6 +6039,9 @@ class StitchingDialog(PersistentDialog):
         s.setValue("destripe_params_json", json.dumps(self._destripe_params))
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
+        s.setValue(
+            "intensity_adjustment", self._intensity_adjust_combo.currentData()
+        )
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
         s.setValue("package_ozx", self._ozx_cb.isChecked())
         s.setValue("tiff_pyramids", self._tiff_pyramids_cb.isChecked())
@@ -6156,6 +6190,11 @@ class StitchingDialog(PersistentDialog):
 
         content_fusion = s.value("content_based_fusion", False, type=bool)
         self._content_fusion_cb.setChecked(content_fusion)
+        _ia_idx = self._intensity_adjust_combo.findData(
+            s.value("intensity_adjustment", "off", type=str)
+        )
+        if _ia_idx >= 0:
+            self._intensity_adjust_combo.setCurrentIndex(_ia_idx)
 
         chunk_idx = s.value("chunk_size_idx", 2, type=int)
         if 0 <= chunk_idx < self._chunk_size_combo.count():
@@ -6337,6 +6376,9 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("destripe_params_json", json.dumps(self._destripe_params))
         s.setValue("deconvolution", self._deconv_cb.isChecked())
         s.setValue("content_based_fusion", self._content_fusion_cb.isChecked())
+        s.setValue(
+            "intensity_adjustment", self._intensity_adjust_combo.currentData()
+        )
         s.setValue("chunk_size_idx", self._chunk_size_combo.currentIndex())
         s.setValue("package_ozx", self._ozx_cb.isChecked())
         s.setValue("tiff_pyramids", self._tiff_pyramids_cb.isChecked())
@@ -6485,6 +6527,11 @@ class NativeStitchingDialog(StitchingDialog):
 
         content_fusion = s.value("content_based_fusion", False, type=bool)
         self._content_fusion_cb.setChecked(content_fusion)
+        _ia_idx = self._intensity_adjust_combo.findData(
+            s.value("intensity_adjustment", "off", type=str)
+        )
+        if _ia_idx >= 0:
+            self._intensity_adjust_combo.setCurrentIndex(_ia_idx)
 
         chunk_idx = s.value("chunk_size_idx", 2, type=int)
         if 0 <= chunk_idx < self._chunk_size_combo.count():
