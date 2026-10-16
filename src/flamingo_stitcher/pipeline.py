@@ -3620,6 +3620,40 @@ def _detail_weights(plane_a, plane_b, sigma_1: float = 5.0, sigma_2: float = 11.
     return wa
 
 
+# How many bands a tile is cut into for the logged brightness profiles. Sets
+# only the resolution of the log line, not anything the stitch does.
+_PROFILE_BANDS = 16
+# Planes read per tile per stage for its profile (spread over the stack), so
+# the diagnostic never holds a tile -- full-resolution tiles are tens of GB.
+_PROFILE_PLANES = 9
+
+
+def _band_profile(arr, axis: int, planes: Optional[int] = None) -> Optional[np.ndarray]:
+    """Mean brightness in ``_PROFILE_BANDS`` bands along ``axis`` of a (Z, Y, X)
+    or (Y, X) array, as % of the array's mean, from at most ``planes`` evenly
+    spaced Z planes (default ``_PROFILE_PLANES``)."""
+    a = arr
+    planes = planes or _PROFILE_PLANES
+    if a.ndim == 3:
+        idx = np.unique(np.linspace(0, a.shape[0] - 1, planes).round().astype(int))
+        a = np.stack([np.asarray(a[i], dtype=np.float32) for i in idx])
+    a = np.asarray(a, dtype=np.float32)
+    if a.ndim == 2:
+        a = a[None]
+    n = a.shape[axis]
+    if n < _PROFILE_BANDS:
+        return None
+    other = tuple(d for d in range(3) if d != (axis % 3))
+    line = a.mean(axis=other)
+    total = float(line.mean())
+    if total <= 0:
+        return None
+    edges = np.linspace(0, n, _PROFILE_BANDS + 1).round().astype(int)
+    return np.array(
+        [line[edges[k] : edges[k + 1]].mean() for k in range(_PROFILE_BANDS)]
+    ) * (100.0 / total)
+
+
 def _index_to_world_px_affine(sim, transform_key, native_px_um):
     """3x4 affine: voxel index (x, y, z) -> world position in NATIVE xy pixels
     (x, y, z), the frame BigStitcher's intensity adjustment works in."""
@@ -5380,6 +5414,7 @@ class StitchingPipeline:
             self.logger.info("Pipeline cancelled by user")
             return output_path
 
+        self._log_tile_profiles()
         # --- Step 3: Register using reference channel ---
         if self.config.skip_registration:
             self._progress_fn(_PCT_REGISTER, "Skipping registration (using stage positions)...")
@@ -5589,6 +5624,7 @@ class StitchingPipeline:
                 self.logger.warning(f"Registration report skipped: {exc}")
 
         elapsed = time.time() - t0
+        self._log_tile_profiles()
         self.logger.info(
             f"=== Pipeline complete in {elapsed:.1f}s === Output: {output_path}"
         )
@@ -5804,6 +5840,7 @@ class StitchingPipeline:
         # None = sides fused, which is what the registration path always
         # produces (it materialises the reference channel without a side).
         reg_reuse_side = None
+        self._log_tile_profiles()
         if self.config.skip_registration:
             self._progress_fn(_PCT_REGISTER, "Skipping registration (using stage positions)...")
             self.logger.info(
@@ -6401,6 +6438,7 @@ class StitchingPipeline:
                 self.logger.warning(f"Registration report skipped: {exc}")
 
         elapsed = time.time() - t0
+        self._log_tile_profiles()
         self.logger.info(
             f"=== Pipeline complete (streaming) in {elapsed:.1f}s === "
             f"Output: {output_path}"
@@ -6596,6 +6634,8 @@ class StitchingPipeline:
                     cancel_fn=self._cancelled_fn,
                 )
             illum_volumes[illum_side] = vol
+            if not shape_only:
+                self._record_profile(ch_id, f"raw side {illum_side}", vol, raw=True)
 
         if len(illum_volumes) > 1:
             self.logger.info(
@@ -6619,6 +6659,13 @@ class StitchingPipeline:
         _ff_model = self._flatfield_models.get(ch_id)
         if _ff_model is not None:
             volume = self._apply_flatfield_volume(volume, _ff_model)
+        if not shape_only:
+            self._record_profile(
+                ch_id,
+                "merged + flat-field" if _ff_model is not None else "merged",
+                volume,
+                raw=True,
+            )
 
         if self.config.depth_attenuation and not shape_only:
             from .depth_attenuation import correct_depth_attenuation
@@ -6677,6 +6724,8 @@ class StitchingPipeline:
             "flip_h" if self.config.camera_x_inverted else "identity"
         )
         volume = MosaicOrientation.from_name(ori_name).apply_volume_xy(volume)
+        if not shape_only:
+            self._record_profile(ch_id, "tile as stitched", volume, raw=False)
 
         return volume
 
@@ -9988,6 +10037,58 @@ class StitchingPipeline:
                     )
 
         return sims, fuse_kwargs
+
+    def _record_profile(self, ch_id, stage, volume, raw=True):
+        """Remember one tile's brightness profile along Y and X for a stage."""
+        try:
+            store = self.__dict__.setdefault("_tile_profiles", {})
+            per = store.setdefault(ch_id, {})
+            for axis_name, axis in (("Y", -2), ("X", -1)):
+                prof = _band_profile(volume, axis)
+                if prof is not None:
+                    per.setdefault((stage, axis_name), []).append(prof)
+        except Exception as e:  # a diagnostic must never fail a run
+            self.logger.debug(f"Brightness profile skipped: {e}")
+
+    def _log_tile_profiles(self):
+        """Log, once per channel, the median brightness across a tile at each
+        stage. A shape that is the same in every tile is what shows up in the
+        stitched output as a fade repeating with every tile; comparing stages
+        shows which step it first appears at."""
+        store = getattr(self, "_tile_profiles", None) or {}
+        done = self.__dict__.setdefault("_tile_profiles_logged", set())
+        for ch_id, per in store.items():
+            if ch_id in done or not per:
+                continue
+            done.add(ch_id)
+            model = self._flatfield_models.get(ch_id) if self._flatfield_models else None
+            n = max(len(v) for v in per.values())
+            self.logger.info(
+                f"  Brightness across a tile, channel {ch_id}: median of {n} tiles, "
+                f"each of {_PROFILE_BANDS} bands as % of that tile's mean, first "
+                f"row/column to last. Raw and merged are in the camera frame; "
+                f"'tile as stitched' is after downsample and tile orientation."
+            )
+            stages = []
+            for stage, _axis in per:
+                if stage not in stages:
+                    stages.append(stage)
+            for axis_name in ("Y", "X"):
+                rows = [(st, np.median(np.stack(per[(st, axis_name)]), axis=0))
+                        for st in stages if (st, axis_name) in per]
+                if model is not None:
+                    ff = _band_profile(
+                        np.asarray(model.flatfield, dtype=np.float32),
+                        -2 if axis_name == "Y" else -1,
+                    )
+                    if ff is not None:
+                        rows.append(("flat-field divisor", ff))
+                for st, prof in rows:
+                    self.logger.info(
+                        f"    along {axis_name}  {st:<22s} "
+                        + " ".join(f"{v:3.0f}" for v in prof)
+                        + f"   (range {prof.min():.0f}-{prof.max():.0f})"
+                    )
 
     def _intensity_adjust_sims(self, sims, tile_data, voxel_size_um, transform_key):
         """Fit (and, in "apply" mode, apply) BigStitcher's per-tile intensity
