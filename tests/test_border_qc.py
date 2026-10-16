@@ -456,3 +456,67 @@ class TestZAlignmentForPerTileZRanges:
         assert ca.shape == cb.shape, "alignment must reconcile the shapes"
         ragged = detect_border_steps(ca, cb, "x", W, params=params)
         assert ragged.flagged, "the same step must still be found on ragged tiles"
+
+
+# --------------------------------------------------------------------------- #
+# 2026-10-16: the seam alignment itself. Whitened phase correlation read a
+# 14 px misalignment of a smooth seam profile as 0 (it locks onto the
+# wrap-around edge), and a Hann window read 2, 3 and 5 px all as 1. Tiles are
+# crops of the sample -- linear shifts, not circular rolls -- so the tests below
+# crop, as the real data does.
+# --------------------------------------------------------------------------- #
+
+
+def _cropped_profiles(shift, n=150, noise=0.0, seed=0, smooth=None):
+    rng = _np.random.default_rng(seed)
+    if smooth is None:
+        from scipy import ndimage as nd
+
+        base = nd.gaussian_filter(rng.normal(0, 1, n + 40), 4.0) * 1000 + 3000
+    else:
+        base = _np.sin(_np.linspace(0, smooth, n + 40)) * 200 + 1000
+    a = base[10 : 10 + n].copy()
+    b = base[10 + shift : 10 + shift + n].copy()
+    if noise:
+        sd = noise * a.std()
+        a += rng.normal(0, sd, a.shape)
+        b += rng.normal(0, sd, b.shape)
+    return a[None], b[None]
+
+
+@pytest.mark.parametrize("shift", [-6, -3, 0, 2, 5, 7])
+def test_a_cropped_shift_is_measured_exactly(shift):
+    _, d1, clamped = _bq._phase_corr_int_shift(*_cropped_profiles(shift), 8)
+    assert d1 == shift and not clamped
+
+
+@pytest.mark.parametrize("shift", [2, 3, 5])
+def test_a_smooth_profile_is_measured_not_read_as_zero(shift):
+    a, b = _cropped_profiles(shift, n=40, smooth=7.0)
+    assert _bq._phase_corr_int_shift(a, b, 8)[1] == shift
+
+
+def test_noise_at_a_fifth_of_the_contrast_still_measures_every_shift():
+    for shift in (-6, -3, 0, 2, 5, 7):
+        for seed in range(5):
+            a, b = _cropped_profiles(shift, noise=0.2, seed=seed)
+            got = _bq._phase_corr_int_shift(a, b, 8, clip_sigma=3.0)[1]
+            assert got == shift, (shift, seed, got)
+
+
+def test_a_shift_past_the_window_on_cropped_data_is_clamped_not_shrunk():
+    _, d1, clamped = _bq._phase_corr_int_shift(*_cropped_profiles(14), 8)
+    assert clamped and d1 == 8
+
+
+def test_a_bright_patch_on_one_side_does_not_move_the_alignment():
+    a, b = _cropped_profiles(4)
+    b[0, 40:70] += 20000.0  # the kind of step QC exists to find
+    assert _bq._phase_corr_int_shift(a, b, 8, clip_sigma=3.0)[1] == 4
+
+
+def test_background_in_one_strip_is_left_out_of_the_alignment():
+    a, b = _cropped_profiles(3)
+    a[0, :50] = 0.0  # zeroed background on A only
+    got = _bq._phase_corr_int_shift(a, b, 8, clip_sigma=3.0, floor=0.0)[1]
+    assert got == 3

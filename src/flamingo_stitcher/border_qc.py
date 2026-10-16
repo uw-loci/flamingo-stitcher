@@ -125,40 +125,103 @@ def _moveaxis_last(vol, dim):
     return np.moveaxis(vol, dim, -1)
 
 
-def _phase_corr_int_shift(a2d, b2d, max_shift):
+
+
+def _typical(x, n_sigma, mask=None):
+    """True where ``x`` is within median ± ``n_sigma`` robust sigmas.
+
+    ``n_sigma`` is the detector's own ``beta``: a value that far from the strip's
+    typical level is what this module calls a step, so it is left out of the
+    alignment rather than allowed to pull it toward itself. A flat-field step
+    or saturated patch on one side otherwise outweighs the structure both
+    sides share (clipping it instead still left a 1 px bias).
+    """
+    vals = x[mask] if mask is not None and mask.any() else x
+    med = float(np.median(vals))
+    sigma = _robust_sigma(vals - med)
+    return np.abs(x - med) <= n_sigma * sigma
+
+
+def _phase_corr_int_shift(a2d, b2d, max_shift, clip_sigma=None, floor=None):
     """Integer (d0, d1, clamped) shift aligning ``b2d`` onto ``a2d``.
 
-    ``clamped`` is True when the peak landed at (or beyond) ``±max_shift`` on
-    either axis, i.e. the returned number is the SEARCH LIMIT and the true
-    misalignment is at least that large — not a measurement. Reporting a
-    clamped value as if it were measured is how a mosaic misaligned by an
-    unknown amount produced a tidy-looking "aligned shift: ds=8" for 57% of
-    its flagged seams.
+    ``np.roll(b2d, (d0, d1))`` lines ``b2d`` up with ``a2d``. ``clamped`` is
+    True when the best match lies at or beyond ``±max_shift`` on either axis:
+    the returned number is then the SEARCH LIMIT and the true misalignment is
+    at least that large -- not a measurement. Reporting a clamped value as if
+    it were measured is how a mosaic misaligned by an unknown amount produced
+    a tidy-looking "aligned shift: ds=8" for 57% of its flagged seams.
+
+    Masked normalised cross-correlation over the OVERLAP of the two strips,
+    not phase correlation. Two tiles' seam strips are crops of the sample
+    offset from each other -- a linear shift with an edge, never a circular
+    one -- and a seam profile is often smooth. Whitened phase correlation
+    locks onto the wrap-around edge there and reads 0 whatever the offset (a
+    14 px misalignment came back as 0); a Hann window instead leaves a
+    featureless profile nothing to lock onto (2, 3 and 5 px all read 1).
+    Scoring each candidate shift only over the samples both strips cover has
+    neither failure. The search runs past ``max_shift`` (to half the strip,
+    keeping at least half of it overlapping) so a shift beyond the window is
+    SEEN and reported as clamped rather than replaced by a smaller false peak.
     """
     if a2d.shape != b2d.shape or a2d.size == 0:
         return (0, 0, False)
     a = np.asarray(a2d, dtype=np.float64)
     b = np.asarray(b2d, dtype=np.float64)
-    a = a - a.mean()
-    b = b - b.mean()
-    if not np.any(a) or not np.any(b):
+    if a.ndim != 2 or not np.any(a - a.mean()) or not np.any(b - b.mean()):
         return (0, 0, False)
-    axes = tuple(range(a.ndim))
-    fa = np.fft.rfftn(a, axes=axes)
-    fb = np.fft.rfftn(b, axes=axes)
-    r = fa * np.conj(fb)
-    mag = np.abs(r)
-    mag[mag == 0] = 1e-12
-    corr = np.fft.irfftn(r / mag, s=a.shape, axes=axes)
-    peak = np.unravel_index(int(np.argmax(corr)), corr.shape)
-    shifts = []
-    clamped = False
-    for p, n in zip(peak, a.shape):
-        s = p if p <= n // 2 else p - n
-        if abs(s) >= max_shift:
-            clamped = True
-        s = int(np.clip(s, -max_shift, max_shift))
-        shifts.append(s)
+    # An axis along which neither strip varies at all cannot be measured; it
+    # is held at 0 rather than left to edge effects.
+    frozen = [
+        not (np.ptp(a, axis=d).any() or np.ptp(b, axis=d).any()) for d in (0, 1)
+    ]
+    # Only samples above background in BOTH strips are scored: a band one tile
+    # zeroed and the other did not would otherwise anti-correlate and push
+    # the alignment off. ``floor`` is the detector's own background level.
+    ma = np.ones(a.shape) if floor is None else (a > floor).astype(np.float64)
+    mb = np.ones(b.shape) if floor is None else (b > floor).astype(np.float64)
+    if clip_sigma:
+        ma = ma * _typical(a, float(clip_sigma), ma > 0)
+        mb = mb * _typical(b, float(clip_sigma), mb > 0)
+    a = a * ma
+    b = b * mb
+    shape = a.shape
+    pad = tuple(2 * n for n in shape)
+    axes = (0, 1)
+
+    def xc(u, v):
+        # out[s] = sum_r u[r] * v[r - s], linear (zero-padded, no wrap).
+        return np.fft.irfftn(
+            np.fft.rfftn(u, pad, axes=axes) * np.conj(np.fft.rfftn(v, pad, axes=axes)),
+            pad, axes=axes,
+        )
+
+    count = np.rint(xc(ma, mb))
+    n = np.maximum(count, 1.0)
+    sa, sb = xc(a, mb), xc(ma, b)
+    with np.errstate(invalid="ignore", divide="ignore"):
+        num = xc(a, b) - sa * sb / n
+        den = np.sqrt(
+            np.maximum(xc(a * a, mb) - sa * sa / n, 0)
+            * np.maximum(xc(ma, b * b) - sb * sb / n, 0)
+        )
+        ncc = np.where(den > 0, num / np.where(den > 0, den, 1), -np.inf)
+    # Signed shift of each padded index, and the candidates worth scoring.
+    s0 = np.fft.fftfreq(pad[0], 1.0 / pad[0]).astype(int)[:, None]
+    s1 = np.fft.fftfreq(pad[1], 1.0 / pad[1]).astype(int)[None, :]
+    lim0 = shape[0] // 2
+    lim1 = shape[1] // 2
+    ok = (np.abs(s0) <= (0 if frozen[0] else lim0)) & (
+        np.abs(s1) <= (0 if frozen[1] else lim1)
+    )
+    ok &= count >= 0.5 * min(ma.sum(), mb.sum())
+    ncc = np.where(ok, ncc, -np.inf)
+    if not np.isfinite(ncc).any():
+        return (0, 0, False)
+    peak = np.unravel_index(int(np.argmax(ncc)), ncc.shape)
+    shifts = [int(s0[peak[0], 0]), int(s1[0, peak[1]])]
+    clamped = any(abs(v) >= max_shift for v in shifts)
+    shifts = [int(np.clip(v, -max_shift, max_shift)) for v in shifts]
     return (shifts[0], shifts[1], clamped)
 
 
@@ -195,7 +258,7 @@ def _refine_overlap_width(a_border, b_border, w0, search):
     return min(near, key=lambda wt: (abs(wt - w0), wt))
 
 
-def _align_z(va, vb, ta, tb):
+def _align_z(va, vb, ta, tb, z0_um=None):
     """Crop two tile volumes to the Z range they physically share.
 
     The seam detector compares slabs plane index by plane index, which only
@@ -217,10 +280,14 @@ def _align_z(va, vb, ta, tb):
     # whatever Z downsample the volumes have already been through.
     span_a = float(ta.z_max_mm) - float(ta.z_min_mm)
     step_mm = (span_a / (za - 1)) if za > 1 and span_a > 0 else 0.0
+    # ``z0_um`` = each tile's placed first-plane depth (stage + registration);
+    # without it, the stage depths.
+    if z0_um is None:
+        z0_um = (float(ta.z_min_mm) * 1000.0, float(tb.z_min_mm) * 1000.0)
     if step_mm <= 0:
         offset = 0
     else:
-        offset = int(round((float(tb.z_min_mm) - float(ta.z_min_mm)) / step_mm))
+        offset = int(round((z0_um[1] - z0_um[0]) / (step_mm * 1000.0)))
     a0 = max(0, offset)
     b0 = max(0, -offset)
     common = min(za - a0, zb - b0)
@@ -250,6 +317,10 @@ def detect_border_steps(
 ) -> BorderStepResult:
     """Detect sharp intensity steps along the shared seam of two tiles.
 
+    ``geom_shift = (0, s)``: where the placement puts B along the seam, in px —
+    B's along-seam index ``s`` lands on A's index 0. Only the along-seam part
+    is used; Z is lined up by the caller (:func:`_align_z`).
+
     ``vol_a`` / ``vol_b`` are (Z, Y, X) arrays (numpy or dask/memmap). ``vol_a``
     is the lower-coordinate tile along ``axis`` ("x": B is to the right; "y": B
     is below; "z": B is above). Only the near-seam slab of each is materialized.
@@ -274,6 +345,25 @@ def detect_border_steps(
     D = min(D, a_last.shape[-1], b_last.shape[-1])
     a_slab = np.asarray(a_last[..., -D:], dtype=np.float32)  # seam at the end
     b_slab = np.asarray(b_last[..., :D], dtype=np.float32)  # seam at the start
+
+    # Line the two slabs up ALONG the seam where the placement says they sit
+    # (``geom_shift[1]``: B's row s is A's row 0), so the phase correlation
+    # below measures what is left over, not the placement itself. Rows only
+    # one tile covers after the shift are cropped rather than wrapped.
+    s_along = int(geom_shift[1]) if geom_shift else 0
+    if s_along:
+        n_along = a_slab.shape[1]
+        if abs(s_along) >= n_along:
+            return BorderStepResult(
+                flagged=False, axis=axis, overlap_px=W,
+                note="placement leaves no shared seam",
+            )
+        if s_along > 0:
+            a_slab = a_slab[:, : n_along - s_along]
+            b_slab = b_slab[:, s_along:]
+        else:
+            a_slab = a_slab[:, -s_along:]
+            b_slab = b_slab[:, : n_along + s_along]
 
     # Collapse Z (the first plane axis) in mip mode for x/y seams.
     collapse = p.mode == "mip" and axis in ("x", "y") and a_slab.shape[0] > 1
@@ -307,7 +397,14 @@ def detect_border_steps(
         if p.refine_shift and _ndi is not None:
             a_prof = a_ov.mean(axis=-1)  # (P0, P1)
             b_prof = b_ov.mean(axis=-1)
-            dz, ds, shift_clamped = _phase_corr_int_shift(a_prof, b_prof, search)
+            prof_vals = np.concatenate([a_prof.ravel(), b_prof.ravel()])
+            prof_vals = prof_vals[np.isfinite(prof_vals)]
+            floor = float(p.bg_abs_floor)
+            if prof_vals.size:
+                floor = max(floor, float(np.percentile(prof_vals, p.bg_percentile)))
+            dz, ds, shift_clamped = _phase_corr_int_shift(
+                a_prof, b_prof, search, clip_sigma=p.beta, floor=floor
+            )
             if dz or ds:
                 b_ov = np.roll(b_ov, shift=(dz, ds), axis=(0, 1))
         kk = max(1, int(round(W * p.k_frac)))
@@ -479,11 +576,64 @@ def _overlap_px(tile_a, tile_b, vol_a, axis, eff_pixel_um, eff_z_um):
     return int(round(overlap_um / voxel_um))
 
 
+def _placed_overlap_px(pa, pb, vol_a, axis, eff_pixel_um):
+    """(overlap across the seam, B's offset along it), in processing px."""
+    if axis == "x":
+        extent_um = vol_a.shape[2] * eff_pixel_um
+        gap_um = (pb.x_mm - pa.x_mm) * 1000.0
+        along_um = (pa.y_mm - pb.y_mm) * 1000.0
+    else:
+        extent_um = vol_a.shape[1] * eff_pixel_um
+        gap_um = (pb.y_mm - pa.y_mm) * 1000.0
+        along_um = (pa.x_mm - pb.x_mm) * 1000.0
+    return (
+        int(round((extent_um - gap_um) / eff_pixel_um)),
+        int(round(along_um / eff_pixel_um)),
+    )
+
+
 def _tile_name(tile) -> str:
+    """``X003 Y001`` — every tile of a single-workflow acquisition shares one
+    folder, so the folder name alone named both sides of every seam the same."""
+    from flamingo_stitcher.center_out import tile_label
+
+    label = tile_label(tile, 0)
     try:
-        return tile.folder.name
+        folder = tile.folder.name
     except Exception:
-        return str(getattr(tile, "folder", "?"))
+        folder = ""
+    if getattr(tile, "tile_index", None) is not None or not folder:
+        return label
+    return folder
+
+
+def position_key(tile) -> Tuple[float, float, float]:
+    """Stage identity of a tile, for matching registration rows to QC tiles."""
+    return (
+        round(float(tile.x_mm), 4),
+        round(float(tile.y_mm), 4),
+        round(float(tile.z_min_mm), 4),
+    )
+
+
+class _Placed:
+    """A tile's placement in the fused volume's frame, in µm.
+
+    The fused volume's X/Y can run opposite to the stage's (``reverse_x`` /
+    ``reverse_y``), and a registered run moves every tile off its stage
+    position. Seams have to be compared where the tiles were PUT: in stage
+    order, with the reversed-X scopes, every X seam compared the two tiles'
+    far edges, and on a registered run every seam reported the stage error the
+    registration had already removed.
+    """
+
+    __slots__ = ("x_mm", "y_mm", "z_um", "z_min_mm")
+
+    def __init__(self, tile, sign_x, sign_y, offset_um):
+        dz, dy, dx = offset_um or (0.0, 0.0, 0.0)
+        self.x_mm = sign_x * float(tile.x_mm) + dx / 1000.0
+        self.y_mm = sign_y * float(tile.y_mm) + dy / 1000.0
+        self.z_um = float(tile.z_min_mm) * 1000.0 + dz
 
 
 def run_border_qc(
@@ -498,12 +648,19 @@ def run_border_qc(
     params: BorderQCParams,
     logger=None,
     cancelled_fn=None,
+    reverse_x: bool = False,
+    reverse_y: bool = False,
+    offsets_um: Optional[Dict[Tuple[float, float, float], Tuple[float, float, float]]] = None,
 ) -> BorderQCReport:
     """Run border QC over neighbor pairs of the reference channel.
 
     ``channel_tile_data`` is ``{ch_id: [(volume, tile_info), ...]}`` (volumes are
     the preprocessed, downsampled (Z,Y,X) arrays). ``pixel_size_um`` /
     ``z_step_um`` are the EFFECTIVE (post-downsample) sizes.
+
+    ``reverse_x`` / ``reverse_y``: the fused volume's axis runs opposite to the
+    stage's, as in the pipeline config. ``offsets_um``: the registered (dz, dy,
+    dx) per tile, keyed by :func:`position_key`; None = stage positions.
     """
     t0 = time.monotonic()
     ch = reg_channel if reg_channel in channel_tile_data else (
@@ -521,6 +678,7 @@ def run_border_qc(
             "alpha": params.alpha,
             "beta": params.beta,
             "min_component_px": params.min_component_px,
+            "placement": "registered" if offsets_um else "stage positions",
         },
     )
     if ch is None:
@@ -530,7 +688,19 @@ def run_border_qc(
     entries = channel_tile_data[ch]
     vol_by_id = {id(t): v for (v, t) in entries}
     tiles_present = [t for (v, t) in entries]
-    pairs = find_neighbor_pairs(tiles_present, include_z=params.include_z_seams)
+    sx = -1.0 if reverse_x else 1.0
+    sy = -1.0 if reverse_y else 1.0
+    offsets_um = offsets_um or {}
+    placed = [
+        _Placed(t, sx, sy, offsets_um.get(position_key(t))) for t in tiles_present
+    ]
+    # Pair and order on the GRID (signed stage positions, no registration), so
+    # a registered shift can never re-pair tiles; "A is the lower coordinate"
+    # then holds in the fused frame, which is the frame the arrays are in.
+    grid = [_Placed(t, sx, sy, None) for t in tiles_present]
+    for g, t in zip(grid, tiles_present):
+        g.z_min_mm = float(t.z_min_mm)  # find_neighbor_pairs reads it for Z seams
+    pairs = find_neighbor_pairs(grid, include_z=params.include_z_seams)
 
     eff_um2 = pixel_size_um * pixel_size_um
     # Stage positions come from folder names quantized to ~0.01 mm, so the
@@ -554,16 +724,22 @@ def run_border_qc(
             continue
         # X/Y neighbours need not span the same Z (per-tile Z ranges), and the
         # detector compares plane-for-plane. Trim to what they share.
+        pa, pb = placed[ia], placed[ib]
         z_trim_a = 0
         if axis in ("x", "y"):
-            va, vb, z_trim_a = _align_z(va, vb, ta, tb)
+            va, vb, z_trim_a = _align_z(va, vb, ta, tb, (pa.z_um, pb.z_um))
             if va is None:
                 n_no_shared_z += 1
                 continue
         report.n_pairs_checked += 1
-        W = _overlap_px(ta, tb, va, axis, pixel_size_um, z_step_um)
+        if axis in ("x", "y"):
+            W, along = _placed_overlap_px(pa, pb, va, axis, pixel_size_um)
+        else:
+            W, along = _overlap_px(ta, tb, va, axis, pixel_size_um, z_step_um), 0
         try:
-            res = detect_border_steps(va, vb, axis, W, params=pair_params)
+            res = detect_border_steps(
+                va, vb, axis, W, params=pair_params, geom_shift=(0, along)
+            )
         except Exception as e:  # never let one pair kill the pass
             if logger is not None:
                 logger.debug(f"Border QC pair {_tile_name(ta)}<->{_tile_name(tb)} failed: {e}")
@@ -649,6 +825,14 @@ def format_report_text(report: BorderQCReport, *, acquisition: str = "") -> str:
         f" Thresholds: alpha={report.params.alpha:g}  beta={report.params.beta:g}  "
         f"min_component={report.params.min_component_px} px   "
         f"Elapsed: {report.elapsed_s:.1f} s"
+    )
+    lines.append(
+        f" Placement checked: {s.get('placement', 'stage positions')}"
+        + (
+            " (tiles where registration put them)"
+            if s.get("placement") == "registered"
+            else " (no registration applied)"
+        )
     )
     lines.append(" (Intra-tile illumination seams are not analyzed — tile-to-tile borders only.)")
     # Headline the clamp count. A run where most shifts hit the search limit is

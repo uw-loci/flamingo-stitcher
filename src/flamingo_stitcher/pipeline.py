@@ -60,6 +60,14 @@ REGISTRATION_OVERLAP_TARGET_PX = 32
 # the correlated volume. The intent is physical; the binning is derived from it.
 REFERENCE_Z_STEP_UM = 10.0
 
+# PyImarisWriter's RAM on top of the pipeline's own peak, as a fraction of the
+# uncompressed output. NOT MEASURED: carried over from the initial extraction
+# (2026-06-08) with no record behind it. On 2026-10-16 it alone refused a
+# full-resolution 825 GB Imaris run (58.6 GB projected + 206 GB assumed, vs
+# 180 GB available). `_log_memory_summary` logs the measured figure for every
+# Imaris run so this can be replaced by data.
+IMARIS_WRITER_RAM_FRACTION_ASSUMED = 0.25
+
 
 # Fields re-derived from the acquisition itself. A shared configuration records
 # them for provenance but must never apply them: they describe THIS data, and
@@ -4627,6 +4635,11 @@ class StitchingPipeline:
             metric="private",
         )
         self._memory_monitor.start()
+        self._watchdog_projection = {
+            "projected_gb": projected_gb,
+            "output_gb": float(mem_est.get("output_gb", 0.0)),
+            "mode": mode,
+        }
         self.logger.info(
             f"Memory watchdog armed: warn if working-set memory exceeds "
             f"{threshold_gb:.1f} GB (projected {projected_gb:.1f} × {margin:g}"
@@ -4639,7 +4652,45 @@ class StitchingPipeline:
                 self._memory_monitor.stop()
             except Exception:
                 pass
+            try:
+                self._log_memory_summary(self._memory_monitor)
+            except Exception as e:  # a summary must never fail a run
+                self.logger.debug(f"Memory summary skipped: {e}")
             self._memory_monitor = None
+
+    def _log_memory_summary(self, monitor):
+        """What each phase actually allocated, next to what was projected.
+
+        Every memory number the pre-flight uses is a projection, and the
+        Imaris writer's is an outright assumption. Without this line a run
+        that fits says nothing, so the projections never get checked against
+        the machine they run on.
+        """
+        gib = 1024**3
+        proj = getattr(self, "_watchdog_projection", None) or {}
+        phases = monitor.phase_peaks_delta()
+        if not phases and not monitor.peak_delta_bytes:
+            return
+        order = ["discover", "preprocess", "register", "fuse", "write"]
+        names = sorted(phases, key=lambda p: (order.index(p) if p in order else 99, p))
+        parts = ", ".join(f"{p} {phases[p] / gib:.1f}" for p in names)
+        self.logger.info(
+            f"Memory used (private allocation, GB, peak per phase): {parts}; "
+            f"run peak {monitor.peak_delta_bytes / gib:.1f} vs projected "
+            f"{float(proj.get('projected_gb', 0.0)):.1f} ({proj.get('mode', '?')}). "
+            f"Memory-mapped scratch resident at peak: "
+            f"{monitor.peak_mapped_bytes / gib:.1f} GB (disk-backed, not counted)."
+        )
+        output_gb = float(proj.get("output_gb", 0.0))
+        if self.config.output_format == "imaris" and output_gb > 0 and "write" in phases:
+            write_gb = phases["write"] / gib
+            self.logger.info(
+                f"Imaris writer, measured: the write phase peaked at {write_gb:.1f} GB "
+                f"for a {output_gb:.1f} GB output = {write_gb / output_gb:.1%} of the "
+                f"output (the pre-flight assumes "
+                f"{IMARIS_WRITER_RAM_FRACTION_ASSUMED:.0%}). Includes whatever the run "
+                f"still held from fusion when the write began."
+            )
 
     def _build_estimator(self, tiles, acquisition_dir=None, output_dir=None):
         """Construct the multi-phase estimator from tiles + config.
@@ -4743,6 +4794,25 @@ class StitchingPipeline:
         for path in written.values():
             self.logger.info(f"  Wrote {path}")
 
+    def _border_qc_offsets_um(self):
+        """Registered (dz, dy, dx) µm per tile, keyed for border QC; None when
+        the tiles sit at their stage positions (skipped, refused, failed).
+
+        QC must check the placement that is written. Before 0.13.10 it always
+        checked the stage positions, so a registered run printed the same
+        flagged seams, to the pixel, as the same data with registration off.
+        """
+        from flamingo_stitcher import border_qc
+
+        report = getattr(self, "_registration_report", None)
+        if report is None or not report.ran or not report.applied:
+            return None
+        offsets = {}
+        for row in report.tiles:
+            key = border_qc.position_key(row)
+            offsets[key] = (float(row.dz_um), float(row.dy_um), float(row.dx_um))
+        return offsets or None
+
     def _run_border_qc(
         self, channel_tile_data, tiles, acquisition_dir, voxel_size_um, output_path
     ):
@@ -4765,6 +4835,9 @@ class StitchingPipeline:
             params=params,
             logger=self.logger,
             cancelled_fn=self._cancelled_fn,
+            reverse_x=bool(getattr(self.config, "reverse_x_tiles", False)),
+            reverse_y=bool(getattr(self.config, "reverse_y_tiles", False)),
+            offsets_um=self._border_qc_offsets_um(),
         )
         acq_name = Path(acquisition_dir).name or "acquisition"
         text = border_qc.format_report_text(report, acquisition=acq_name)
@@ -5185,11 +5258,12 @@ class StitchingPipeline:
                 _avail_gb = 0.0
             _ram_frac = float(getattr(self.config, "resource_guard_ram_fraction", 0.95))
             # Match _enforce_resource_limits, which adds PyImarisWriter scratch
-            # (~0.25x output) to the peak for imaris output — otherwise the
+            # (IMARIS_WRITER_RAM_FRACTION_ASSUMED x output) to the peak for
+            # imaris output — otherwise the
             # fallback can pick streaming believing it fits, then the guard
             # aborts anyway.
             _imaris_extra = (
-                0.25 * float(mem_est.get("output_gb", 0.0))
+                IMARIS_WRITER_RAM_FRACTION_ASSUMED * float(mem_est.get("output_gb", 0.0))
                 if self.config.output_format == "imaris"
                 else 0.0
             )
@@ -11125,11 +11199,14 @@ class StitchingPipeline:
             # output size on top of our own peak. Block reads are file I/O
             # from the fused memmap, not dask graph recomputes, so write
             # time is roughly output_gb ÷ writer_throughput.
-            ims_overhead_gb = output_gb * 0.25
+            ims_overhead_gb = output_gb * IMARIS_WRITER_RAM_FRACTION_ASSUMED
             self.logger.info(
                 f"Imaris writer overhead: ~{ims_overhead_gb:.0f} GB "
                 f"(PyImarisWriter block cache + pyramid buffers, "
-                f"added on top of pipeline peak)"
+                f"added on top of pipeline peak). ASSUMED, not measured: "
+                f"{IMARIS_WRITER_RAM_FRACTION_ASSUMED:.0%} of the {output_gb:.0f} GB "
+                f"output. The memory summary at the end of the run logs what the "
+                f"write actually used."
             )
             if _psutil is not None:
                 combined = peak + ims_overhead_gb
@@ -11283,7 +11360,7 @@ class StitchingPipeline:
             mem_est.get("streaming_gb" if use_streaming else "in_memory_gb", 0.0)
         )
         if self.config.output_format == "imaris":
-            peak_gb += output_gb * 0.25  # PyImarisWriter scratch (see _log_preflight)
+            peak_gb += output_gb * IMARIS_WRITER_RAM_FRACTION_ASSUMED
         try:
             avail_ram_gb = _psutil.virtual_memory().available / (1024**3)
         except Exception:
