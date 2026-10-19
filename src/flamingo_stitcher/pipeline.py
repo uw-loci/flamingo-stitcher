@@ -5840,7 +5840,6 @@ class StitchingPipeline:
         # None = sides fused, which is what the registration path always
         # produces (it materialises the reference channel without a side).
         reg_reuse_side = None
-        self._log_tile_profiles()
         if self.config.skip_registration:
             self._progress_fn(_PCT_REGISTER, "Skipping registration (using stage positions)...")
             self.logger.info(
@@ -5899,6 +5898,10 @@ class StitchingPipeline:
                 self.logger.info("Pipeline cancelled by user")
                 return output_path
 
+            # Streaming loads tiles here, not before Step 3 as in-memory does;
+            # logged earlier the store was still empty and the block only
+            # appeared at the very end of a multi-hour run.
+            self._log_tile_profiles()
             self._progress_fn(_PCT_REGISTER, f"Registering tiles (channel {ref_ch})...")
             self.logger.info(
                 f"Step 3: Registering on reference channel {ref_ch} "
@@ -6597,6 +6600,9 @@ class StitchingPipeline:
         if illum_side is not None and illum_side in illum_files:
             illum_files = {illum_side: illum_files[illum_side]}
 
+        if shape_only:
+            return self._preprocessed_shape_stub(tile, illum_files)
+
         # Destripe runs PER ILLUMINATION SIDE, BEFORE fusion (below): stripe
         # artifacts originate independently in each light-sheet path, so fusing
         # first and destriping the combined tile mixes two different stripe
@@ -6728,6 +6734,36 @@ class StitchingPipeline:
             self._record_profile(ch_id, "tile as stitched", volume, raw=False)
 
         return volume
+
+    def _preprocessed_shape_stub(self, tile: RawTileInfo, illum_files) -> np.ndarray:
+        """A zero-cost array with the shape preprocessing would produce.
+
+        Skipping the filters was not enough: the probe still merged both sides
+        and downsampled the whole tile. On the 2026-10-18 full-Z run that was
+        3 minutes of reading 50 GB to learn a tuple. Only the downsample and the
+        orientation change the shape, so they are worked out on one plane and a
+        zero-stride view: the same code, so the same rounding and transposes.
+        """
+        from scipy.ndimage import zoom
+
+        from flamingo_stitcher.orientation import MosaicOrientation
+
+        vol = load_tile_volume(
+            next(iter(illum_files.values())),
+            tile.n_planes, tile.frame_width, tile.frame_height,
+        )
+        z, h, w = vol.shape
+        fxy = int(self.config.downsample_xy or 1)
+        fz = int(self.config.downsample_z or 1)
+        if fz > 1:
+            z = max(1, int(round(z / fz)))
+        if fxy > 1:
+            h, w = zoom(np.zeros((h, w), np.float32), 1.0 / fxy, order=1).shape
+        ori_name = self.config.tile_orientation or (
+            "flip_h" if self.config.camera_x_inverted else "identity"
+        )
+        stub = np.broadcast_to(np.zeros((), dtype=np.uint16), (z, h, w))
+        return MosaicOrientation.from_name(ori_name).apply_volume_xy(stub)
 
     def _output_channel_units(
         self, tiles: List[RawTileInfo], process_channels: List[int]
@@ -6923,10 +6959,25 @@ class StitchingPipeline:
 
         total = _time.time() - t_started
         if completed:
+            # Both rates: the spill alone read "0.0 GB/s" on a run that was
+            # reading 0.24 GB/s of raw data (246 GB written, 1968 GB read).
+            read_bytes = 0
+            for _, t in active:
+                files = t.raw_files.get(ch_id, {})
+                if illum_side is not None and illum_side in files:
+                    files = {illum_side: files[illum_side]}
+                for f in files.values():
+                    try:
+                        read_bytes += Path(f).stat().st_size
+                    except OSError:
+                        pass
+            secs = max(total, 0.001)
+            rates = f"wrote {spill_bytes / (1024**3) / secs:.2f} GB/s"
+            if read_bytes:
+                rates = f"read {read_bytes / (1024**3) / secs:.2f} GB/s, " + rates
             self.logger.info(
                 f"  Preprocessed {completed} tiles in {total:.1f}s "
-                f"({total / completed:.1f}s/tile avg, "
-                f"{spill_bytes / (1024**3) / max(total, 0.001):.1f} GB/s)"
+                f"({total / completed:.1f}s/tile avg; {rates})"
             )
 
         # Return in original tile order so fusion sees tiles in the same
@@ -8074,12 +8125,30 @@ class StitchingPipeline:
                 )
 
         if effective != configured:
+            # Say why per axis: the two rules are different, and one sentence
+            # about overlap pixels used to explain a Z change it had no part in.
+            why = []
+            if effective.get("z") != configured.get("z"):
+                z_voxel = float((voxel_size_um or {}).get("z", 0.0) or 0.0)
+                if z_voxel > 0:
+                    want = max(1, int(configured.get("z") or 1))
+                    why.append(
+                        f"Z {configured.get('z')} means ~{want * REFERENCE_Z_STEP_UM:g} µm "
+                        f"of Z (each step = {REFERENCE_Z_STEP_UM:g} µm, the step it was "
+                        f"tuned at), so {effective['z']} planes of {z_voxel:g} µm "
+                        f"= {effective['z'] * z_voxel:.1f} µm"
+                    )
+                else:
+                    why.append("Z discounted by the Z downsample already applied")
+            if any(effective.get(a) != configured.get(a) for a in ("y", "x")):
+                why.append(
+                    f"XY lowered to keep about {REGISTRATION_OVERLAP_TARGET_PX} px "
+                    f"of tile overlap to correlate on; the configured value is "
+                    f"against native tiles and these are already downsampled"
+                )
             self.logger.info(
                 f"  Registration binning {dict(configured)} -> {effective}: "
-                f"binned to keep about {REGISTRATION_OVERLAP_TARGET_PX} px of "
-                f"tile overlap to correlate on. The configured value is against "
-                f"native tiles, and these are already downsampled, so applying "
-                f"it as-is would multiply.{thin}"
+                + "; ".join(why) + f".{thin}"
             )
         elif thin:
             self.logger.warning(f"  Registration overlap is thin.{thin}")

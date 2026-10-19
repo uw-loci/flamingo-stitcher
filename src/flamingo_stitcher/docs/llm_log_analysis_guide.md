@@ -280,12 +280,14 @@ would leave a 77 px strip where 38 px already registered 11 of 12 seams — 4x t
 registration cost for margin the evidence says is not needed.
 
     Registration binning {'z': 2, 'y': 4, 'x': 4} -> {'z': 2, 'y': 1, 'x': 1}:
-    binned to keep about 32 px of tile overlap to correlate on. ...
+    XY lowered to keep about 32 px of tile overlap to correlate on; ...
 
 If even unbinned is under 16 px the run warns and names the number. That means
 **lower the XY downsample** — no binning setting can recover overlap the
-downsample already threw away. Z has no overlap to measure on an XY mosaic, so
-its binning is simply discounted by the Z downsample already applied.
+downsample already threw away. Z follows a different rule: each step of the Z
+setting means ~10 µm of Z (the step it was tuned at), so at a 2.5 µm step `z: 1`
+becomes 4 planes, and the log line says so. The finest Z the main pass can
+register at is therefore ~10 µm, whatever the acquisition's step.
 
 **Note on `pruned`.** It does NOT mean the seam failed: `STATUS_PRUNED` is
 "survived quality, dropped by edge pruning" — measured fine (0.89-0.95 in the run

@@ -121,3 +121,40 @@ class TestTheExpensiveStagesAreSkipped:
         full = pipe._preprocess_single_tile(tiles[0], 1).shape
         probe = pipe._preprocess_single_tile(tiles[0], 1, shape_only=True).shape
         assert probe == full
+
+
+class TestTheProbeReadsNoPixels:
+    """2026-10-18: the probe still merged both sides and downsampled a full
+    2999-plane tile, 3 minutes for a tuple. It now works the shape out from
+    one plane and a zero-stride view."""
+
+    @pytest.fixture
+    def two_sided(self, tmp_path):
+        acq = write_synth_acquisition(
+            tmp_path / "acq2", grid=(2, 1), n_planes=9, channels=(1,),
+            illum_sides=(0, 1), frame_size=(30, 34),
+        )
+        return discover_tiles(acq)
+
+    @pytest.mark.parametrize("ori", ["identity", "flip_h", "transpose", "rot90", "rot180"])
+    @pytest.mark.parametrize("ds", [(1, 1), (2, 1), (3, 2), (1, 4)])
+    def test_same_shape_as_the_real_thing(self, two_sided, ori, ds):
+        pipe = _pipe(downsample_xy=ds[0], downsample_z=ds[1], tile_orientation=ori)
+        full = pipe._preprocess_single_tile(two_sided[0], 1).shape
+        probe = pipe._preprocess_single_tile(two_sided[0], 1, shape_only=True).shape
+        assert probe == full
+
+    def test_no_merge_and_no_downsample(self, two_sided, monkeypatch):
+        import flamingo_stitcher.pipeline as mod
+
+        calls = []
+        monkeypatch.setattr(
+            mod, "fuse_illumination_sides", lambda *a, **k: calls.append("fuse")
+        )
+        monkeypatch.setattr(
+            mod, "downsample_volume", lambda *a, **k: calls.append("downsample")
+        )
+        _pipe(downsample_xy=2)._preprocess_single_tile(
+            two_sided[0], 1, shape_only=True
+        )
+        assert calls == []

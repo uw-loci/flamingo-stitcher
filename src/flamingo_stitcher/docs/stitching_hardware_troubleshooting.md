@@ -422,7 +422,7 @@ break ngff-zarr's zarr_format selection when writing OME-Zarr v0.4
 | `System RAM: N total, N available; peak N`  | real-time RAM headroom vs projected use                                  | `9948a8a` |
 | `Output drive (...): N free, need ... + ...`| three-term disk demand with headroom warning                             | `9948a8a`, `c50322c` |
 | `Materializing N tiles for channel X (K workers)` | worker count picked by auto-heuristic                              | `cfbc836` |
-| `Preprocessed N tiles in Xs (Y s/tile, Z GB/s)` | per-channel aggregate throughput                                     | `cfbc836` |
+| `Preprocessed N tiles in Xs (Y s/tile avg; read R GB/s, wrote W GB/s)` | per-channel throughput: raw data read, spill written | `cfbc836` |
 | `Storing channel X (scheduler=threads×N)`   | fuse scheduler chosen (`threads×N` vs `synchronous`)                     | `d43a02d` |
 | `Fused output memmap: (C,Z,Y,X) N GB → path`| confirms the memmap refactor is live                                     | `c50322c` |
 | `Imaris writer overhead: ~N GB`             | format-specific RAM warning                                              | `9948a8a` |

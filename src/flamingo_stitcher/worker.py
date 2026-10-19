@@ -73,6 +73,19 @@ class StitchingWorker(QThread):
         self._cancelled = False
         self._verbose = verbose
 
+    def _registration_summary(self) -> str:
+        c = self._config
+        if getattr(c, "skip_registration", False):
+            return "skipped (stage positions only)"
+        b = dict(getattr(c, "registration_binning", {}) or {})
+        parts = [
+            f"binning XY {b.get('x', '?')}x Z {b.get('z', '?')}x (before adjustment)",
+            f"quality threshold {getattr(c, 'quality_threshold', '?')}",
+            f"approach {getattr(c, 'stitching_approach', 'default')}",
+            f"Refine Z {'on' if getattr(c, 'registration_z_refine', False) else 'off'}",
+        ]
+        return ", ".join(parts)
+
     def cancel(self):
         """Request cancellation of the pipeline."""
         self._cancelled = True
@@ -123,6 +136,10 @@ class StitchingWorker(QThread):
                 f"{' (µ=' + str(self._config.depth_attenuation_mu) + '/µm)' if self._config.depth_attenuation and self._config.depth_attenuation_mu else ''}\n"
                 f"Deconvolution: {self._config.deconvolution_enabled}"
                 f"{' (' + self._config.deconvolution_engine + ')' if self._config.deconvolution_enabled else ''}\n"
+                # Registration and intensity settings were missing, so a log
+                # could not say whether 'Measure only' had been chosen.
+                f"Registration: {self._registration_summary()}\n"
+                f"Intensity adjustment: {getattr(self._config, 'intensity_adjustment', 'off')}\n"
                 f"Output format: {self._config.output_format}"
                 f"{' + .ozx' if self._config.package_ozx else ''}"
             )

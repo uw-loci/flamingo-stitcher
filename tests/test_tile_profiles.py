@@ -69,3 +69,29 @@ def test_a_ramp_in_one_side_is_reported_at_every_stage(tmp_path, caplog, streami
     lo_m, hi_m = y["merged"]
     lo_s, hi_s = y["tile as stitched"]
     assert hi_m - lo_m >= 8 and hi_s - lo_s >= 8, y  # mean carries half of it
+
+
+def test_streaming_logs_the_block_before_registration(tmp_path, caplog):
+    """Streaming loads the reference channel inside Step 3's branch, so the
+    block was logged with nothing in it and only appeared at the end."""
+    pytest.importorskip("multiview_stitcher")
+    frame, planes = 64, 8
+    acq = write_synth_acquisition(
+        tmp_path / "acq", grid=(2, 2), overlap=0.2, n_planes=planes,
+        channels=(1,), illum_sides=(0, 1), frame_size=(frame, frame),
+        pixel_size_um=1.0,
+    )
+    cfg = StitchingConfig.with_yaml_defaults()
+    for k, v in dict(
+        skip_registration=False, streaming_mode=True, output_format="ome-tiff",
+        resource_guard_enabled=False, flat_field_correction=False,
+        downsample_xy=1, downsample_z=1, tile_orientation="identity",
+        camera_x_inverted=False, auto_tile_orientation=False,
+    ).items():
+        setattr(cfg, k, v)
+    with caplog.at_level(logging.INFO):
+        StitchingPipeline(cfg).run(acq, tmp_path / "out")
+    lines = [r.getMessage() for r in caplog.records]
+    block = next(i for i, l in enumerate(lines) if "Brightness across a tile" in l)
+    step3 = next(i for i, l in enumerate(lines) if "Step 3: Registering" in l)
+    assert block < step3
