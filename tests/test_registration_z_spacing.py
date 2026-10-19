@@ -254,3 +254,50 @@ def test_the_yaml_key_is_read(monkeypatch):
     c = StitchingConfig()
     loader.apply_stitching_yaml_to_config(c)
     assert c.registration_z_spacing_um == 0.0
+
+
+# --------------------------------------------------------------------------
+# Peak refinement (registration_upsample_factor)
+# --------------------------------------------------------------------------
+
+
+class TestPeakRefinement:
+    def test_it_costs_a_little_time_and_no_memory(self):
+        tiles = _ket_tiles()
+        base = _cfg(registration_z_spacing_um=10.0)
+        fine = _cfg(registration_z_spacing_um=10.0, registration_upsample_factor=10)
+        ratio = P._rough_register_seconds(tiles, fine) / P._rough_register_seconds(tiles, base)
+        assert ratio == pytest.approx(P._ROUGH_UPSAMPLE_TIME_FACTOR)
+        assert estimate_registration_peak_bytes(tiles, fine) == (
+            estimate_registration_peak_bytes(tiles, base)
+        )
+
+    def test_the_cache_key_separates_it_only_when_set(self):
+        tiles = _ket_tiles()
+        assert "up=" not in build_timing_key(tiles, _cfg(registration_z_spacing_um=20.0)).serialize()
+        assert build_timing_key(
+            tiles, _cfg(registration_z_spacing_um=20.0, registration_upsample_factor=10)
+        ).serialize().endswith("|up=10")
+
+    def test_the_log_says_the_z_step_per_seam(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            _effective(_cfg(registration_z_spacing_um=10.0, registration_upsample_factor=10), 2.5)
+        assert "steps of 1 µm" in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.INFO):
+            _effective(_cfg(registration_z_spacing_um=10.0), 2.5)
+        assert "steps of 5 µm" in caplog.text and "multiview-stitcher default" in caplog.text
+
+
+def test_writer_progress_stays_in_the_write_band():
+    seen = []
+    pipe = StitchingPipeline(StitchingConfig())
+    pipe._progress_fn = lambda pct, msg: seen.append((pct, msg))
+    pipe._writer_progress(0, "Preparing")
+    pipe._writer_progress(50, "Computing channel 1/1 (3130 Z-planes)...")
+    pipe._writer_progress(100, "done")
+    assert [p for p, _ in seen] == [P._PCT_WRITE, (P._PCT_WRITE + P._PCT_METADATA) // 2, P._PCT_METADATA]
+    # classified as writing, not fusion
+    assert all(pipe._classify_phase(m) == "write" for _, m in seen)

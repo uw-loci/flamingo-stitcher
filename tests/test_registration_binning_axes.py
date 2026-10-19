@@ -93,6 +93,12 @@ class TestTheDictIsBuiltFromTwoChoices:
         assert self._dlg._registration_z_spacing() == 20.0
         assert "~7 planes" in self._dlg._reg_z_spacing_combo.currentText()
 
+    def test_peak_refinement_reaches_the_config(self):
+        self._dlg._set_combo_by_data(self._dlg._reg_upsample_combo, 10)
+        assert self._dlg._build_config().registration_upsample_factor == 10
+        self._dlg._set_combo_by_data(self._dlg._reg_upsample_combo, 0)
+        assert self._dlg._build_config().registration_upsample_factor == 0
+
     def test_the_config_carries_the_spacing(self):
         self._dlg._rebuild_reg_z_choices(2.5, keep=0.0)
         assert self._dlg._build_config().registration_z_spacing_um == 0.0

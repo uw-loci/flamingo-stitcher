@@ -284,10 +284,18 @@ registration:
   # Global optimization — iterative edge-pruning inspired by BigStitcher
   # (Horl et al., Nature Methods 2019).
   global_optimization:
-    # Maximum acceptable residual in pixels after global optimization.
-    # Edges with residuals above this are pruned if the graph stays connected.
-    # Depends on tile overlap and pixel size. Typical: 1.0 - 5.0 pixels.
+    # Maximum acceptable residual in REGISTRATION pixels after global
+    # optimization (converted to µm with the lateral registration pixel and
+    # floored at one registration voxel's diagonal; the log prints the µm).
+    # Seams whose placement disagrees with their own measurement by more are
+    # pruned while the graph stays connected. Higher keeps more seams and
+    # averages their disagreement; lower trusts fewer. GUI: Solve tolerance.
     absolute_tolerance: 3.5
+
+    # What the solve may do to a tile: translation (shift only, default) or
+    # rigid (shift + rotation, inferred from where different neighbours'
+    # overlaps sit). Rigid is optional and not yet validated across datasets.
+    transform: translation
 
     # Relative convergence threshold for the optimization solver.
     # Smaller = more precise but slower. 0.01 is usually fine.

@@ -322,6 +322,24 @@ def build_parser() -> argparse.ArgumentParser:
         "usually worth it, especially in Z. 0 = leave its default alone.",
     )
     reg_group.add_argument(
+        "--solve-tolerance",
+        type=float,
+        default=None,
+        metavar="PX",
+        help="Global-solve tolerance in registration pixels (default 3.5; the "
+        "log prints it in µm). A seam whose placement disagrees with its own "
+        "measurement by more is dropped. Higher keeps more seams and averages "
+        "their disagreement.",
+    )
+    reg_group.add_argument(
+        "--solve-transform",
+        choices=["translation", "rigid"],
+        default=None,
+        help="What the global solve may do to a tile: shift only (default) or "
+        "shift + rotation. Rigid is optional and not yet validated across "
+        "datasets.",
+    )
+    reg_group.add_argument(
         "--max-reg-shift",
         type=float,
         default=None,
@@ -918,6 +936,8 @@ def main():
         ("skip_registration", args.skip_registration),
         ("registration_binning", _binning),
         ("registration_z_spacing_um", args.reg_z_spacing_um),
+        ("global_opt_abs_tol", args.solve_tolerance),
+        ("registration_solve_transform", args.solve_transform),
         ("registration_upsample_factor", args.reg_upsample),
         ("max_registration_shift_um", args.max_reg_shift),
         ("max_registration_shift_z_um", args.max_reg_shift_z),

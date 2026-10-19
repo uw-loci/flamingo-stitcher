@@ -130,6 +130,10 @@ class StitchingTimingKey:
     # appends nothing, so existing cache entries keep matching. 0 = not
     # registering / unknown.
     reg_z_spacing_um: float = 0.0
+    # registration_upsample_factor; 0 = multiview-stitcher's default. Costs
+    # ~1.07-1.18x registration time above 2. Appended only when set, so
+    # existing entries keep matching.
+    reg_upsample: int = 0
 
     def serialize(self) -> str:
         return (
@@ -161,6 +165,11 @@ class StitchingTimingKey:
                 if not self.skip_registration
                 and self.reg_z_spacing_um > 0
                 and abs(self.reg_z_spacing_um - LEGACY_REG_Z_SPACING_UM) > 0.05
+                else ""
+            )
+            + (
+                f"|up={self.reg_upsample}"
+                if not self.skip_registration and self.reg_upsample > 2
                 else ""
             )
         )

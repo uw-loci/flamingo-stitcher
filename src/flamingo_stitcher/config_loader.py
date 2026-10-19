@@ -362,6 +362,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.global_opt_abs_tol = float(gopt["absolute_tolerance"])
     if gopt.get("relative_tolerance") is not None:
         config_obj.global_opt_rel_tol = float(gopt["relative_tolerance"])
+    if gopt.get("transform"):
+        config_obj.registration_solve_transform = str(gopt["transform"]).lower()
 
     # Blending
     blend = cfg.get("blending", {})

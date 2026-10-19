@@ -88,6 +88,9 @@ class StitchingWorker(QThread):
             f"quality threshold {getattr(c, 'quality_threshold', '?')}",
             f"approach {getattr(c, 'stitching_approach', 'default')}",
             f"Refine Z {'on' if getattr(c, 'registration_z_refine', False) else 'off'}",
+            f"peak refinement 1/{int(getattr(c, 'registration_upsample_factor', 0) or 0) or 2}",
+            f"solve tolerance {getattr(c, 'global_opt_abs_tol', 3.5):g} px",
+            f"solve model {getattr(c, 'registration_solve_transform', 'translation')}",
         ]
         return ", ".join(parts)
 

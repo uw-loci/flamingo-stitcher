@@ -111,6 +111,48 @@ def resolve_registration_z(config, z_voxel_um: float) -> RegistrationZ:
     return RegistrationZ(bin_z, bin_z * voxel, voxel, source)
 
 
+def msi_get_sim(msim):
+    from multiview_stitcher import msi_utils
+
+    return msi_utils.get_sim_from_msim(msim)
+
+
+def si_utils_get(name):
+    from multiview_stitcher import spatial_image_utils as si_utils
+
+    return getattr(si_utils, name)
+
+
+def _mvs_metadata_key():
+    from multiview_stitcher import io as mvs_io
+
+    return mvs_io.METADATA_TRANSFORM_KEY
+
+
+def global_opt_abs_tol_um(px, voxel_size_um, binning) -> float:
+    """The solve tolerance in µm: ``px`` registration pixels x the lateral
+    registration pixel, floored at one registration voxel's diagonal (the
+    solver's own default). Shared by the run and the dialog's readout."""
+    try:
+        px = float(px or 3.5)
+    except (TypeError, ValueError):
+        px = 3.5
+    spacing = {}
+    for ax in ("z", "y", "x"):
+        try:
+            v = float((voxel_size_um or {}).get(ax, 0.0) or 0.0)
+            b = float((binning or {}).get(ax, 1) or 1)
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if v > 0:
+            spacing[ax] = v * b
+    lateral = [spacing[a] for a in ("y", "x") if a in spacing]
+    if not lateral:
+        return px  # cannot convert; keep the legacy behaviour
+    diagonal = sum(v * v for v in spacing.values()) ** 0.5
+    return max(px * max(lateral), diagonal)
+
+
 def registration_z_choices(z_voxel_um: float, max_um: float = 80.0):
     """``[(spacing_um, planes_averaged), ...]`` the GUI offers for one voxel:
     every plane, then doubling, up to ``max_um``. 0 = every plane."""
@@ -200,6 +242,8 @@ _CONFIG_FIELD_ORDER = (
     "deconvolution_psf_path",
     "registration_binning",
     "registration_z_spacing_um",
+    "registration_solve_transform",
+    "global_opt_abs_tol",
     "quality_threshold",
     "max_registration_shift_um",
     "max_registration_shift_z_um",
@@ -609,6 +653,12 @@ _ROUGH_S_PER_OUT_UNIT = 0.08
 # Still one machine, so still an order-of-magnitude prior — but one that now
 # MOVES with the settings. The cache supersedes it for any config that has run.
 _ROUGH_S_PER_REG_MVOXEL = 3.3
+# Registration time with registration_upsample_factor above multiview-stitcher's
+# 3-D default of 2. Measured 2026-10-19 (MVS 0.1.59, 4-8 M compared voxels):
+# 10 or 20 cost 1.07-1.18x the default and no extra memory (same peak to the
+# MB under tracemalloc); the upsampled DFT only refines around the peak.
+_ROUGH_UPSAMPLE_TIME_FACTOR = 1.18
+MVS_DEFAULT_3D_UPSAMPLE = 2
 
 # Global-progress percent boundaries for the pipeline phases. The estimator
 # turns this percent into a whole-run ETA by linear extrapolation
@@ -697,6 +747,10 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
         source_drive=_drive_root(src),
         dest_drive=_drive_root(output_dir),
         reg_z_spacing_um=reg_z,
+        reg_upsample=(
+            0 if config.skip_registration
+            else int(getattr(config, "registration_upsample_factor", 0) or 0)
+        ),
     )
 
 
@@ -910,6 +964,8 @@ def _rough_register_seconds(tiles, config) -> float:
     if geo is None:
         return 0.0
     seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
+    if int(getattr(config, "registration_upsample_factor", 0) or 0) > MVS_DEFAULT_3D_UPSAMPLE:
+        seconds *= _ROUGH_UPSAMPLE_TIME_FACTOR
     # The Z-refinement pass is a second pairwise pass over the same seams at
     # its own binning (every plane, coarser XY), so cost it as such rather
     # than as a flat doubling: at a 2.5 µm step every plane is 4-8x the main
@@ -1480,6 +1536,14 @@ class StitchingConfig:
     # edge residuals in physical units, and passing 3.5 straight through meant
     # 3.5 µm: under half a pixel at 8x downsample, which pruned every loop.
     global_opt_abs_tol: float = 3.5  # Max acceptable residual (pixels)
+    # What the global solve may do to a tile: "translation" (shift only, the
+    # default and every run before 2026-10-19) or "rigid" (shift + rotation).
+    # The pairwise measurements stay translations; rigid infers each tile's
+    # rotation from where its different neighbours' overlaps sit, the way
+    # BigStitcher does. Optional and unvalidated across datasets: on the
+    # 2026-10-18 Ket_Trial1 run the Z offset between two rows changed 105 ->
+    # 140 µm across four columns, a tilt a shift cannot represent.
+    registration_solve_transform: str = "translation"
     global_opt_rel_tol: float = 0.01  # Convergence threshold
 
     # Minimum measured tile overlap fraction before registration is ATTEMPTED.
@@ -4767,6 +4831,10 @@ class StitchingPipeline:
     # (discover, register, preprocess, fuse, write, metadata). First
     # match wins; order follows pipeline execution.
     _STATUS_TO_PHASE = [
+        # First: _writer_progress prefixes every writer message with it, and a
+        # writer says things like "Computing channel 1/1" that would otherwise
+        # read as fusion.
+        ("writing output", "write"),
         ("discover", "discover"),
         ("loading reference", "register"),
         ("registering", "register"),
@@ -4778,8 +4846,8 @@ class StitchingPipeline:
         ("fusing", "fuse"),
         ("computing channel", "fuse"),
         ("storing channel", "fuse"),
-        ("channel ", "fuse"),
         ("writing", "write"),
+        ("channel ", "fuse"),
         ("finalizing", "write"),
         ("metadata", "metadata"),
     ]
@@ -4790,6 +4858,21 @@ class StitchingPipeline:
             if needle in s:
                 return phase
         return None
+
+    def _writer_progress(self, pct, msg):
+        """A writer's own 0-100 progress, kept inside the write band.
+
+        Writers were handed the pipeline's progress function directly, so their
+        local percent read as whole-run progress and a message like "Computing
+        channel 1/1" was classified as fusion: on 2026-10-18 a 54-minute
+        OME-TIFF write was booked as Fuse and Write showed 14 s.
+        """
+        try:
+            local = min(100.0, max(0.0, float(pct or 0)))
+        except (TypeError, ValueError):
+            local = 0.0
+        g = _PCT_WRITE + (_PCT_METADATA - _PCT_WRITE) * local / 100.0
+        self._progress_fn(int(g), f"Writing output: {msg}")
 
     def _on_progress_emit(self, pct, msg):
         """Hook called for every internal progress emit. Drives the
@@ -5992,7 +6075,9 @@ class StitchingPipeline:
                 gc.collect()
 
             # Probe one tile for output shape
-            probe_vol = self._preprocess_single_tile(tiles[0], process_channels[0])
+            probe_vol = self._preprocess_single_tile(
+                tiles[0], process_channels[0], shape_only=True
+            )
             expected_tile_shape = probe_vol.shape
             del probe_vol
             gc.collect()
@@ -6244,7 +6329,9 @@ class StitchingPipeline:
 
         # Determine tile output shape (load one tile, measure, free)
         probe_ch = process_channels[0]
-        probe_vol = self._preprocess_single_tile(tiles[0], probe_ch)
+        # Shape only: on 2026-10-18 this preprocessed tile 1 a fourth time
+        # (3 min) and added a 43rd tile to the brightness profiles.
+        probe_vol = self._preprocess_single_tile(tiles[0], probe_ch, shape_only=True)
         expected_tile_shape = probe_vol.shape
         del probe_vol
         gc.collect()
@@ -6647,7 +6734,7 @@ class StitchingPipeline:
                             output_path=ims_path,
                             voxel_size_um=voxel_size_um,
                             channel_names=channel_names,
-                            progress_callback=self._progress_fn,
+                            progress_callback=self._writer_progress,
                         )
                 except Exception as e:
                     self.logger.error(f"Imaris .ims write failed: {e}", exc_info=True)
@@ -8052,7 +8139,8 @@ class StitchingPipeline:
                 f"  Global solve tolerance: {self.config.global_opt_abs_tol:g} "
                 f"registration px = {abs_tol_um:.1f} µm. A seam whose placement "
                 f"disagrees with its own measurement by more than this is "
-                f"pruned and the solve re-run."
+                f"pruned and the solve re-run. Solve model: "
+                f"{'shift + rotation (rigid, experimental)' if self._rigid_solve() else 'shift only'}."
             )
             with dask.diagnostics.ProgressBar():
                 with registration_report.capture_prefilter_graph(sink, reject):
@@ -8082,6 +8170,14 @@ class StitchingPipeline:
             params = self._expand_to_all_tiles(
                 list(result["params"]), index_map, len(msims)
             )
+            # Rigid solve: everything below judges and reports CENTRE shifts on
+            # translation-only copies; the rotations go back on at the end.
+            rigid_full = rigid_centres = None
+            if self._rigid_solve():
+                rigid_centres = self._tile_centres_world(msims)
+                rigid_full = list(params)
+                params = self._centre_shift_view(rigid_full, rigid_centres)
+                self._log_rotations(rigid_full, rigid_centres, tiles, extent_um)
 
             # Extract the seams once, here: the guard below and the report have
             # to be reading the same rows or the report cannot explain the
@@ -8160,6 +8256,20 @@ class StitchingPipeline:
             clamp = self._clamp_registration_shifts(params, tile_data, voxel_size_um)
             params = clamp.params
 
+            def _placed(shift_params):
+                """What fusion uses: rotations back on, for a rigid solve."""
+                if rigid_full is None:
+                    return shift_params
+                drop = set(getattr(coverage, "bound_tiles", None) or [])
+                drop |= {
+                    int(r.index) for r in (clamp.records or [])
+                    if getattr(r, "clamped_xy", False) or getattr(r, "clamped_z", False)
+                    or getattr(r, "whole_matrix", False)
+                }
+                return self._recombine_rotation(
+                    rigid_full, shift_params, rigid_centres, drop
+                )
+
             # multiview-stitcher wrote the UNCLAMPED params into the msims under
             # "registered" before returning, so a second pass starting from that
             # key would build on exactly the shifts the clamp just rejected.
@@ -8168,7 +8278,7 @@ class StitchingPipeline:
             for position, msim in enumerate(reg_msims):
                 msi_utils.set_affine_transform(
                     msim,
-                    params[index_map[position] if index_map else position],
+                    _placed(params)[index_map[position] if index_map else position],
                     transform_key="registered",
                     base_transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                 )
@@ -8200,7 +8310,7 @@ class StitchingPipeline:
             self._log_z_coverage(params, tile_data, voxel_size_um)
             self.logger.info("  Registration complete")
             self._log_verbose_alignment()
-            return params, "registered"
+            return _placed(params), "registered"
 
         except Exception as e:
             self.logger.error(f"  Registration failed: {e}")
@@ -8383,10 +8493,13 @@ class StitchingPipeline:
             # most of the registration cost, so the log must show where it came
             # from and what it became on this acquisition.
             planes = "every plane" if rz.bin_z == 1 else f"{rz.bin_z} planes averaged"
+            up = int(getattr(self.config, "registration_upsample_factor", 0) or 0)
+            up_eff = up if up > 0 else MVS_DEFAULT_3D_UPSAMPLE
             self.logger.info(
                 f"  Registration Z: {planes} of {rz.voxel_um:g} µm = "
-                f"{rz.spacing_um:g} µm ({rz.source}). Z shifts resolve to about "
-                f"half of that per seam."
+                f"{rz.spacing_um:g} µm ({rz.source}). Peak refinement 1/{up_eff} "
+                f"voxel{' (multiview-stitcher default)' if up <= 0 else ''}, so each "
+                f"seam's Z shift moves in steps of {rz.spacing_um / up_eff:.2g} µm."
             )
         lateral_changed = any(
             effective.get(a) != configured.get(a) for a in ("y", "x")
@@ -9251,21 +9364,136 @@ class StitchingPipeline:
         default -- so a one-plane Z quantisation difference cannot by itself
         prune a seam when Z is much coarser than XY.
         """
-        px = float(getattr(self.config, "global_opt_abs_tol", 3.5) or 3.5)
-        spacing = {}
-        for ax in ("z", "y", "x"):
+        return global_opt_abs_tol_um(
+            getattr(self.config, "global_opt_abs_tol", 3.5), voxel_size_um, binning
+        )
+
+    def _rigid_solve(self) -> bool:
+        return str(
+            getattr(self.config, "registration_solve_transform", "translation") or ""
+        ).strip().lower() == "rigid"
+
+    @staticmethod
+    def _tile_centres_world(msims) -> List[Optional[np.ndarray]]:
+        """Each tile's centre (z, y, x) in world µm under its stage placement."""
+        out = []
+        for msim in msims:
             try:
-                v = float((voxel_size_um or {}).get(ax, 0.0) or 0.0)
-                b = float((binning or {}).get(ax, 1) or 1)
-            except (TypeError, ValueError, AttributeError):
+                sim = msi_get_sim(msim)
+                origin = si_utils_get("get_origin_from_sim")(sim, asarray=True)
+                spacing = si_utils_get("get_spacing_from_sim")(sim, asarray=True)
+                shape = si_utils_get("get_shape_from_sim")(sim, asarray=True)
+                c = np.asarray(origin, float) + (np.asarray(shape, float) - 1) / 2 * np.asarray(spacing, float)
+                aff = np.asarray(
+                    si_utils_get("get_affine_from_sim")(sim, transform_key=_mvs_metadata_key())
+                ).squeeze()
+                out.append((aff @ np.append(c, 1.0))[:3])
+            except Exception:
+                out.append(None)
+        return out
+
+    @staticmethod
+    def _param_matrix(param) -> np.ndarray:
+        arr = np.asarray(param, dtype=float)
+        return arr[0] if arr.ndim == 3 else arr
+
+    def _centre_shift_view(self, params, centres):
+        """Translation-only copies whose shift is each tile's CENTRE
+        displacement (A c - c).
+
+        For a translation that is the translation itself, so everything that
+        judges or reports a shift -- carry, clamp, Z snap, the report, the
+        coverage check -- reads the same kind of number it always has. For a
+        rotated tile the translation column alone is the motion of the world
+        origin: 0.2° about a tile 10 mm from it moves that column ~35 µm while
+        the tile itself barely moves."""
+        out = []
+        for param, c in zip(params, centres):
+            view = param.copy()
+            buf = view.values if hasattr(view, "values") else view
+            mat = buf[0] if buf.ndim == 3 else buf
+            if c is not None:
+                full = self._param_matrix(param)
+                d = full[:3, :3] @ c + full[:3, 3] - c
+                mat[:3, :3] = np.eye(3)
+                mat[:3, 3] = d
+            out.append(view)
+        return out
+
+    def _recombine_rotation(self, full_params, shift_params, centres, drop):
+        """Put each tile's rotation back around its final centre shift.
+
+        ``drop``: tiles that were clamped or carried. Their placement was not
+        measured, so neither is their rotation, and they stay translations."""
+        out = []
+        for i, (full, shifted, c) in enumerate(zip(full_params, shift_params, centres)):
+            if c is None or i in drop:
+                out.append(shifted)
                 continue
-            if v > 0:
-                spacing[ax] = v * b
-        lateral = [spacing[a] for a in ("y", "x") if a in spacing]
-        if not lateral:
-            return px  # cannot convert; keep the legacy behaviour
-        diagonal = sum(v * v for v in spacing.values()) ** 0.5
-        return max(px * max(lateral), diagonal)
+            final = full.copy()
+            buf = final.values if hasattr(final, "values") else final
+            mat = buf[0] if buf.ndim == 3 else buf
+            d = self._param_matrix(shifted)[:3, 3]
+            mat[:3, 3] = d + c - mat[:3, :3] @ c
+            out.append(final)
+        return out
+
+    def _log_rotations(self, full_params, centres, tiles, extent_um):
+        """Rotation per tile from a rigid solve, and whether it is plausible.
+
+        Plausible = the rotation moves a tile corner by less than the overlap
+        width; a larger one cannot have come from seams that overlap at all."""
+        from flamingo_stitcher.center_out import tile_label
+
+        rows = []
+        for i, (param, c) in enumerate(zip(full_params, centres)):
+            try:
+                R = self._param_matrix(param)[:3, :3]
+            except Exception:
+                continue
+            angle = float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+            # out of the XY plane = how much the tile's Z depends on Y/X
+            tilt = float(np.degrees(np.arcsin(np.clip(np.hypot(R[0, 1], R[0, 2]), 0, 1))))
+            rows.append((i, angle, tilt))
+        if not rows:
+            return
+        fy = float((extent_um or {}).get("y", 0.0) or 0.0)
+        fx = float((extent_um or {}).get("x", 0.0) or 0.0)
+        half_diag = 0.5 * float(np.hypot(fy, fx))
+        # Narrowest overlap, from the stage pitch against the frame extent.
+        overlap = None
+        try:
+            widths = []
+            for attr, extent in (("x_mm", fx), ("y_mm", fy)):
+                vals = sorted({round(float(getattr(t, attr)), 4) for t in tiles})
+                gaps = [b - a for a, b in zip(vals, vals[1:]) if b - a > 1e-3]
+                if gaps and extent > 0:
+                    widths.append(extent - min(gaps) * 1000.0)
+            widths = [w for w in widths if w > 0]
+            overlap = min(widths) if widths else None
+        except Exception:
+            overlap = None
+        angles = [a for _, a, _ in rows]
+        tilts = [t for _, _, t in rows]
+        self.logger.info(
+            f"  Rigid solve: tile rotations median {np.median(angles):.3f}°, max "
+            f"{max(angles):.3f}°; tilt out of the XY plane max {max(tilts):.3f}° "
+            f"(a tilted tile is resampled across Z planes in fusion). "
+            f"Rotation is about each tile's centre; shifts below are centre shifts."
+        )
+        if half_diag > 0:
+            for i, a, t in sorted(rows, key=lambda r: -r[1])[:5]:
+                corner_um = np.radians(a) * half_diag
+                note = ""
+                if overlap and corner_um > overlap:
+                    note = (
+                        f" -- moves a corner {corner_um:.0f} µm, more than the "
+                        f"{overlap:.0f} µm overlap; not plausible from these seams"
+                    )
+                self.logger.info(
+                    f"    {tile_label(tiles[i], i)}: {a:.3f}° (tilt {t:.3f}°), "
+                    f"corner moves ~{corner_um:.0f} µm{note}"
+                )
 
     def _groupwise_kwargs(self, tiles, index_map, abs_tol_um=None):
         """Solver kwargs, with the gauge anchored at the centre for `center_xy`.
@@ -9286,6 +9514,8 @@ class StitchingPipeline:
             ),
             "rel_tol": self.config.global_opt_rel_tol,
         }
+        if self._rigid_solve():
+            kwargs["transform"] = "rigid"
         if not self._center_out_approach():
             return kwargs
         centre = center_out.centre_tile_index(list(tiles or []))
@@ -9538,6 +9768,8 @@ class StitchingPipeline:
             "quality_threshold": self.config.quality_threshold,
             "registration_binning": dict(self.config.registration_binning),
             "registration_z_spacing_um": self.config.registration_z_spacing_um,
+            "solve_transform": getattr(self.config, "registration_solve_transform", "translation"),
+            "solve_tolerance_px": self.config.global_opt_abs_tol,
             "upsample_factor": self.config.registration_upsample_factor,
             "voxel_z_um": float(voxel_size_um.get("z", 0.0)),
             "voxel_y_um": float(voxel_size_um.get("y", 0.0)),
@@ -10719,7 +10951,7 @@ class StitchingPipeline:
                         output_path=ims_path,
                         voxel_size_um=voxel_size_um,
                         channel_names=channel_names,
-                        progress_callback=self._progress_fn,
+                        progress_callback=self._writer_progress,
                     )
             except Exception as e:
                 # 'imaris' is the sole requested format, so a failure here means

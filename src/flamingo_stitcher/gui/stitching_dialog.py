@@ -1408,13 +1408,58 @@ class StitchingDialog(PersistentDialog):
         )
         reg_layout.addWidget(self._verbose_align_cb, 5, 0, 1, 4)
 
+        # Global solve: how much disagreement a seam may have with the placement
+        # before it is dropped, and whether tiles may rotate as well as shift.
+        self._solve_tol_label = QLabel("Solve tolerance:")
+        reg_layout.addWidget(self._solve_tol_label, 6, 0)
+        self._solve_tol_spin = _NoScrollDoubleSpinBox()
+        self._solve_tol_spin.setRange(0.5, 50.0)
+        self._solve_tol_spin.setSingleStep(0.5)
+        self._solve_tol_spin.setDecimals(1)
+        self._solve_tol_spin.setValue(3.5)
+        self._solve_tol_spin.setSuffix(" reg. px")
+        self._solve_tol_spin.setToolTip(
+            "How far a seam's measurement may disagree with where the solve puts\n"
+            "its two tiles before the seam is dropped, in registration pixels.\n"
+            "The line below and the run log give it in µm (registration pixel x\n"
+            "this, never less than one registration voxel's diagonal).\n\n"
+            "Lower: trust fewer seams. A row can end up hanging on ONE seam to\n"
+            "the row above (2026-10-18: the bottom row kept 1 of 4 Y-seams that\n"
+            "all passed the quality threshold).\n"
+            "Higher: keep more seams and AVERAGE their disagreement, which\n"
+            "spreads the error over the row instead of removing it.\n\n"
+            "No extra time or memory; the solve is a small part of registration."
+        )
+        reg_layout.addWidget(self._solve_tol_spin, 6, 1)
+        self._solve_model_label = QLabel("Solve model:")
+        reg_layout.addWidget(self._solve_model_label, 6, 2)
+        self._solve_model_combo = QComboBox()
+        self._solve_model_combo.addItem("Shift only", "translation")
+        self._solve_model_combo.addItem("Shift + rotation (rigid) ✱", "rigid")
+        self._solve_model_combo.setToolTip(
+            "What the global solve may do to each tile.\n\n"
+            "Shift only: every run so far. A tile is a block that can move.\n\n"
+            "Shift + rotation: each tile may also rotate slightly, inferred from\n"
+            "where its different neighbours' overlaps sit (as BigStitcher does).\n"
+            "This can absorb a tilt between rows -- on 2026-10-18 the Z offset\n"
+            "between the bottom two rows grew 105 -> 140 µm across four tiles,\n"
+            "which no shift can match.\n\n"
+            "✱ EXPERIMENTAL, not yet validated across datasets. A tilted tile is\n"
+            "resampled across Z planes in fusion (Snap Z cannot keep planes\n"
+            "intact for it). Tiles that were clamped or placed from their\n"
+            "neighbours stay shift-only. The log lists the rotations and flags\n"
+            "any too large to have come from the overlaps.\n\n"
+            "No extra time or memory."
+        )
+        reg_layout.addWidget(self._solve_model_combo, 6, 3)
+
         # What the Z spacing will cost on the queued acquisitions. Filled by
         # _update_reg_z_cost from the same functions the run and the memory
         # estimate use, so the warning cannot disagree with them.
         self._reg_z_cost_label = QLabel("")
         self._reg_z_cost_label.setWordWrap(True)
         self._reg_z_cost_label.setTextFormat(Qt.RichText)
-        reg_layout.addWidget(self._reg_z_cost_label, 6, 0, 1, 4)
+        reg_layout.addWidget(self._reg_z_cost_label, 7, 0, 1, 4)
 
         self._z_snap_cb = QCheckBox("Snap Z shifts to whole planes")
         self._z_snap_cb.setChecked(True)
@@ -1434,7 +1479,37 @@ class StitchingDialog(PersistentDialog):
             "Turn it off only when axial placement finer than one plane matters\n"
             "more than keeping planes intact."
         )
-        reg_layout.addWidget(self._z_snap_cb, 3, 0, 1, 4)
+        reg_layout.addWidget(self._z_snap_cb, 3, 0, 1, 2)
+
+        # How finely each seam's correlation peak is located, in fractions of a
+        # registration voxel (registration_upsample_factor). multiview-stitcher
+        # uses 1/2 for 3-D unless told otherwise, so a Z spacing of 10 µm moved
+        # each seam's Z in 5 µm steps -- every seam dz on the 2026-10-18 run was
+        # a multiple of 5.00 µm.
+        self._reg_upsample_label = QLabel("Peak refinement:")
+        reg_layout.addWidget(self._reg_upsample_label, 3, 2)
+        self._reg_upsample_combo = QComboBox()
+        for _label, _value in [
+            ("1/2 voxel (default)", 0),
+            ("1/4 voxel", 4),
+            ("1/10 voxel", 10),
+            ("1/20 voxel", 20),
+        ]:
+            self._reg_upsample_combo.addItem(_label, _value)
+        self._reg_upsample_combo.setToolTip(
+            "How finely each seam's correlation peak is located, as a fraction of\n"
+            "a registration voxel (the Z spacing in Z, the binned pixel in XY).\n\n"
+            "The default, 1/2, is multiview-stitcher's own for 3-D: at a 10 µm Z\n"
+            "spacing each seam's Z shift moves in 5 µm steps, and a loop of seams\n"
+            "can miss by more than the solve tolerance from rounding alone, so\n"
+            "good seams get dropped. 1/10 locates it to 1 µm with the same data.\n\n"
+            "Measured on a synthetic pair offset by 3 planes and binned 4 in Z:\n"
+            "1/2 was off by a whole plane, 1/10 by 0.2 of a plane.\n\n"
+            "COST: about 1.1-1.2x the registration time, no extra memory. It\n"
+            "cannot find detail the Z spacing averaged away; for that, lower the\n"
+            "Z spacing. The cost line below and the queue time include it."
+        )
+        reg_layout.addWidget(self._reg_upsample_combo, 3, 3)
 
         reg_group.setLayout(reg_layout)
         proc_layout.addWidget(reg_group, 2, 0, 3, 4)
@@ -1563,12 +1638,15 @@ class StitchingDialog(PersistentDialog):
             self._z_refine_cb,
         ):
             _cb.toggled.connect(self._refresh_memory_estimate)
+        self._solve_tol_spin.valueChanged.connect(self._refresh_memory_estimate)
         for _combo in (
             self._frame_size_combo,
             self._fusion_combo,
             self._tile_fusion_combo,
             self._reg_binning_xy_combo,
             self._reg_z_spacing_combo,
+            self._reg_upsample_combo,
+            self._solve_model_combo,
             self._chunk_size_combo,
         ):
             _combo.currentIndexChanged.connect(self._refresh_memory_estimate)
@@ -2970,10 +3048,22 @@ class StitchingDialog(PersistentDialog):
                 " Includes the Z refinement pass (every plane)."
                 if getattr(config, "registration_z_refine", False) else ""
             )
+            up = int(getattr(config, "registration_upsample_factor", 0) or 0)
+            step = rz.spacing_um / (up if up > 0 else 2)
+            from flamingo_stitcher.pipeline import global_opt_abs_tol_um
+
+            lat = float(config.pixel_size_um) * max(1, int(config.downsample_xy or 1))
+            tol_um = global_opt_abs_tol_um(
+                config.global_opt_abs_tol,
+                {"z": rz.voxel_um, "y": lat, "x": lat},
+                {"z": geo["bin_z"], "y": geo["bin_xy"], "x": geo["bin_xy"]},
+            )
             label.setText(
                 f"<span style='color:{colour};'>Registration Z: {what} = "
                 f"{rz.spacing_um:g} µm, {int(round(geo['reg_planes']))} planes "
-                f"compared per seam. Rough cost: ~{_format_duration(t)} and "
+                f"compared per seam; each seam's Z moves in {step:.2g} µm steps; "
+                f"solve tolerance ~{tol_um:.1f} µm. "
+                f"Rough cost: ~{_format_duration(t)} and "
                 f"~{gb:.1f} GB{ram} for one seam.{refine}{cmp}</span>"
             )
         except Exception as e:
@@ -2987,6 +3077,12 @@ class StitchingDialog(PersistentDialog):
             self._reg_z_spacing_combo,
             self._reg_binning_xy_label,
             self._reg_z_spacing_label,
+            self._reg_upsample_combo,
+            self._reg_upsample_label,
+            self._solve_tol_spin,
+            self._solve_tol_label,
+            self._solve_model_combo,
+            self._solve_model_label,
             self._reg_binning_label,
         ):
             _widget.setEnabled(not checked)
@@ -3552,6 +3648,13 @@ class StitchingDialog(PersistentDialog):
         config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
         config.registration_binning = self._registration_binning()
         config.registration_z_spacing_um = self._registration_z_spacing()
+        config.registration_upsample_factor = int(
+            self._reg_upsample_combo.currentData() or 0
+        )
+        config.global_opt_abs_tol = float(self._solve_tol_spin.value())
+        config.registration_solve_transform = (
+            self._solve_model_combo.currentData() or "translation"
+        )
         config.package_ozx = self._ozx_cb.isChecked()
         config.tiff_pyramids = self._tiff_pyramids_cb.isChecked()
         config.streaming_mode = self._streaming_combo.currentData()
@@ -3878,6 +3981,8 @@ class StitchingDialog(PersistentDialog):
             ("output_chunksize", self._chunk_size_combo),
             ("fusion_superblock_target_gb", self._fusion_region_combo),
             ("border_qc_mode", self._border_qc_mode_combo),
+            ("registration_upsample_factor", self._reg_upsample_combo),
+            ("registration_solve_transform", self._solve_model_combo),
         ]
         for name, combo in combo_fields:
             if has(name):
@@ -3887,6 +3992,12 @@ class StitchingDialog(PersistentDialog):
         if has("registration_binning"):
             self._set_registration_binning(cfg["registration_binning"])
             applied += 1
+        if cfg.get("global_opt_abs_tol") is not None:
+            try:
+                self._solve_tol_spin.setValue(float(cfg["global_opt_abs_tol"]))
+                applied += 1
+            except (TypeError, ValueError):
+                pass
         # After the dict, so a file that has both keeps its explicit spacing
         # rather than the dict's older "z" reading.
         if cfg.get("registration_z_spacing_um") is not None:
@@ -6304,6 +6415,9 @@ class StitchingDialog(PersistentDialog):
         # unread lets it age out instead.
         s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
         s.setValue("reg_z_spacing_um", self._registration_z_spacing())
+        s.setValue("reg_upsample", self._reg_upsample_combo.currentData())
+        s.setValue("solve_tolerance_px", self._solve_tol_spin.value())
+        s.setValue("solve_transform", self._solve_model_combo.currentData())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -6484,6 +6598,13 @@ class StitchingDialog(PersistentDialog):
         _rb_xy = s.value("reg_binning_xy", 4, type=int)
         self._set_registration_binning({"y": _rb_xy, "x": _rb_xy})
         self._restore_reg_z_spacing(s)
+        self._set_combo_by_data(
+            self._reg_upsample_combo, s.value("reg_upsample", 0, type=int)
+        )
+        self._solve_tol_spin.setValue(s.value("solve_tolerance_px", 3.5, type=float))
+        self._set_combo_by_data(
+            self._solve_model_combo, s.value("solve_transform", "translation", type=str)
+        )
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)
@@ -6636,6 +6757,9 @@ class NativeStitchingDialog(StitchingDialog):
         # unread lets it age out instead.
         s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
         s.setValue("reg_z_spacing_um", self._registration_z_spacing())
+        s.setValue("reg_upsample", self._reg_upsample_combo.currentData())
+        s.setValue("solve_tolerance_px", self._solve_tol_spin.value())
+        s.setValue("solve_transform", self._solve_model_combo.currentData())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -6815,6 +6939,13 @@ class NativeStitchingDialog(StitchingDialog):
         _rb_xy = s.value("reg_binning_xy", 4, type=int)
         self._set_registration_binning({"y": _rb_xy, "x": _rb_xy})
         self._restore_reg_z_spacing(s)
+        self._set_combo_by_data(
+            self._reg_upsample_combo, s.value("reg_upsample", 0, type=int)
+        )
+        self._solve_tol_spin.setValue(s.value("solve_tolerance_px", 3.5, type=float))
+        self._set_combo_by_data(
+            self._solve_model_combo, s.value("solve_transform", "translation", type=str)
+        )
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)
