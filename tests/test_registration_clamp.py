@@ -150,7 +150,9 @@ class TestAxialBound:
     def test_a_shallow_stack_caps_the_bound_at_a_quarter_of_its_depth(self):
         # 40 planes x 1 µm = 40 µm deep. A "correction" of 30 µm is most of the
         # volume and is a garbage peak, not a measurement, whatever the step size.
-        pipe = StitchingPipeline(StitchingConfig())
+        # Every plane: at the default 20 µm spacing a 1 µm voxel bins 20 planes,
+        # and the quantization floor (2 binned steps = 40 µm) would rightly win.
+        pipe = StitchingPipeline(StitchingConfig(registration_z_spacing_um=0.0))
         td = _tile_data([0.0, 0.08], [0.0, 0.0], shape=(40, 100, 100))
         params = _params([(0, 0, 0), (30, 0, 0)])
         out = pipe._clamp_registration_shifts(params, td, _VOXEL).params

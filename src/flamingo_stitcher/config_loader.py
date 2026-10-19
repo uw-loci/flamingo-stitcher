@@ -314,6 +314,9 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
             "y": int(binning.get("y", lateral if lateral is not None else 4)),
             "x": int(binning.get("x", lateral if lateral is not None else 4)),
         }
+    if reg.get("z_spacing_um") is not None:
+        # um, 0 = every plane; wins over binning.z (see resolve_registration_z)
+        config_obj.registration_z_spacing_um = float(reg["z_spacing_um"])
     if reg.get("quality_threshold") is not None:
         config_obj.quality_threshold = float(reg["quality_threshold"])
     if reg.get("max_shift_um") is not None:

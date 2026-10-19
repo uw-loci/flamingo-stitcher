@@ -60,6 +60,68 @@ REGISTRATION_OVERLAP_TARGET_PX = 32
 # the correlated volume. The intent is physical; the binning is derived from it.
 REFERENCE_Z_STEP_UM = 10.0
 
+
+class RegistrationZ(NamedTuple):
+    """How registration samples Z on one acquisition, and where that came from."""
+
+    bin_z: int          # planes averaged per registration voxel
+    spacing_um: float   # resulting Z spacing (bin_z x the acquisition's voxel)
+    voxel_um: float     # the acquisition's Z voxel after the Z downsample
+    source: str         # the setting that produced it, for the log
+
+
+def resolve_registration_z(config, z_voxel_um: float) -> RegistrationZ:
+    """Z binning for registration, from the setting and THIS acquisition's voxel.
+
+    ``registration_z_spacing_um`` is a physical spacing (0 = every plane), so
+    the same setting means the same Z resolution at a 10 µm or a 2.5 µm step;
+    only the number of planes averaged changes. When it is unset, an older
+    config's ``registration_binning["z"]`` is read the way it was written:
+    each step = ``REFERENCE_Z_STEP_UM``. That conversion is the only place the
+    10 µm still appears, and the source string says so.
+    """
+    try:
+        voxel = float(z_voxel_um or 0.0)
+    except (TypeError, ValueError):
+        voxel = 0.0
+    spacing = getattr(config, "registration_z_spacing_um", None)
+    if spacing is not None:
+        try:
+            target = max(0.0, float(spacing))
+        except (TypeError, ValueError):
+            spacing, target = None, 0.0
+    if spacing is not None:
+        source = (
+            "Reg. Z spacing: every plane" if target == 0
+            else f"Reg. Z spacing: {target:g} µm"
+        )
+    else:
+        try:
+            want = max(1, int((config.registration_binning or {}).get("z", 1) or 1))
+        except (TypeError, ValueError, AttributeError):
+            want = 1
+        target = want * REFERENCE_Z_STEP_UM
+        source = (
+            f"from the Z binning setting {want}, read as {REFERENCE_Z_STEP_UM:g} µm "
+            f"per step"
+        )
+    if voxel <= 0:
+        return RegistrationZ(1, 0.0, 0.0, source + "; Z voxel unknown, not binned")
+    bin_z = 1 if target <= 0 else max(1, int(round(target / voxel)))
+    return RegistrationZ(bin_z, bin_z * voxel, voxel, source)
+
+
+def registration_z_choices(z_voxel_um: float, max_um: float = 80.0):
+    """``[(spacing_um, planes_averaged), ...]`` the GUI offers for one voxel:
+    every plane, then doubling, up to ``max_um``. 0 = every plane."""
+    out = [(0.0, 1)]
+    if z_voxel_um and z_voxel_um > 0:
+        k = 2
+        while k * z_voxel_um <= max_um + 1e-9:
+            out.append((round(k * z_voxel_um, 3), k))
+            k *= 2
+    return out
+
 # PyImarisWriter's RAM on top of the pipeline's own peak, as a fraction of the
 # uncompressed output. NOT MEASURED: carried over from the initial extraction
 # (2026-06-08) with no record behind it. On 2026-10-16 it alone refused a
@@ -137,6 +199,7 @@ _CONFIG_FIELD_ORDER = (
     "deconvolution_fast",
     "deconvolution_psf_path",
     "registration_binning",
+    "registration_z_spacing_um",
     "quality_threshold",
     "max_registration_shift_um",
     "max_registration_shift_z_um",
@@ -525,9 +588,9 @@ _ROUGH_S_PER_OUT_UNIT = 0.08
 #   * XY bins as hard as the configured value allows while keeping the overlap
 #     strip at REGISTRATION_OVERLAP_TARGET_PX, so a heavier downsample is met
 #     with lighter binning.
-#   * Z is a physical target (REFERENCE_Z_STEP_UM), so registration always runs
-#     at ~10 um effective Z — the compared plane count is stack DEPTH / 10 um
-#     whatever the sampling.
+#   * Z is a physical spacing (registration_z_spacing_um via
+#     resolve_registration_z), so the compared plane count is stack DEPTH /
+#     spacing whatever the sampling -- and every plane when the spacing is 0.
 #
 # Per-run fits: 2.85 / 3.74 / 3.38 s per Mvoxel across
 #   2026-09-18  49 tiles   643 planes  XY=1  15% overlap   24187 s
@@ -599,6 +662,15 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
     src = acquisition_dir
     if not src and tiles:
         src = getattr(tiles[0], "folder", None)
+    reg_z = 0.0
+    if tiles and not config.skip_registration:
+        try:
+            ds_z = max(1, int(getattr(config, "downsample_z", 1) or 1))
+            reg_z = resolve_registration_z(
+                config, float(tiles[0].z_step_mm) * 1000.0 * ds_z
+            ).spacing_um
+        except Exception:
+            reg_z = 0.0
     return StitchingTimingKey(
         n_tiles=n_tiles,
         n_channels=n_channels,
@@ -624,10 +696,15 @@ def build_timing_key(tiles, config, acquisition_dir=None, output_dir=None):
         flat_field=bool(getattr(config, "flat_field_correction", False)),
         source_drive=_drive_root(src),
         dest_drive=_drive_root(output_dir),
+        reg_z_spacing_um=reg_z,
     )
 
 
 def rough_run_seconds(tiles, config) -> float:
+    return sum(rough_phase_seconds(tiles, config).values())
+
+
+def rough_phase_seconds(tiles, config) -> Dict[str, float]:
     """Very rough cold-start wall-time estimate (seconds) for one acquisition.
 
     Used only when the timing cache has no measured total for this config.
@@ -657,7 +734,44 @@ def rough_run_seconds(tiles, config) -> float:
 
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
     fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
-    return load_register + _rough_register_seconds(tiles, config) + fuse_write
+    return {
+        "preprocess": load_register,
+        "register": _rough_register_seconds(tiles, config),
+        "fuse": fuse_write,
+    }
+
+
+def progress_bands(shares: Dict[str, float]) -> Tuple[float, float]:
+    """(end of preprocess, end of registration) as fractions of the run's
+    TIME, from phase shares (measured, or the rough model's).
+
+    The pipeline reports progress on fixed percent bands (registration is
+    always 45-70), and the ETA extrapolates that percent linearly. When
+    registration is 5% of a run or 80% of it -- every plane of a 2.5 µm stack
+    -- a fixed band makes the ETA run away during the phase it misjudges.
+    """
+    pre = float(shares.get("discover", 0.0)) + float(shares.get("preprocess", 0.0))
+    reg = float(shares.get("register", 0.0))
+    rest = sum(float(v) for k, v in shares.items() if k not in ("discover", "preprocess", "register"))
+    total = pre + reg + rest
+    if total <= 0:
+        return _PCT_REGISTER / 100.0, _PCT_FUSE / 100.0
+    a = min(0.98, max(0.01, pre / total))
+    b = min(0.99, max(a, (pre + reg) / total))
+    return a, b
+
+
+def remap_progress(pct: float, bands: Tuple[float, float]) -> float:
+    """Pipeline percent -> fraction of the run's time, piecewise linear over
+    the fixed percent bands (0-45 preprocess, 45-70 register, 70-100 rest)."""
+    a, b = bands
+    p = min(100.0, max(0.0, float(pct or 0.0)))
+    r0, r1 = float(_PCT_REGISTER), float(_PCT_FUSE)
+    if p <= r0:
+        return a * p / r0
+    if p <= r1:
+        return a + (b - a) * (p - r0) / (r1 - r0)
+    return b + (1.0 - b) * (p - r1) / (100.0 - r1)
 
 
 # Stage positions that differ by less than this are the same row or column.
@@ -725,19 +839,17 @@ def _rough_overlap_fraction(tiles, config) -> float:
         return default
 
 
-def _rough_register_seconds(tiles, config) -> float:
-    """Cold-start estimate for the pairwise registration phase.
+def _registration_geometry(tiles, config, z_bin=None) -> Optional[Dict[str, Any]]:
+    """What one registration pass compares, as the run will choose it.
 
-    Models the voxels registration actually compares: the overlap strip after
-    BOTH the pipeline's downsample and the registration binning it then picks,
-    which partly cancels the downsample (see _effective_registration_binning).
-    Zero when registration is off.
+    Shared by the time and memory estimates so they model the same seams, the
+    same XY binning rule as _effective_registration_binning and the same Z rule
+    (resolve_registration_z). ``z_bin`` overrides Z with a raw plane factor,
+    for the Z-refinement pass. None when there is nothing to register.
     """
-    if getattr(config, "skip_registration", False):
-        return 0.0
     n_tiles = len(tiles)
     if n_tiles < 2:
-        return 0.0
+        return None
     rows, cols = _grid_shape(tiles)
     n_seams = rows * max(0, cols - 1) + cols * max(0, rows - 1)
     if n_seams <= 0:
@@ -761,30 +873,121 @@ def _rough_register_seconds(tiles, config) -> float:
     while bin_xy > 1 and strip_px / bin_xy < REGISTRATION_OVERLAP_TARGET_PX:
         bin_xy -= 1
 
-    # Z: a physical target, so the compared plane count is stack depth divided
-    # by the reference step, whatever the sampling.
     z_step_um = 0.0
     try:
         z_step_um = float(t0.z_step_mm) * 1000.0
     except Exception:
         pass
-    reg_planes = planes / ds_z
-    if z_step_um > 0:
-        try:
-            want = max(1, int((config.registration_binning or {}).get("z", 1) or 1))
-        except Exception:
-            want = 1
-        bin_z = max(1, int(round(want * REFERENCE_Z_STEP_UM / (z_step_um * ds_z))))
-        reg_planes = reg_planes / bin_z
+    rz = resolve_registration_z(config, z_step_um * ds_z)
+    bin_z = max(1, int(z_bin)) if z_bin else rz.bin_z
+    reg_planes = (planes / ds_z) / bin_z
+    seam_vox = reg_planes * (fh / (ds_xy * bin_xy)) * (strip_px / bin_xy)
+    return {
+        "n_seams": n_seams,
+        "seam_vox": seam_vox,
+        "reg_planes": reg_planes,
+        "bin_xy": bin_xy,
+        "bin_z": bin_z,
+        "z": rz,
+    }
 
-    mvox_per_seam = (
-        reg_planes * (fh / (ds_xy * bin_xy)) * (strip_px / bin_xy)
-    ) / 1e6
-    seconds = _ROUGH_S_PER_REG_MVOXEL * mvox_per_seam * n_seams
-    # A second pairwise pass over the same seams, at finer Z.
+
+def _rough_register_seconds(tiles, config) -> float:
+    """Cold-start estimate for the pairwise registration phase.
+
+    Models the voxels registration actually compares: the overlap strip after
+    BOTH the pipeline's downsample and the registration binning it then picks,
+    which partly cancels the downsample (see _effective_registration_binning),
+    and the Z spacing from resolve_registration_z. Zero when registration is
+    off.
+    """
+    if getattr(config, "skip_registration", False):
+        return 0.0
+    try:
+        geo = _registration_geometry(tiles, config)
+    except Exception:  # an estimate must never fail a run
+        return 0.0
+    if geo is None:
+        return 0.0
+    seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
+    # The Z-refinement pass is a second pairwise pass over the same seams at
+    # its own binning (every plane, coarser XY), so cost it as such rather
+    # than as a flat doubling: at a 2.5 µm step every plane is 4-8x the main
+    # pass's planes.
     if getattr(config, "registration_z_refine", False):
-        seconds *= 2.0
+        seconds += _rough_refine_seconds(tiles, config)
     return seconds
+
+
+def _refine_geometry(tiles, config):
+    b = dict(getattr(config, "registration_z_refine_binning", None) or {})
+    ref_cfg = _copy_config_with(
+        config, registration_binning={"z": 1, "y": int(b.get("y", 4)), "x": int(b.get("x", 4))}
+    )
+    return _registration_geometry(tiles, ref_cfg, z_bin=int(b.get("z", 1) or 1))
+
+
+def _rough_refine_seconds(tiles, config) -> float:
+    try:
+        geo = _refine_geometry(tiles, config)
+    except Exception:  # an estimate must never fail a run
+        return 0.0
+    if geo is None:
+        return 0.0
+    return _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
+
+
+def _copy_config_with(config, **changes):
+    import copy
+
+    c = copy.copy(config)
+    for k, v in changes.items():
+        setattr(c, k, v)
+    return c
+
+
+# Peak RAM of ONE pairwise registration, per voxel it compares (after binning).
+# Measured 2026-10-19 on multiview-stitcher 0.1.59 with registration.register on
+# a dask-backed pair (tracemalloc and RSS agree): 112-124 B per compared voxel
+# once the overlap is large (8-17 M voxels), the float32 transformed copies,
+# float64 rescale and complex FFT buffers. Pairs run one at a time for 3-D data
+# (n_parallel_pairwise_regs=1), so this is per seam, not summed.
+REGISTRATION_BYTES_PER_COMPARED_VOXEL = 124.0
+# Plus dask's chunk buffers while the overlap is cut out and binned: small
+# overlaps peaked up to ~340 MB above the per-voxel term with 64x256x256
+# chunks on 16 threads (~10 float64 chunks). Modelled as one float64 chunk
+# per thread, which covered every measured case.
+_REGISTRATION_CHUNK_BUFFERS_PER_THREAD = 1
+
+
+def estimate_registration_peak_bytes(tiles, config) -> int:
+    """RAM the registration phase adds on top of what is already held.
+
+    The largest seam's compared voxels x REGISTRATION_BYTES_PER_COMPARED_VOXEL,
+    plus chunk buffers; the Z-refinement pass is costed too and the larger of
+    the two is the peak (they run one after the other). 0 when skipped.
+    """
+    if getattr(config, "skip_registration", False):
+        return 0
+    try:
+        geos = [_registration_geometry(tiles, config)]
+    except Exception:  # an estimate must never fail a run
+        return 0
+    if getattr(config, "registration_z_refine", False):
+        try:
+            geos.append(_refine_geometry(tiles, config))
+        except Exception:
+            pass
+    geos = [g for g in geos if g]
+    if not geos:
+        return 0
+    import os
+
+    cz, cy, cx = _DASK_PROCESSING_CHUNKS
+    chunk_bytes = cz * cy * cx * 8
+    buffers = (os.cpu_count() or 4) * _REGISTRATION_CHUNK_BUFFERS_PER_THREAD * chunk_bytes
+    per_vox = max(g["seam_vox"] for g in geos) * REGISTRATION_BYTES_PER_COMPARED_VOXEL
+    return int(per_vox + buffers)
 
 
 # Tile file extensions the discovery + loader understand. The acquisition can
@@ -1238,6 +1441,13 @@ class StitchingConfig:
     registration_binning: Dict[str, int] = field(
         default_factory=lambda: {"z": 2, "y": 4, "x": 4}
     )
+    # The Z spacing, in µm, registration correlates on: planes are averaged in
+    # groups of round(spacing / this acquisition's Z voxel). 0 = every plane.
+    # None = derive it from registration_binning["z"] the way older configs
+    # meant it (each step = REFERENCE_Z_STEP_UM). See resolve_registration_z;
+    # every consumer -- the run, the ETA, the memory estimate, the axial bound
+    # -- goes through it so they cannot disagree.
+    registration_z_spacing_um: Optional[float] = None
     quality_threshold: float = 0.4  # Min phase-correlation quality (Spearman).
     # Was 0.2 — too permissive: low-content tiles (background / featureless
     # bright blur) clear a 0.2 correlation with a garbage shift. 0.4 makes those
@@ -1318,9 +1528,10 @@ class StitchingConfig:
     # matrix per pair and nothing else.
     registration_upsample_factor: int = 0
 
-    # Dedicated second registration pass whose only job is Z. The main pass is
-    # binned z=2 for speed, which is the wrong trade for the axis with the
-    # coarsest voxel: it resolves Z to ~one raw plane while resolving XY to a
+    # Dedicated second registration pass whose only job is Z. The main pass
+    # compares planes at registration_z_spacing_um for speed, which is the wrong
+    # trade for the axis with the coarsest voxel: it resolves Z to ~half that
+    # spacing while resolving XY to a
     # fraction of a pixel. The second pass re-registers from the first pass's
     # result at full Z resolution and contributes ONLY its Z component. Off by
     # default — it is a second pairwise pass, roughly doubling registration
@@ -2240,7 +2451,14 @@ def estimate_memory_usage(
     in_memory_resident_gb = (
         held_tiles_gb + fusion_gb + max(fused_materialize_gb, write_phase_gb)
     )
-    in_memory_gb = max(in_memory_resident_gb, materialize_gb)
+    # Registration runs between preprocessing and fusion, one seam at a time.
+    # It was not modelled at all, which was harmless at ~10-20 µm Z and is not
+    # at every plane of a 2.5 µm stack (~35 GB for one seam of a 2999-plane
+    # tile at XY=2x). In-memory it sits on top of the held tiles.
+    registration_gb = estimate_registration_peak_bytes(tiles, config) / (1024**3)
+    in_memory_gb = max(
+        in_memory_resident_gb, materialize_gb, held_tiles_gb + registration_gb
+    )
 
     # --- Streaming peak ---
     # Tiles spill to an on-disk memmap and the fused output goes to an on-disk
@@ -2249,14 +2467,16 @@ def estimate_memory_usage(
     # of the two phases, not their sum. A couple of chunk buffers ride along
     # during the zarr/TIFF write.
     chunk_buffer_gb = _streaming_workers * chunk_z * chunk_y * chunk_x * bpv / (1024**3)
-    streaming_gb = max(materialize_gb, fusion_gb + chunk_buffer_gb)
+    streaming_gb = max(materialize_gb, fusion_gb + chunk_buffer_gb, registration_gb)
 
     # Which term the peak is pinned to. Preprocessing runs at NATIVE resolution
     # (before downsample), so once it dominates, turning downsample up stops
     # moving the estimate and both modes report the same number -- surfacing
     # that here is what makes an unresponsive figure explainable instead of
     # looking broken.
-    if materialize_gb >= in_memory_resident_gb:
+    if registration_gb > max(materialize_gb, fusion_gb + chunk_buffer_gb):
+        limited_by = "registration"
+    elif materialize_gb >= in_memory_resident_gb:
         limited_by = "preprocess"
     elif fusion_gb >= max(output_gb, held_tiles_gb):
         limited_by = "fusion"
@@ -2292,6 +2512,7 @@ def estimate_memory_usage(
         "fusion_gb": round(fusion_gb, 1),
         "views_per_block": int(views_per_block),
         "preprocess_gb": round(materialize_gb, 1),
+        "registration_gb": round(registration_gb, 1),
         "preprocess_workers": int(pp_workers),
         "limited_by": limited_by,
         # Peak of the in-memory fuse phase: the pre-allocated stacked array (if
@@ -4584,7 +4805,10 @@ class StitchingPipeline:
             # (per-tile in preprocess, per-region in fusion). This is what makes
             # the estimate stable and self-correcting.
             try:
-                self._estimator.update_fraction((pct or 0) / 100.0)
+                bands = getattr(self, "_eta_bands", None)
+                self._estimator.update_fraction(
+                    remap_progress(pct, bands) if bands else (pct or 0) / 100.0
+                )
             except Exception:
                 pass
             tail = self._estimator.format_label()
@@ -4710,6 +4934,7 @@ class StitchingPipeline:
         self._watchdog_projection = {
             "projected_gb": projected_gb,
             "output_gb": float(mem_est.get("output_gb", 0.0)),
+            "registration_gb": float(mem_est.get("registration_gb", 0.0) or 0.0),
             "mode": mode,
         }
         self.logger.info(
@@ -4753,6 +4978,14 @@ class StitchingPipeline:
             f"Memory-mapped scratch resident at peak: "
             f"{monitor.peak_mapped_bytes / gib:.1f} GB (disk-backed, not counted)."
         )
+        reg_proj = float(proj.get("registration_gb", 0.0) or 0.0)
+        if reg_proj > 0 and "register" in phases:
+            self.logger.info(
+                f"Registration, measured: peaked at {phases['register'] / gib:.1f} GB "
+                f"vs {reg_proj:.1f} GB projected for one seam at the binning used "
+                f"({REGISTRATION_BYTES_PER_COMPARED_VOXEL:g} B per compared voxel, "
+                f"measured off-rig 2026-10-19). Includes what preprocessing still held."
+            )
         output_gb = float(proj.get("output_gb", 0.0))
         if self.config.output_format == "imaris" and output_gb > 0 and "write" in phases:
             write_gb = phases["write"] / gib
@@ -4782,8 +5015,20 @@ class StitchingPipeline:
         # Rough cold-start prior (order-of-magnitude); the estimator prefers a
         # cached measured total when this config has run before, and refines
         # both live from the global progress fraction.
-        prior = rough_run_seconds(tiles, self.config)
-        return MultiPhaseEstimator(StitchingTimingCache(), key, prior_total_s=prior)
+        phases = rough_phase_seconds(tiles, self.config)
+        prior = sum(phases.values())
+        cache = StitchingTimingCache()
+        shares = cache.get_phase_shares(key)
+        source = "measured on similar runs"
+        if not shares or (not self.config.skip_registration and "register" not in shares):
+            shares, source = phases, "rough model"
+        self._eta_bands = progress_bands(shares)
+        a, b = self._eta_bands
+        self.logger.info(
+            f"Stitching ETA phase shares ({source}): preprocess {a:.0%}, "
+            f"registration {b - a:.0%}, fusion and writing {1 - b:.0%}"
+        )
+        return MultiPhaseEstimator(cache, key, prior_total_s=prior)
 
     # ------------------------------------------------------------------
     # Tile-border artifact QC (diagnostic)
@@ -5315,6 +5560,12 @@ class StitchingPipeline:
         else:
             self.logger.info(
                 f"Mode: {'streaming' if use_streaming else 'in-memory'} (user-selected)"
+            )
+        if mem_est.get("registration_gb"):
+            self.logger.info(
+                f"  Registration working set: ~{mem_est['registration_gb']:.1f} GB "
+                f"(largest seam at the binning this run will use"
+                f"{'; peak is set by registration' if mem_est.get('limited_by') == 'registration' else ''})"
             )
 
         # D3: if AUTO-mode picked in-memory but it would trip the resource guard
@@ -8014,7 +8265,8 @@ class StitchingPipeline:
             return {}
 
     def _effective_registration_binning(
-        self, tile_data, tiles, extent_um, configured=None, voxel_size_um=None
+        self, tile_data, tiles, extent_um, configured=None, voxel_size_um=None,
+        z_in_planes=False,
     ):
         """Binning that keeps a usable overlap strip, rather than one that
         multiplies with the downsample already applied.
@@ -8044,8 +8296,12 @@ class StitchingPipeline:
         pixels than the setting asks for — it only declines to throw away
         overlap that is already thin.
 
-        Z gets the other rule: an XY mosaic has no Z overlap to measure, so its
-        binning is simply discounted by the Z downsample already applied.
+        Z gets the other rule: an XY mosaic has no Z overlap to measure, so Z
+        follows the physical spacing setting via resolve_registration_z (the
+        same function the ETA and memory estimates use). ``z_in_planes`` takes
+        ``configured["z"]`` as a raw plane factor instead -- the Z-refinement
+        pass, whose whole point is every plane. Read as a spacing, its z=1
+        meant 10 µm, i.e. 4 planes at a 2.5 µm step.
 
         The applied factor is measured from the tile shape rather than read from
         the config, so "iso" XY and any future resolution path are handled by
@@ -8064,20 +8320,18 @@ class StitchingPipeline:
             return configured  # can't measure it; leave the setting alone
 
         effective = dict(configured)
-        if "z" in effective:
-            want = max(1, int(effective["z"] or 1))
-            # Physical target, not a raw factor: `want` planes at the reference
-            # step is the Z resolution being asked for, so the binning is
-            # whatever reaches it on THIS acquisition's voxel. voxel_size_um is
-            # post-downsample, so this covers the Z downsample too and must not
-            # also divide by applied_z.
+        rz = None
+        if z_in_planes:
+            effective["z"] = max(1, int(effective.get("z", 1) or 1))
+        else:
+            # voxel_size_um is post-downsample, so this covers the Z downsample
+            # too and must not also divide by applied_z.
             z_voxel = float((voxel_size_um or {}).get("z", 0.0) or 0.0)
-            if z_voxel > 0:
-                effective["z"] = max(
-                    1, int(round(want * REFERENCE_Z_STEP_UM / z_voxel))
-                )
-            else:
-                effective["z"] = max(1, int(round(want / (applied_z or 1.0))))
+            rz = resolve_registration_z(
+                _copy_config_with(self.config, registration_binning=configured),
+                z_voxel,
+            )
+            effective["z"] = rz.bin_z
 
         thin = ""
         fractions = {}
@@ -8124,31 +8378,30 @@ class StitchingPipeline:
                     f"below the quality threshold."
                 )
 
-        if effective != configured:
-            # Say why per axis: the two rules are different, and one sentence
-            # about overlap pixels used to explain a Z change it had no part in.
+        if rz is not None:
+            # Always said, changed or not: it decides the Z precision floor and
+            # most of the registration cost, so the log must show where it came
+            # from and what it became on this acquisition.
+            planes = "every plane" if rz.bin_z == 1 else f"{rz.bin_z} planes averaged"
+            self.logger.info(
+                f"  Registration Z: {planes} of {rz.voxel_um:g} µm = "
+                f"{rz.spacing_um:g} µm ({rz.source}). Z shifts resolve to about "
+                f"half of that per seam."
+            )
+        lateral_changed = any(
+            effective.get(a) != configured.get(a) for a in ("y", "x")
+        )
+        if lateral_changed:
             why = []
-            if effective.get("z") != configured.get("z"):
-                z_voxel = float((voxel_size_um or {}).get("z", 0.0) or 0.0)
-                if z_voxel > 0:
-                    want = max(1, int(configured.get("z") or 1))
-                    why.append(
-                        f"Z {configured.get('z')} means ~{want * REFERENCE_Z_STEP_UM:g} µm "
-                        f"of Z (each step = {REFERENCE_Z_STEP_UM:g} µm, the step it was "
-                        f"tuned at), so {effective['z']} planes of {z_voxel:g} µm "
-                        f"= {effective['z'] * z_voxel:.1f} µm"
-                    )
-                else:
-                    why.append("Z discounted by the Z downsample already applied")
-            if any(effective.get(a) != configured.get(a) for a in ("y", "x")):
+            if lateral_changed:
                 why.append(
                     f"XY lowered to keep about {REGISTRATION_OVERLAP_TARGET_PX} px "
                     f"of tile overlap to correlate on; the configured value is "
                     f"against native tiles and these are already downsampled"
                 )
             self.logger.info(
-                f"  Registration binning {dict(configured)} -> {effective}: "
-                + "; ".join(why) + f".{thin}"
+                f"  Registration XY binning {configured.get('x')} -> "
+                f"{effective.get('x')}: " + "; ".join(why) + f".{thin}"
             )
         elif thin:
             self.logger.warning(f"  Registration overlap is thin.{thin}")
@@ -8313,6 +8566,7 @@ class StitchingPipeline:
                 self._frame_extent_um(tile_data, voxel_size_um),
                 configured=self.config.registration_z_refine_binning,
                 voxel_size_um=voxel_size_um,
+                z_in_planes=True,
             )
             with dask.diagnostics.ProgressBar():
                 refined = registration.register(
@@ -9283,6 +9537,7 @@ class StitchingPipeline:
         settings = {
             "quality_threshold": self.config.quality_threshold,
             "registration_binning": dict(self.config.registration_binning),
+            "registration_z_spacing_um": self.config.registration_z_spacing_um,
             "upsample_factor": self.config.registration_upsample_factor,
             "voxel_z_um": float(voxel_size_um.get("z", 0.0)),
             "voxel_y_um": float(voxel_size_um.get("y", 0.0)),
@@ -9901,11 +10156,10 @@ class StitchingPipeline:
         configured = float(
             getattr(self.config, "max_registration_shift_z_um", 0.0) or 0.0
         )
-        binning_z = 1
-        try:
-            binning_z = max(1, int(self.config.registration_binning.get("z", 1) or 1))
-        except Exception:
-            pass
+        # The binning the run actually uses (resolve_registration_z), not the
+        # raw setting: at a 2.5 µm step "z=1" is 4 planes, and a floor of one
+        # setting-step would have clamped quantization as a measurement.
+        binning_z = resolve_registration_z(self.config, vz).bin_z
         # Pass 1 registers at `binning_z` Z voxels, so it can only EXPRESS
         # multiples of that. A bound below one binned step would clamp pure
         # quantization and report it as a rejected measurement.

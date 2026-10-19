@@ -101,15 +101,24 @@ registration:
   # `empty_overlap` (never attempted) rather than counted as failures.
   seam_content_gate: true
 
-  # Downsampling factors for phase-correlation registration.
-  # Higher values = faster but less precise.
-  # Fine:    {z: 1, y: 2, x: 2}   — most accurate, slowest
-  # Default: {z: 2, y: 4, x: 4}   — good balance
-  # Fast:    {z: 4, y: 8, x: 8}   — fastest, may miss small shifts
+  # Lateral binning for phase-correlation registration (y, x), a maximum: the
+  # run lowers it to keep ~32 px of overlap after the XY downsample.
+  # z is the older way of setting Z: N x 10 um (2 = 20 um). Used only when
+  # z_spacing_um below is not set.
   binning:
     z: 2
     y: 4
     x: 4
+
+  # Z spacing registration correlates on, in um. 0 = every plane. Planes are
+  # averaged in groups of round(z_spacing_um / the acquisition's Z step), so the
+  # same value means the same Z resolution at a 10 um or a 2.5 um step. Sets the
+  # floor on Z precision (about half this per seam). Registration time and RAM
+  # both scale with the planes compared: every plane of a 2.5 um stack is 8x
+  # the work of 20 um (one seam of a 2999-plane tile at XY=2x: ~35 GB vs ~4 GB).
+  # Left unset here so binning.z above (and older config files that only have
+  # it) keep meaning what they meant; the GUI and --reg-z-spacing-um set it.
+  # z_spacing_um: 20
 
   # Minimum phase-correlation quality score (0.0 - 1.0, Spearman correlation).
   # Tile pairs below this threshold are treated as unregistered (tiles fall

@@ -1238,7 +1238,6 @@ class StitchingDialog(PersistentDialog):
         for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
             self._reg_binning_xy_combo.addItem(_label, _value)
         from flamingo_stitcher.pipeline import (
-            REFERENCE_Z_STEP_UM as _REF_Z_UM,
             REGISTRATION_OVERLAP_TARGET_PX as _OVERLAP_PX,
         )
 
@@ -1256,28 +1255,35 @@ class StitchingDialog(PersistentDialog):
         )
         rb_layout.addWidget(self._reg_binning_xy_combo)
         rb_layout.addSpacing(16)  # visible gap between the XY group and Z group
-        self._reg_binning_z_label = QLabel("Z")
-        rb_layout.addWidget(self._reg_binning_z_label)
-        self._reg_binning_z_combo = QComboBox()
-        for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
-            self._reg_binning_z_combo.addItem(_label, _value)
-        self._reg_binning_z_combo.setToolTip(
-            "How much to bin tiles axially for phase correlation, independent\n"
-            "of XY.\n"
-            f"Not a plane count: each step means about {_REF_Z_UM:g} µm of Z, after\n"
-            f"the Z downsample, so it does not stack with it (1x = ~{_REF_Z_UM:g} µm,\n"
-            f"2x = ~{2 * _REF_Z_UM:g} µm; the log shows the binning used).\n\n"
-            "This sets the FLOOR on Z precision: a shift can only be resolved\n"
-            "to about one binned voxel.\n\n"
-            "1x doubles the correlation volume but is the cheapest way to\n"
-            "improve Z alignment — it costs one axis, where lowering XY costs\n"
-            "two. Use it before reaching for 'Refine Z alignment', which runs\n"
-            "a whole second pass."
+        self._reg_z_spacing_label = QLabel("Z spacing")
+        rb_layout.addWidget(self._reg_z_spacing_label)
+        # Spacings in µm, built from the selected acquisition's own Z step (and
+        # the Z downsample) by _rebuild_reg_z_choices: "Every plane", then
+        # doubling. Data = µm, 0 = every plane. It replaced a "1x/2x/4x/8x"
+        # combo where 1x silently meant 10 µm, so at a 2.5 µm step nobody could
+        # register on every plane, and the log blamed the XY overlap rule.
+        self._reg_z_spacing_combo = QComboBox()
+        self._reg_z_voxel_um = None
+        self._rebuild_reg_z_choices(None, keep=20.0)
+        self._reg_z_spacing_combo.setToolTip(
+            "The Z spacing registration compares tiles on. Planes are averaged\n"
+            "in groups to reach it, so the same choice means the same Z\n"
+            "resolution at any Z step; the run log shows the planes used.\n\n"
+            "This sets the FLOOR on Z precision: each seam's Z shift resolves to\n"
+            "about half the spacing.\n\n"
+            "COST: registration time and memory both grow with the planes\n"
+            "compared. Every plane of a 2.5 µm stack is 8x the work of 20 µm,\n"
+            "and one seam of a 2999-plane tile at XY 2x needs ~35 GB of RAM\n"
+            "instead of ~4 GB. The line below the registration settings gives\n"
+            "the rough time and memory for the acquisitions in the queue, and\n"
+            "the memory estimate and queue time include it.\n\n"
+            "Cheaper first: 'Refine Z alignment' runs a second pass on every\n"
+            "plane with coarser XY and keeps only its Z result."
         )
-        rb_layout.addWidget(self._reg_binning_z_combo)
+        rb_layout.addWidget(self._reg_z_spacing_combo)
         rb_layout.addStretch(1)
         reg_layout.addLayout(rb_layout, 0, 3)
-        self._set_registration_binning({"z": 2, "y": 4, "x": 4})
+        self._set_registration_binning({"y": 4, "x": 4})
 
         # Proc Row 3: Max registration shift (registration sub-option; only
         # meaningful when registration runs, so it greys out with Skip reg).
@@ -1333,14 +1339,17 @@ class StitchingDialog(PersistentDialog):
         self._z_refine_cb = QCheckBox("Refine Z alignment ✱")
         self._z_refine_cb.setToolTip(
             "Run a second registration pass whose only job is Z.\n\n"
-            "The main pass registers at Z binning 2 and multiview-stitcher\n"
-            "upsamples 3-D phase correlation by only 2, so Z resolves to about one\n"
-            "raw plane while X/Y resolve a fraction of a pixel — the coarsest\n"
-            "treatment on the axis with the coarsest voxel. This pass re-registers\n"
-            "from the first pass's result at full Z resolution and contributes ONLY\n"
-            "its Z component; X/Y are left exactly as the first pass set them.\n\n"
-            "Costs roughly 2-3x the registration time. Turn it on when\n"
-            "registration_seams.csv shows pairs disagreeing in Z while X/Y is clean."
+            "The main pass compares planes at the 'Z spacing' setting, and\n"
+            "multiview-stitcher refines a 3-D match to only half a voxel, so Z\n"
+            "resolves to about half that spacing while X/Y resolve a fraction\n"
+            "of a pixel. This pass re-registers from the first pass's result on\n"
+            "EVERY plane, with XY binned 4x, refines to a tenth of a plane, and\n"
+            "contributes ONLY its Z component; X/Y stay as the first pass set\n"
+            "them.\n\n"
+            "Cost: a second pass over every seam on every plane. The cost line\n"
+            "below, the memory estimate and the queue time include it. Turn it\n"
+            "on when registration_seams.csv shows pairs disagreeing in Z while\n"
+            "X/Y is clean."
         )
         reg_layout.addWidget(self._z_refine_cb, 2, 0, 1, 2)
 
@@ -1398,6 +1407,14 @@ class StitchingDialog(PersistentDialog):
             "Costs one line per tile and one per adjacent pair."
         )
         reg_layout.addWidget(self._verbose_align_cb, 5, 0, 1, 4)
+
+        # What the Z spacing will cost on the queued acquisitions. Filled by
+        # _update_reg_z_cost from the same functions the run and the memory
+        # estimate use, so the warning cannot disagree with them.
+        self._reg_z_cost_label = QLabel("")
+        self._reg_z_cost_label.setWordWrap(True)
+        self._reg_z_cost_label.setTextFormat(Qt.RichText)
+        reg_layout.addWidget(self._reg_z_cost_label, 6, 0, 1, 4)
 
         self._z_snap_cb = QCheckBox("Snap Z shifts to whole planes")
         self._z_snap_cb.setChecked(True)
@@ -1543,6 +1560,7 @@ class StitchingDialog(PersistentDialog):
             self._deconv_cb,
             self._flat_field_cb,
             self._skip_reg_cb,
+            self._z_refine_cb,
         ):
             _cb.toggled.connect(self._refresh_memory_estimate)
         for _combo in (
@@ -1550,7 +1568,7 @@ class StitchingDialog(PersistentDialog):
             self._fusion_combo,
             self._tile_fusion_combo,
             self._reg_binning_xy_combo,
-            self._reg_binning_z_combo,
+            self._reg_z_spacing_combo,
             self._chunk_size_combo,
         ):
             _combo.currentIndexChanged.connect(self._refresh_memory_estimate)
@@ -2721,19 +2739,35 @@ class StitchingDialog(PersistentDialog):
             self.layout().activate()
         self.resize(self.width(), self.sizeHint().height())
 
-    def _registration_binning(self) -> dict:
-        """The per-axis binning dict multiview-stitcher wants, from XY and Z.
+    def _restore_reg_z_spacing(self, s) -> None:
+        """Saved Z spacing, or an older saved "reg_binning_z" read as what it
+        meant (N x REFERENCE_Z_STEP_UM). Default 20 µm, the old z=2."""
+        if s.contains("reg_z_spacing_um"):
+            self._set_registration_z_spacing(s.value("reg_z_spacing_um", 20.0, type=float))
+        elif s.contains("reg_binning_z"):
+            from flamingo_stitcher.pipeline import REFERENCE_Z_STEP_UM
 
-        The dict stays the one canonical form -- it is what the pipeline, the
-        YAML and the CLI all carry, and what MVS is handed. XY and Z are how
-        it is CHOSEN, not a second place it is stored.
+            self._set_registration_z_spacing(
+                max(1, s.value("reg_binning_z", 2, type=int)) * REFERENCE_Z_STEP_UM
+            )
+        else:
+            self._set_registration_z_spacing(20.0)
+
+    def _registration_binning(self) -> dict:
+        """The per-axis binning dict multiview-stitcher wants.
+
+        Lateral only, from the XY combo. Z is chosen as a spacing
+        (``_registration_z_spacing``) and resolved per acquisition by the
+        pipeline; "z" stays in the dict at its old default only so files read
+        by older versions keep a valid shape -- the run ignores it whenever
+        ``registration_z_spacing_um`` is set, which the dialog always does.
         """
         xy = int(self._reg_binning_xy_combo.currentData() or 1)
-        z = int(self._reg_binning_z_combo.currentData() or 1)
-        return {"z": z, "y": xy, "x": xy}
+        return {"z": 2, "y": xy, "x": xy}
 
     def _set_registration_binning(self, binning) -> None:
-        """Drive the XY and Z combos from a per-axis dict.
+        """Drive the XY combo from a per-axis dict, and the Z spacing from an
+        older dict's "z" (N x REFERENCE_Z_STEP_UM, what it meant then).
 
         A dict whose X and Y differ cannot be shown exactly, so the larger of
         the two is selected and the mismatch logged rather than silently
@@ -2744,9 +2778,9 @@ class StitchingDialog(PersistentDialog):
         if not isinstance(binning, dict):
             return
         try:
-            z = int(binning.get("z", 2))
             y = int(binning.get("y", 4))
             x = int(binning.get("x", y))
+            z = int(binning["z"]) if "z" in binning else None
         except (TypeError, ValueError):
             return
         if x != y:
@@ -2756,15 +2790,203 @@ class StitchingDialog(PersistentDialog):
                 f"separately in the config file if they must differ."
             )
         self._set_combo_by_data(self._reg_binning_xy_combo, max(x, y))
-        self._set_combo_by_data(self._reg_binning_z_combo, z)
+        if z is not None:
+            from flamingo_stitcher.pipeline import REFERENCE_Z_STEP_UM
+
+            self._set_registration_z_spacing(max(1, z) * REFERENCE_Z_STEP_UM)
+
+    def _registration_z_spacing(self) -> float:
+        """Selected registration Z spacing in µm; 0 = every plane."""
+        v = self._reg_z_spacing_combo.currentData()
+        try:
+            return max(0.0, float(v))
+        except (TypeError, ValueError):
+            return 20.0
+
+    def _set_registration_z_spacing(self, um) -> None:
+        try:
+            um = max(0.0, float(um))
+        except (TypeError, ValueError):
+            return
+        if not self._select_reg_z(um):
+            self._rebuild_reg_z_choices(self._reg_z_voxel_um, keep=um)
+
+    def _select_reg_z(self, um) -> bool:
+        combo = self._reg_z_spacing_combo
+        for i in range(combo.count()):
+            if abs(float(combo.itemData(i)) - um) < 1e-6:
+                combo.setCurrentIndex(i)
+                return True
+        return False
+
+    def _reg_z_voxel_from_ui(self):
+        """This acquisition's Z voxel after the Z downsample, µm, or None.
+
+        From the Z step box when set, else the first queued acquisition's own
+        step. The pipeline resolves the spacing per acquisition at run time;
+        this only labels the choices.
+        """
+        z_step = float(self._z_step_spin.value()) if hasattr(self, "_z_step_spin") else 0.0
+        if z_step <= 0:
+            for it in getattr(self, "_queue", []) or []:
+                tiles = it.get("tiles")
+                if tiles:
+                    try:
+                        z_step = float(tiles[0].z_step_mm) * 1000.0
+                    except Exception:
+                        z_step = 0.0
+                    break
+        if z_step <= 0:
+            return None
+        ds_z = self._downsample_z_combo.currentData() if hasattr(self, "_downsample_z_combo") else 1
+        if ds_z == -1:
+            try:
+                from flamingo_stitcher.pipeline import compute_iso_downsample
+
+                _, ds_z = compute_iso_downsample(self._pixel_size_spin.value(), z_step)
+            except Exception:
+                ds_z = 1
+        return z_step * max(1, int(ds_z or 1))
+
+    def _rebuild_reg_z_choices(self, voxel_um, keep=None) -> None:
+        """Offer every plane plus doubling spacings for ``voxel_um``.
+
+        ``keep`` (µm) stays selected; a value that is not one of the offered
+        multiples (a saved 20 µm on a 3 µm step) is kept as its own entry and
+        the pipeline rounds it to the nearest whole number of planes.
+        """
+        from flamingo_stitcher.pipeline import registration_z_choices
+
+        combo = self._reg_z_spacing_combo
+        if keep is None and combo.count():
+            keep = self._registration_z_spacing()
+        self._reg_z_voxel_um = voxel_um
+        combo.blockSignals(True)
+        try:
+            combo.clear()
+            if voxel_um:
+                for um, planes in registration_z_choices(voxel_um):
+                    if planes == 1:
+                        combo.addItem(f"Every plane ({voxel_um:g} µm)", 0.0)
+                    else:
+                        combo.addItem(f"{um:g} µm ({planes} planes)", float(um))
+            else:
+                combo.addItem("Every plane", 0.0)
+                for um in (5.0, 10.0, 20.0, 40.0, 80.0):
+                    combo.addItem(f"{um:g} µm", um)
+            if keep is not None and not self._select_reg_z(float(keep)):
+                if voxel_um:
+                    n = max(1, int(round(float(keep) / voxel_um)))
+                    label = f"{float(keep):g} µm (~{n} planes)"
+                else:
+                    label = f"{float(keep):g} µm"
+                combo.addItem(label, float(keep))
+                combo.setCurrentIndex(combo.count() - 1)
+        finally:
+            combo.blockSignals(False)
+
+    def _sync_reg_z_choices(self) -> None:
+        """Relabel the Z spacing choices when the acquisition's Z voxel changes
+        (new queue item, Z step typed, Z downsample changed)."""
+        if not hasattr(self, "_reg_z_spacing_combo"):
+            return
+        v = self._reg_z_voxel_from_ui()
+        if v != self._reg_z_voxel_um:
+            self._rebuild_reg_z_choices(v)
+
+    def _update_reg_z_cost(self, tile_sets, config) -> None:
+        """Say what the chosen Z spacing costs, for the worst queued item.
+
+        Time from the rough registration model and memory from the measured
+        bytes-per-voxel model -- the same functions behind the queue time and
+        the memory estimate -- next to the same at the default 20 µm, so the
+        price of a finer choice is visible before Start.
+        """
+        label = getattr(self, "_reg_z_cost_label", None)
+        if label is None:
+            return
+        if config.skip_registration or not tile_sets:
+            label.setText("")
+            return
+        try:
+            import copy
+
+            from flamingo_stitcher.pipeline import (
+                _registration_geometry,
+                _rough_register_seconds,
+                estimate_registration_peak_bytes,
+            )
+
+            ref = copy.copy(config)
+            ref.registration_z_spacing_um = 20.0
+            worst = None
+            for _label, tset in tile_sets:
+                geo = _registration_geometry(tset, config)
+                if geo is None:
+                    continue
+                row = (
+                    _rough_register_seconds(tset, config),
+                    estimate_registration_peak_bytes(tset, config) / 1024**3,
+                    _rough_register_seconds(tset, ref),
+                    estimate_registration_peak_bytes(tset, ref) / 1024**3,
+                    geo,
+                )
+                if worst is None or row[1] > worst[1]:
+                    worst = row
+            if worst is None:
+                label.setText("")
+                return
+            t, gb, t_ref, gb_ref, geo = worst
+
+            def _format_duration(sec):
+                m = int(round(sec / 60.0))
+                return f"{m // 60} h {m % 60:02d} min" if m >= 60 else f"{max(1, m)} min"
+
+            rz = geo["z"]
+            try:
+                import psutil
+
+                avail = psutil.virtual_memory().available / 1024**3
+            except Exception:
+                avail = 0.0
+            if avail and gb > 0.95 * avail:
+                colour = "#D32F2F"
+            elif (avail and gb > 0.7 * avail) or t > 2.0 * max(t_ref, 1.0):
+                colour = "#F57C00"
+            else:
+                colour = "#666"
+            what = (
+                "every plane" if rz.bin_z == 1
+                else f"{rz.bin_z} planes averaged"
+            )
+            cmp = ""
+            if abs(rz.spacing_um - 20.0) > 0.05 and rz.voxel_um:
+                cmp = (
+                    f" At 20 µm: ~{_format_duration(t_ref)}, "
+                    f"~{gb_ref:.1f} GB."
+                )
+            ram = f" of {avail:.0f} GB free" if avail else ""
+            refine = (
+                " Includes the Z refinement pass (every plane)."
+                if getattr(config, "registration_z_refine", False) else ""
+            )
+            label.setText(
+                f"<span style='color:{colour};'>Registration Z: {what} = "
+                f"{rz.spacing_um:g} µm, {int(round(geo['reg_planes']))} planes "
+                f"compared per seam. Rough cost: ~{_format_duration(t)} and "
+                f"~{gb:.1f} GB{ram} for one seam.{refine}{cmp}</span>"
+            )
+        except Exception as e:
+            logger.debug(f"Registration Z cost skipped: {e}")
+            label.setText("")
 
     def _on_skip_reg_toggled(self, checked: bool):
         """Enable/disable registration controls based on skip state."""
         for _widget in (
             self._reg_binning_xy_combo,
-            self._reg_binning_z_combo,
+            self._reg_z_spacing_combo,
             self._reg_binning_xy_label,
-            self._reg_binning_z_label,
+            self._reg_z_spacing_label,
             self._reg_binning_label,
         ):
             _widget.setEnabled(not checked)
@@ -2894,6 +3116,7 @@ class StitchingDialog(PersistentDialog):
         if not hasattr(self, "_voxel_readout_label"):
             # Signals can fire during _build_ui before the label exists.
             return
+        self._sync_reg_z_choices()
         xy_pixel = self._pixel_size_spin.value()
         z_step = self._z_step_spin.value()
         ds_xy = self._downsample_xy_combo.currentData()
@@ -2951,6 +3174,7 @@ class StitchingDialog(PersistentDialog):
                 (it.get("path"), it["tiles"]) for it in self._queue if it["tiles"]
             ]
 
+        self._sync_reg_z_choices()
         if not tile_sets:
             self._memory_label.setText(_ESTIMATES_PLACEHOLDER)
             self._last_mem_estimate = None
@@ -2975,6 +3199,7 @@ class StitchingDialog(PersistentDialog):
 
             est = worst_est
             self._last_mem_estimate = est
+            self._update_reg_z_cost(tile_sets, config)
 
             mode_hint = ""
             if est["auto_streaming"]:
@@ -3057,8 +3282,20 @@ class StitchingDialog(PersistentDialog):
                     f"({est.get('preprocess_workers', '?')} tiles at NATIVE "
                     f"resolution)\n"
                 )
+            if est.get("registration_gb"):
+                fusion_note += (
+                    f"  Registration working set: ~{_fmt_gb(est['registration_gb'])} "
+                    f"(one seam at the chosen Z spacing)\n"
+                )
             limit_note = ""
-            if est.get("limited_by") == "preprocess":
+            if est.get("limited_by") == "registration":
+                limit_note = (
+                    "  Peak is set by REGISTRATION: one seam's overlap at the\n"
+                    "  chosen Z spacing. A coarser 'Z spacing', a larger XY\n"
+                    "  downsample, or 'Refine Z alignment' instead of every plane\n"
+                    "  lowers it.\n"
+                )
+            elif est.get("limited_by") == "preprocess":
                 limit_note = (
                     "  Peak is pinned by PREPROCESSING, which runs at native\n"
                     "  resolution before downsampling — raising the downsample\n"
@@ -3314,6 +3551,7 @@ class StitchingDialog(PersistentDialog):
         config.border_qc_enabled = self._border_qc_cb.isChecked()
         config.border_qc_mode = self._border_qc_mode_combo.currentData() or "mip"
         config.registration_binning = self._registration_binning()
+        config.registration_z_spacing_um = self._registration_z_spacing()
         config.package_ozx = self._ozx_cb.isChecked()
         config.tiff_pyramids = self._tiff_pyramids_cb.isChecked()
         config.streaming_mode = self._streaming_combo.currentData()
@@ -3648,6 +3886,11 @@ class StitchingDialog(PersistentDialog):
         # Not a combo any more: one per-axis dict drives two controls.
         if has("registration_binning"):
             self._set_registration_binning(cfg["registration_binning"])
+            applied += 1
+        # After the dict, so a file that has both keeps its explicit spacing
+        # rather than the dict's older "z" reading.
+        if cfg.get("registration_z_spacing_um") is not None:
+            self._set_registration_z_spacing(cfg["registration_z_spacing_um"])
             applied += 1
 
         check_fields = [
@@ -4178,7 +4421,9 @@ class StitchingDialog(PersistentDialog):
             fmt_note = ""
             fmt = getattr(config, "output_format", "")
             if fmt == "imaris":
-                fmt_overhead_gb = est["output_gb"] * 0.25
+                from flamingo_stitcher.pipeline import IMARIS_WRITER_RAM_FRACTION_ASSUMED
+
+                fmt_overhead_gb = est["output_gb"] * IMARIS_WRITER_RAM_FRACTION_ASSUMED
                 fmt_note = f" + ~{fmt_overhead_gb:.0f} GB Imaris writer overhead"
             elif fmt == "ome-zarr-v2":
                 fmt_overhead_gb = est["output_gb"] * 0.30
@@ -6058,7 +6303,7 @@ class StitchingDialog(PersistentDialog):
         # binning than was ever chosen, applied silently. Leaving that key
         # unread lets it age out instead.
         s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
-        s.setValue("reg_binning_z", self._reg_binning_z_combo.currentData())
+        s.setValue("reg_z_spacing_um", self._registration_z_spacing())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -6237,13 +6482,8 @@ class StitchingDialog(PersistentDialog):
             self._border_qc_mode_combo.setCurrentIndex(_qi)
 
         _rb_xy = s.value("reg_binning_xy", 4, type=int)
-        self._set_registration_binning(
-            {
-                "z": s.value("reg_binning_z", 2, type=int),
-                "y": _rb_xy,
-                "x": _rb_xy,
-            }
-        )
+        self._set_registration_binning({"y": _rb_xy, "x": _rb_xy})
+        self._restore_reg_z_spacing(s)
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)
@@ -6395,7 +6635,7 @@ class NativeStitchingDialog(StitchingDialog):
         # binning than was ever chosen, applied silently. Leaving that key
         # unread lets it age out instead.
         s.setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())
-        s.setValue("reg_binning_z", self._reg_binning_z_combo.currentData())
+        s.setValue("reg_z_spacing_um", self._registration_z_spacing())
         s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
         s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
@@ -6573,13 +6813,8 @@ class NativeStitchingDialog(StitchingDialog):
             self._border_qc_mode_combo.setCurrentIndex(_qi)
 
         _rb_xy = s.value("reg_binning_xy", 4, type=int)
-        self._set_registration_binning(
-            {
-                "z": s.value("reg_binning_z", 2, type=int),
-                "y": _rb_xy,
-                "x": _rb_xy,
-            }
-        )
+        self._set_registration_binning({"y": _rb_xy, "x": _rb_xy})
+        self._restore_reg_z_spacing(s)
         self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
         self._max_reg_shift_z_spin.setValue(
             s.value("max_reg_shift_z", 0.0, type=float)

@@ -155,12 +155,12 @@ class TestTheOverlapFloor:
 class TestItSaysWhatItDid:
     def test_a_change_is_logged_with_both_values(self, caplog):
         _binning(StitchingConfig(), 8, caplog=caplog)
-        assert "Registration binning" in caplog.text
+        assert "Registration XY binning 4 -> 1" in caplog.text
         assert "already downsampled" in caplog.text
 
     def test_no_change_is_not_announced(self, caplog):
         _binning(StitchingConfig(), 1, caplog=caplog)
-        assert "Registration binning" not in caplog.text
+        assert "Registration XY binning" not in caplog.text
 
 
 class TestDoesNotKillTheRun:

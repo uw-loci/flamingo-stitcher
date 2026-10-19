@@ -294,10 +294,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="N",
         help=(
-            "Axial phase-correlation binning, independent of XY (default: 2). "
-            "Sets the floor on Z precision -- a shift resolves to about one "
-            "binned voxel -- so 1 is the cheapest way to improve Z alignment. "
-            "Overrides the Z component of --registration-binning."
+            "Older form of --reg-z-spacing-um: N means N x 10 um of Z "
+            "(default 2 = 20 um). Ignored when --reg-z-spacing-um is given."
+        ),
+    )
+    reg_group.add_argument(
+        "--reg-z-spacing-um",
+        type=float,
+        default=None,
+        metavar="UM",
+        help=(
+            "Z spacing registration correlates on, in um; 0 = every plane. "
+            "Planes are averaged in groups of round(UM / the acquisition's Z "
+            "step), so the same value means the same Z resolution at any step "
+            "(default 20). Sets the floor on Z precision. Cost: registration "
+            "time and its memory both scale with the planes compared, so every "
+            "plane of a 2.5 um stack is 8x the work of 20 um; the run log "
+            "prints the registration working set before starting."
         ),
     )
     reg_group.add_argument(
@@ -904,6 +917,7 @@ def main():
         ("quality_threshold", args.quality_threshold),
         ("skip_registration", args.skip_registration),
         ("registration_binning", _binning),
+        ("registration_z_spacing_um", args.reg_z_spacing_um),
         ("registration_upsample_factor", args.reg_upsample),
         ("max_registration_shift_um", args.max_reg_shift),
         ("max_registration_shift_z_um", args.max_reg_shift_z),
@@ -928,6 +942,16 @@ def main():
     ):
         if _value is not None:
             setattr(config, _attr, _value)
+    # An explicit older-style Z binning means what it always meant (N x 10 um)
+    # unless the spacing was given too; otherwise the YAML's z_spacing_um
+    # would silently override the flag the user typed.
+    if args.reg_z_spacing_um is None and _binning is not None and (
+        getattr(args, "reg_binning_z", None) is not None
+        or getattr(args, "registration_binning", None) is not None
+    ):
+        from flamingo_stitcher.pipeline import REFERENCE_Z_STEP_UM
+
+        config.registration_z_spacing_um = float(_binning["z"]) * REFERENCE_Z_STEP_UM
 
     # Tile orientation: an explicit --tile-orientation flag wins (with any
     # --reverse-*-tiles). Otherwise resolve per-acquisition from the microscope's

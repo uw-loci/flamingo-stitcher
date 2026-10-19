@@ -70,6 +70,11 @@ def _bucket_planes(n: int) -> str:
     return "1000+"
 
 
+# The registration Z spacing every key written before reg_z_spacing_um existed
+# was (almost always) measured at: the default z=2 at a 10 µm step.
+LEGACY_REG_Z_SPACING_UM = 20.0
+
+
 @dataclass(frozen=True)
 class StitchingTimingKey:
     """All key axes for the cache. Use ``.serialize()`` to get a flat
@@ -118,6 +123,13 @@ class StitchingTimingKey:
     # magnitude. Same reasoning as destripe above; this axis was simply missed
     # when split/blend/content were added in v0.13.2.
     illumination_fusion: str = "max"
+    # Registration's Z spacing (µm) as resolve_registration_z sets it on this
+    # acquisition. Registration time scales with the planes compared, so
+    # "every plane" of a 2.5 µm stack (8x the planes of 20 µm) must not be
+    # seeded from 20 µm runs. LEGACY_REG_Z_SPACING_UM (the old default, z=2)
+    # appends nothing, so existing cache entries keep matching. 0 = not
+    # registering / unknown.
+    reg_z_spacing_um: float = 0.0
 
     def serialize(self) -> str:
         return (
@@ -142,6 +154,13 @@ class StitchingTimingKey:
             + (
                 f"|if={self.illumination_fusion}"
                 if self.illumination_fusion and self.illumination_fusion != "max"
+                else ""
+            )
+            + (
+                f"|rz={round(self.reg_z_spacing_um, 2):g}"
+                if not self.skip_registration
+                and self.reg_z_spacing_um > 0
+                and abs(self.reg_z_spacing_um - LEGACY_REG_Z_SPACING_UM) > 0.05
                 else ""
             )
         )

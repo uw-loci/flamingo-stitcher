@@ -28,9 +28,12 @@ from flamingo_stitcher.pipeline import _Z_CLAMP_DEPTH_FRACTION, StitchingPipelin
 
 def _bound(vz, planes, *, binning_z=1, configured=0.0):
     p = StitchingPipeline.__new__(StitchingPipeline)
+    # binning_z is the plane factor registration actually uses; expressed as
+    # the physical spacing setting that produces it (0 = every plane).
     p.config = SimpleNamespace(
         max_registration_shift_z_um=configured,
         registration_binning={"z": binning_z, "y": 1, "x": 1},
+        registration_z_spacing_um=0.0 if binning_z <= 1 else binning_z * vz,
     )
     return p._axial_shift_bound(planes * vz, vz)
 

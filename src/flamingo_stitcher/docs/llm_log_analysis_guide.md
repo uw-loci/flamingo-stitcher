@@ -279,15 +279,14 @@ Binning purely by the downsample would be wrong in the other direction: at 2x it
 would leave a 77 px strip where 38 px already registered 11 of 12 seams — 4x the
 registration cost for margin the evidence says is not needed.
 
-    Registration binning {'z': 2, 'y': 4, 'x': 4} -> {'z': 2, 'y': 1, 'x': 1}:
-    XY lowered to keep about 32 px of tile overlap to correlate on; ...
+    Registration XY binning 4 -> 1: XY lowered to keep about 32 px of tile
+    overlap to correlate on; ...
 
 If even unbinned is under 16 px the run warns and names the number. That means
 **lower the XY downsample** — no binning setting can recover overlap the
-downsample already threw away. Z follows a different rule: each step of the Z
-setting means ~10 µm of Z (the step it was tuned at), so at a 2.5 µm step `z: 1`
-becomes 4 planes, and the log line says so. The finest Z the main pass can
-register at is therefore ~10 µm, whatever the acquisition's step.
+downsample already threw away. Z follows its own rule (section 7h) and always
+gets its own line: `Registration Z: 4 planes averaged of 2.5 µm = 10 µm
+(Reg. Z spacing: 10 µm)`.
 
 **Note on `pruned`.** It does NOT mean the seam failed: `STATUS_PRUNED` is
 "survived quality, dropped by edge pruning" — measured fine (0.89-0.95 in the run
@@ -429,20 +428,31 @@ If it does reproduce, it is worth fixing at the source: 1.65% of a 1823 µm pitc
 is ~400 px of drift across a 14x14 grid, and registration currently spends hours
 per run rediscovering it.
 
-## 7h. Registration binning follows the physical Z step
+## 7h. Registration Z is a spacing in µm
 
-`registration_binning`'s `z` is a physical target, not a raw factor: `z: 2` was
-tuned against 10 µm planes and means "register at ~20 µm effective Z". The
-binning is derived from that against the acquisition's own voxel, because the
-same number at a finer step would silently multiply the cost:
+`registration_z_spacing_um` (GUI **Z spacing**, CLI `--reg-z-spacing-um`, YAML
+`registration.z_spacing_um`) is the Z spacing registration compares on; 0 =
+every plane. Planes are averaged in groups of round(spacing / the
+acquisition's Z voxel after the Z downsample), so the same setting means the
+same Z resolution at any step:
 
-    10.0 µm step, z bin 2 -> 20.0 µm effective,  321 planes correlated  1.0x
-     2.5 µm step, z bin 2 ->  5.0 µm effective, 1286 planes correlated  4.0x
-     2.5 µm step, z bin 8 -> 20.0 µm effective,  321 planes correlated  1.0x
+    10.0 µm step, 20 µm -> 2 planes averaged,  ~321 planes compared  1.0x
+     2.5 µm step, 20 µm -> 8 planes averaged,  ~375 planes compared  1.0x
+     2.5 µm step, every plane ->  1 plane,    2999 planes compared  8.0x
 
-A 4x-finer Z sampling would otherwise turn an 8h48m registration into ~35 hours
-for axial resolution nobody asked for. `voxel_size_um` is already
-post-downsample, so the Z downsample is counted once, here — not again.
+The log line `Registration Z: ... (source)` names where the value came from.
+Older configs carry only `registration_binning.z`; it is read as it was
+meant, N x 10 µm (`from the Z binning setting N, read as 10 µm per step`).
+Before 2026-10-19 that was the only form, and its finest value, 1, meant
+10 µm, so a 2.5 µm stack could not be registered on every plane, and
+**Refine Z alignment**'s "every plane" pass ran on 4 planes averaged.
+
+Registration time AND memory scale with the planes compared. The run logs
+`Registration working set: ~N GB` at the start and `Registration, measured:`
+at the end; the ETA cache key gains `|rz=<µm>` for any spacing other than
+20 µm, and the live ETA's progress bands follow the modelled phase shares
+(`Stitching ETA phase shares (...)`), so a registration-heavy run does not
+send the estimate running away mid-phase.
 
 ## 8. Reading the Border-QC report
 
@@ -570,7 +580,7 @@ The log rarely contains these; ask before committing to a diagnosis:
 | `below_quality` seams cluster by **grid position** (whole outer columns/rows near 0.0 while the middle scores 0.3+) | Not a registration fault — the sample only covers part of the mosaic and the outer tiles are background. This is the shape that produces a disconnected registration graph. | Restrict the run to the tiles containing sample. Averaging seam quality per tile onto the grid makes this obvious in one glance. |
 | Seams with status `implausible_shift`, and `N seams passed the quality threshold but proposed a shift the geometry forbids` | The seam correlated well and proposed a shift larger than the tiles' overlap — at which point they do not overlap at all, so it cannot be a measurement of their relative position. Dropped **before** the global solve so it could not move every tile in its component. | Usually nothing: the guard did its job. A high count means the overlaps are correlating on something repetitive or elongated. Note the fix is **not** lowering `quality_threshold` — a confident wrong peak scores *well*, so that makes it worse. Tighten **Maximum lateral correction** for this microscope (Options tab / `--max-reg-shift`) instead; the automatic bound is one whole overlap. |
 | Many tiles `clamped_z`/`clamped_x` in `registration_report.csv` | Corrections exceeded the plausible bound and were reverted to the mosaic's consensus placement — those tiles are **NOT measured** (they are not at their stage position either; a clamped tile keeps the shift the whole mosaic agreed on, which opens no seam) | Read `*_before_clamp`: shifts scaling with distance ⇒ pixel-size error; constant ⇒ overlap error; alternating by row ⇒ tile ordering. None of those are fixed by registration. |
-| Z disagreement in `registration_seams.csv` while X/Y is clean | The first pass registers at Z binning 2 and multiview-stitcher upsamples 3-D by only 2 | Set `registration_binning.z` to 1 first (`--reg-binning-z 1`; independent of XY, so it doubles rather than quadruples the work). If that is not enough, turn on `registration_z_refine` (~2-3x registration time). |
+| Z disagreement in `registration_seams.csv` while X/Y is clean | The main pass compares planes at the Z spacing (default 20 µm) and multiview-stitcher upsamples 3-D by only 2 | Lower the Z spacing (`--reg-z-spacing-um`, down to 0 = every plane; time and RAM scale with the planes compared, shown before Start), or turn on `registration_z_refine` (every plane, XY binned 4x, Z only). |
 | `Z refinement: N corrections came back at the ±… µm search limit` | Those are floors, not measurements; they were rejected | Widen `--z-refine-range-um`, or check tile order — a large fraction usually means a placement error, not a Z error. |
 | Border QC: small `median step` on aligned seams | Per-tile intensity offset | Flat-field (with darkfield); consider intensity equalization (not built in). |
 | **Hard seams in signal-free background**, same at any overlap %, `blend`=dim / `max`=bright | Per-tile intensity offset (§7) | Flat-field first; no overlap mode fixes it. |

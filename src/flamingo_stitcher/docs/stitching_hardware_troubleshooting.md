@@ -359,15 +359,17 @@ If registration *did* run, work through the report in order:
    looks continuous in the index-based orientation preview but places the same
    feature at two world positions, and no aligner can fix a mirror. This is the
    Liara ghost-duplicate case.
-4. **Z specifically.** The main pass registers at Z binning 2 and
-   multiview-stitcher upsamples 3-D phase correlation by only 2, so Z resolves
-   to roughly one raw plane while XY resolves a fraction of a pixel. If seams
-   disagree in Z while XY is clean, **try `Reg. binning` Z = 1x first.** The
-   lateral and axial factors are independent (`--reg-binning-z 1`, or
-   `registration.binning.z` in YAML), and dropping Z alone doubles the
-   correlation volume where dropping XY would quadruple it — for no gain in Z.
-   If that is not enough, turn on **Refine Z alignment** (a whole second
-   pairwise pass, ~2-3x registration time). A refinement that reports
+4. **Z specifically.** The main pass compares planes at the **Z spacing**
+   setting (default 20 µm), and multiview-stitcher refines a 3-D match to only
+   half a voxel, so each seam's Z resolves to about half that spacing while XY
+   resolves a fraction of a pixel. If seams disagree in Z while XY is clean,
+   **lower `Z spacing` first** (down to **Every plane**; `--reg-z-spacing-um 0`,
+   or `registration.z_spacing_um` in YAML). Registration time and memory both
+   grow with the planes compared: every plane of a 2.5 µm stack is 8x the work
+   of 20 µm, and the dialog's cost line, memory estimate and queue time show
+   the price before you start. **Refine Z alignment** is the cheaper
+   alternative on fine stacks: a second pass on every plane with XY binned 4x,
+   keeping only its Z result. A refinement that reports
    corrections *at* its search limit has found floors, not measurements.
 
 **Too little overlap.** `Registration SKIPPED: measured tile overlap is only

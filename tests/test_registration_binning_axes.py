@@ -47,40 +47,55 @@ class TestTheDictIsBuiltFromTwoChoices:
             dlg.deleteLater()
             cls._dlg = None
 
-    def _set(self, xy, z):
-        self._dlg._set_registration_binning({"z": z, "y": xy, "x": xy})
-        return self._dlg._registration_binning()
+    def _set(self, xy, z_um):
+        self._dlg._set_registration_binning({"y": xy, "x": xy})
+        self._dlg._set_registration_z_spacing(z_um)
+        return self._dlg._registration_binning(), self._dlg._registration_z_spacing()
 
     def test_xy_drives_both_lateral_axes(self):
         # A lateral peak is ONE joint correlation, so splitting X from Y would
         # not buy anything and would invite them to disagree.
-        assert self._set(xy=8, z=1) == {"z": 1, "y": 8, "x": 8}
+        b, _ = self._set(xy=8, z_um=10.0)
+        assert (b["y"], b["x"]) == (8, 8)
 
-    def test_z_is_independent_of_xy(self):
-        assert self._set(xy=4, z=1)["z"] == 1
-        assert self._set(xy=4, z=8)["z"] == 8
-        assert self._set(xy=4, z=8)["y"] == 4
-
-    def test_xy_is_independent_of_z(self):
-        assert self._set(xy=1, z=2)["y"] == 1
-        assert self._set(xy=8, z=2)["y"] == 8
-        assert self._set(xy=8, z=2)["z"] == 2
+    def test_z_spacing_is_independent_of_xy(self):
+        assert self._set(xy=4, z_um=0.0) == ({"z": 2, "y": 4, "x": 4}, 0.0)
+        assert self._set(xy=1, z_um=40.0) == ({"z": 2, "y": 1, "x": 1}, 40.0)
 
     def test_the_default_is_what_it_always_was(self):
-        # The three-way preset defaulted to (z2 y4 x4). Splitting the control
-        # must not quietly change what an untouched dialog runs.
+        # z=2 at the 10 µm it was tuned against = 20 µm; lateral 4.
         from flamingo_stitcher.gui.stitching_dialog import StitchingDialog
 
         fresh = StitchingDialog()
         try:
-            assert fresh._registration_binning() == {"z": 2, "y": 4, "x": 4}
+            assert fresh._registration_binning()["x"] == 4
+            assert fresh._registration_z_spacing() == 20.0
         finally:
             fresh.deleteLater()
 
-    def test_every_offered_combination_round_trips(self):
-        for xy in (1, 2, 4, 8):
-            for z in (1, 2, 4, 8):
-                assert self._set(xy, z) == {"z": z, "y": xy, "x": xy}
+    def test_an_older_dict_z_is_read_as_what_it_meant(self):
+        # A saved config from before the spacing existed: z=1 meant ~10 µm.
+        self._dlg._set_registration_binning({"z": 1, "y": 4, "x": 4})
+        assert self._dlg._registration_z_spacing() == 10.0
+
+    def test_choices_follow_the_acquisition_step(self):
+        # 2.5 µm planes: every plane, then 5, 10, 20, 40, 80 -- in µm, with the
+        # plane count, so nobody has to know the reference step.
+        self._dlg._rebuild_reg_z_choices(2.5, keep=10.0)
+        combo = self._dlg._reg_z_spacing_combo
+        items = [(combo.itemText(i), combo.itemData(i)) for i in range(combo.count())]
+        assert items[0] == ("Every plane (2.5 µm)", 0.0)
+        assert ("10 µm (4 planes)", 10.0) in items
+        assert self._dlg._registration_z_spacing() == 10.0
+
+    def test_a_spacing_that_is_not_a_multiple_is_kept(self):
+        self._dlg._rebuild_reg_z_choices(3.0, keep=20.0)
+        assert self._dlg._registration_z_spacing() == 20.0
+        assert "~7 planes" in self._dlg._reg_z_spacing_combo.currentText()
+
+    def test_the_config_carries_the_spacing(self):
+        self._dlg._rebuild_reg_z_choices(2.5, keep=0.0)
+        assert self._dlg._build_config().registration_z_spacing_um == 0.0
 
 
 class TestReadingADictThatCannotBeShownExactly(TestTheDictIsBuiltFromTwoChoices):
@@ -92,8 +107,8 @@ class TestReadingADictThatCannotBeShownExactly(TestTheDictIsBuiltFromTwoChoices)
         assert self._dlg._registration_binning()["y"] == 8
 
     def test_a_missing_x_falls_back_to_y(self):
-        self._dlg._set_registration_binning({"z": 1, "y": 2})
-        assert self._dlg._registration_binning() == {"z": 1, "y": 2, "x": 2}
+        self._dlg._set_registration_binning({"y": 2})
+        assert self._dlg._registration_binning() == {"z": 2, "y": 2, "x": 2}
 
     def test_junk_is_ignored_rather_than_applied(self):
         before = self._dlg._registration_binning()
@@ -129,17 +144,17 @@ class TestSkipRegistrationGreysBothOut:
         dlg = self._dlg
         dlg._skip_reg_cb.setChecked(True)
         assert not dlg._reg_binning_xy_combo.isEnabled()
-        assert not dlg._reg_binning_z_combo.isEnabled()
+        assert not dlg._reg_z_spacing_combo.isEnabled()
         dlg._skip_reg_cb.setChecked(False)
         assert dlg._reg_binning_xy_combo.isEnabled()
-        assert dlg._reg_binning_z_combo.isEnabled()
+        assert dlg._reg_z_spacing_combo.isEnabled()
 
     def test_the_axis_labels_follow_too(self):
         # Otherwise a live "XY"/"Z" label sits beside two dead dropdowns.
         dlg = self._dlg
         dlg._skip_reg_cb.setChecked(True)
         assert not dlg._reg_binning_xy_label.isEnabled()
-        assert not dlg._reg_binning_z_label.isEnabled()
+        assert not dlg._reg_z_spacing_label.isEnabled()
         dlg._skip_reg_cb.setChecked(False)
 
 
@@ -172,9 +187,7 @@ class TestTheSavedSettingCannotBeMisread:
         assert 'setValue("reg_binning_xy", self._reg_binning_xy_combo.currentData())' in (
             source
         )
-        assert 'setValue("reg_binning_z", self._reg_binning_z_combo.currentData())' in (
-            source
-        )
+        assert 'setValue("reg_z_spacing_um", self._registration_z_spacing())' in source
 
     def test_the_restore_defaults_are_the_old_preset(self):
         """These, not the constructor call, are what an untouched dialog runs.
@@ -188,7 +201,10 @@ class TestTheSavedSettingCannotBeMisread:
 
         source = Path(mod.__file__).read_text(encoding="utf-8")
         assert source.count('s.value("reg_binning_xy", 4, type=int)') == 2
-        assert source.count('s.value("reg_binning_z", 2, type=int)') == 2
+        # Z: one shared restore helper, default 20 µm (the old z=2 at 10 µm);
+        # an older saved "reg_binning_z" is read as N x 10 µm, not as planes.
+        assert source.count("self._restore_reg_z_spacing(s)") == 2
+        assert 's.value("reg_z_spacing_um", 20.0, type=float)' in source
 
     def test_every_save_site_has_a_matching_restore(self):
         # NativeStitchingDialog overrides _save_settings/_restore_settings
@@ -198,9 +214,8 @@ class TestTheSavedSettingCannotBeMisread:
 
         source = Path(mod.__file__).read_text(encoding="utf-8")
         assert source.count('setValue("reg_binning_xy"') == 2
-        assert source.count('setValue("reg_binning_z"') == 2
+        assert source.count('setValue("reg_z_spacing_um"') == 2
         assert source.count('s.value("reg_binning_xy"') == 2
-        assert source.count('s.value("reg_binning_z"') == 2
 
 
 class TestTheCliOffersTheSameShape:
@@ -297,3 +312,36 @@ class TestTheConfigFileSpeaksTheSameLanguage:
 
     def test_omitted_axes_fall_back_to_the_defaults(self, monkeypatch):
         assert self._load(monkeypatch=monkeypatch, binning={"z": 1}) == {"z": 1, "y": 4, "x": 4}
+
+
+class TestTheCliZSpacing:
+    def _run_config(self, argv, monkeypatch):
+        """Through main()'s own overlay, stopped before discovery."""
+        import flamingo_stitcher.__main__ as cli
+
+        seen = {}
+
+        class _Stop(Exception):
+            pass
+
+        def fake_pipeline(config, *a, **k):
+            seen["config"] = config
+            raise _Stop
+
+        monkeypatch.setattr(cli, "StitchingPipeline", fake_pipeline)
+        monkeypatch.setattr(sys, "argv", ["flamingo-stitcher", *argv])
+        try:
+            cli.main()
+        except (_Stop, SystemExit):
+            pass
+        return seen.get("config")
+
+    def test_spacing_flag(self, monkeypatch, tmp_path):
+        cfg = self._run_config([str(tmp_path), "--reg-z-spacing-um", "0"], monkeypatch)
+        assert cfg is not None, "main() exited before building the pipeline"
+        assert cfg.registration_z_spacing_um == 0.0
+
+    def test_older_z_flag_means_ten_um_per_step(self, monkeypatch, tmp_path):
+        cfg = self._run_config([str(tmp_path), "--reg-binning-z", "1"], monkeypatch)
+        assert cfg is not None, "main() exited before building the pipeline"
+        assert cfg.registration_z_spacing_um == 10.0

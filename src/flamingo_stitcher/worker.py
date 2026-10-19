@@ -78,8 +78,13 @@ class StitchingWorker(QThread):
         if getattr(c, "skip_registration", False):
             return "skipped (stage positions only)"
         b = dict(getattr(c, "registration_binning", {}) or {})
+        zs = getattr(c, "registration_z_spacing_um", None)
+        if zs is None:
+            z_txt = f"Z binning {b.get('z', '?')} (older setting)"
+        else:
+            z_txt = "Z every plane" if float(zs) <= 0 else f"Z spacing {float(zs):g} µm"
         parts = [
-            f"binning XY {b.get('x', '?')}x Z {b.get('z', '?')}x (before adjustment)",
+            f"binning XY {b.get('x', '?')}x (a maximum), {z_txt}",
             f"quality threshold {getattr(c, 'quality_threshold', '?')}",
             f"approach {getattr(c, 'stitching_approach', 'default')}",
             f"Refine Z {'on' if getattr(c, 'registration_z_refine', False) else 'off'}",
