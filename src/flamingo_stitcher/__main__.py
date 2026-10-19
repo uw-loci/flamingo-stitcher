@@ -322,6 +322,23 @@ def build_parser() -> argparse.ArgumentParser:
         "usually worth it, especially in Z. 0 = leave its default alone.",
     )
     reg_group.add_argument(
+        "--blend-width-overlap",
+        type=float,
+        default=None,
+        metavar="FRAC",
+        help="Blend tile overlap fusion: cross-fade over this fraction of the "
+        "measured tile overlap in X/Y (default 1.0 = the whole overlap; 0 = use "
+        "the fixed blending widths).",
+    )
+    reg_group.add_argument(
+        "--no-registration-map",
+        dest="registration_map",
+        action="store_false",
+        default=None,
+        help="Do not write <name>_registration_map.png (tiles as fused, tinted "
+        "by Z correction, seams coloured by registration's verdict).",
+    )
+    reg_group.add_argument(
         "--solve-tolerance",
         type=float,
         default=None,
@@ -938,6 +955,8 @@ def main():
         ("registration_z_spacing_um", args.reg_z_spacing_um),
         ("global_opt_abs_tol", args.solve_tolerance),
         ("registration_solve_transform", args.solve_transform),
+        ("registration_map_enabled", args.registration_map),
+        ("blending_width_overlap_fraction", args.blend_width_overlap),
         ("registration_upsample_factor", args.reg_upsample),
         ("max_registration_shift_um", args.max_reg_shift),
         ("max_registration_shift_z_um", args.max_reg_shift_z),

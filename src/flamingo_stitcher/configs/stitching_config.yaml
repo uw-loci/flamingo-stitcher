@@ -314,6 +314,11 @@ blending:
     y: 100
     x: 100
 
+  # Blend: cross-fade over this fraction of the tile overlap MEASURED from the
+  # stage positions, in X and Y (1.0 = the whole overlap; 0 = use widths_um.y/x
+  # above). Z always uses widths_um.z. GUI: Blend width.
+  width_from_overlap: 1.0
+
   # Content-based fusion (Preibisch local-variance weighting).
   # Weights each tile's contribution by local sharpness in overlap regions.
   # Improves quality for samples with uneven content but increases

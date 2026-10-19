@@ -454,6 +454,16 @@ at the end; the ETA cache key gains `|rz=<µm>` for any spacing other than
 (`Stitching ETA phase shares (...)`), so a registration-heavy run does not
 send the estimate running away mid-phase.
 
+## 7i. The registration map
+
+Every run writes `<name>_registration_map.png` beside `registration_report.txt`
+(log line: `Wrote ... (registration map: ...)`). It is the seam table and the
+tile placement table drawn on the mosaic: tiles where they were fused, tinted
+by dz, overlaps coloured by seam status with quality (and residual for seams
+the solve dropped). Ask for it first when a user reports a misaligned row:
+a row held by a single green seam among orange ones is the signature of the
+solve keeping one of several disagreeing links.
+
 ## 8. Reading the Border-QC report
 
 If enabled, the QC prints flagged seams worst-first. Each line looks like:

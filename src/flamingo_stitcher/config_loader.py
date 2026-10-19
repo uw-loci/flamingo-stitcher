@@ -374,6 +374,8 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
             "y": int(widths.get("y", 100)),
             "x": int(widths.get("x", 100)),
         }
+    if blend.get("width_from_overlap") is not None:
+        config_obj.blending_width_overlap_fraction = float(blend["width_from_overlap"])
     if blend.get("content_based") is not None:
         config_obj.content_based_fusion = bool(blend["content_based"])
 

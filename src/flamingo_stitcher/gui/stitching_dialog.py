@@ -814,6 +814,36 @@ class StitchingDialog(PersistentDialog):
             "            tiles. Best when tiles differ in exposure/illumination."
         )
         tile_fuse_box.addWidget(self._tile_fusion_combo)
+        # How wide Blend's cross-fade is. Only Blend uses it.
+        self._blend_width_combo = QComboBox()
+        for _label, _value in [
+            ("Fade: whole overlap", 1.0),
+            ("Fade: half overlap", 0.5),
+            ("Fade: fixed 100 µm", 0.0),
+        ]:
+            self._blend_width_combo.addItem(_label, _value)
+        self._blend_width_combo.setToolTip(
+            "How wide Blend's cross-fade between neighbouring tiles is.\n\n"
+            "Whole overlap (default): the fade spans the tile overlap measured\n"
+            "for THIS acquisition from its stage positions, so each tile hands\n"
+            "over to its neighbour gradually across the whole shared strip.\n"
+            "Half overlap: the middle half of it, a sharper hand-over.\n"
+            "Fixed 100 µm: the old setting, whatever the overlap (on a 214 µm\n"
+            "overlap that used half of it).\n\n"
+            "The run log prints the widths used. Only Blend uses this; Maximum\n"
+            "and Brightest tile do not cross-fade. A wide fade cannot hide\n"
+            "misalignment: in a misaligned overlap it averages two different\n"
+            "images over a wider band."
+        )
+        tile_fuse_box.addWidget(self._blend_width_combo)
+        self._tile_fusion_combo.currentIndexChanged.connect(
+            lambda _i: self._blend_width_combo.setEnabled(
+                self._tile_fusion_combo.currentData() == "blend"
+            )
+        )
+        self._blend_width_combo.setEnabled(
+            self._tile_fusion_combo.currentData() == "blend"
+        )
         settings_layout.addLayout(tile_fuse_box, 1, 4)
 
         proc_basic_group.setLayout(proc_outer)
@@ -3624,6 +3654,9 @@ class StitchingDialog(PersistentDialog):
             config.split_illumination = False
             config.illumination_fusion = _illum
         config.tile_overlap_fusion = self._tile_fusion_combo.currentData()
+        config.blending_width_overlap_fraction = float(
+            self._blend_width_combo.currentData()
+        )
         config.output_format = self._format_combo.currentData()
         config.flat_field_correction = self._flat_field_cb.isChecked()
         config.destripe = self._destripe_cb.isChecked()
@@ -3974,6 +4007,7 @@ class StitchingDialog(PersistentDialog):
         combo_fields = [
             ("illumination_fusion", self._fusion_combo),
             ("tile_overlap_fusion", self._tile_fusion_combo),
+            ("blending_width_overlap_fraction", self._blend_width_combo),
             ("intensity_adjustment", self._intensity_adjust_combo),
             ("downsample_xy", self._downsample_xy_combo),
             ("downsample_z", self._downsample_z_combo),
@@ -6385,6 +6419,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
+        s.setValue("blend_width_overlap", self._blend_width_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("timestamp_log", self._timestamp_log_cb.isChecked())
@@ -6517,6 +6552,9 @@ class StitchingDialog(PersistentDialog):
             idx = self._tile_fusion_combo.findData(tile_fusion)
             if idx >= 0:
                 self._tile_fusion_combo.setCurrentIndex(idx)
+        self._set_combo_by_data(
+            self._blend_width_combo, s.value("blend_width_overlap", 1.0, type=float)
+        )
 
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():
@@ -6727,6 +6765,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
+        s.setValue("blend_width_overlap", self._blend_width_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
         s.setValue("verbose_log", self._verbose_log_cb.isChecked())
         s.setValue("timestamp_log", self._timestamp_log_cb.isChecked())
@@ -6859,6 +6898,9 @@ class NativeStitchingDialog(StitchingDialog):
             idx = self._tile_fusion_combo.findData(tile_fusion)
             if idx >= 0:
                 self._tile_fusion_combo.setCurrentIndex(idx)
+        self._set_combo_by_data(
+            self._blend_width_combo, s.value("blend_width_overlap", 1.0, type=float)
+        )
 
         frame_idx = s.value("frame_size_idx", 0, type=int)
         if 0 <= frame_idx < self._frame_size_combo.count():

@@ -243,6 +243,8 @@ _CONFIG_FIELD_ORDER = (
     "registration_binning",
     "registration_z_spacing_um",
     "registration_solve_transform",
+    "registration_map_enabled",
+    "blending_width_overlap_fraction",
     "global_opt_abs_tol",
     "quality_threshold",
     "max_registration_shift_um",
@@ -1544,6 +1546,10 @@ class StitchingConfig:
     # 2026-10-18 Ket_Trial1 run the Z offset between two rows changed 105 ->
     # 140 µm across four columns, a tilt a shift cannot represent.
     registration_solve_transform: str = "translation"
+    # Write <basename>_registration_map.png beside the report: the tiles' max
+    # projections where they were fused, tinted by Z correction, overlaps
+    # coloured by what registration made of each seam, tiles labelled.
+    registration_map_enabled: bool = True
     global_opt_rel_tol: float = 0.01  # Convergence threshold
 
     # Minimum measured tile overlap fraction before registration is ATTEMPTED.
@@ -1726,6 +1732,14 @@ class StitchingConfig:
     blending_widths: Dict[str, int] = field(
         default_factory=lambda: {"z": 50, "y": 100, "x": 100}
     )
+    # Blend (tile_overlap_fusion="blend") cross-fades over this fraction of the
+    # tile overlap MEASURED from the stage positions, per axis, instead of the
+    # fixed X/Y widths above: 1.0 = across the whole overlap, 0.5 = its middle
+    # half, 0 = use blending_widths as given. The fixed 100 µm was set without
+    # reference to any acquisition; on Ket_Trial1 the overlap is 214 µm, so the
+    # crossfade used half of it. Z keeps blending_widths["z"]: tiles of an XY
+    # mosaic share their Z range, so there is no Z overlap to measure.
+    blending_width_overlap_fraction: float = 1.0
     # Content-based tile-overlap weighting — uses Preibisch's local-variance
     # algorithm (bandpass-filtered intensity variance) to weight each tile's
     # contribution in overlap regions by local sharpness.  This concept
@@ -4798,9 +4812,14 @@ class StitchingPipeline:
         # long after the params have been consumed by fusion.
         self._registration_report = None
         self._verbose_alignment_logged = False
+        self._blend_width_logged = False
         self._alignment_carry = None
         self._alignment_tiles = []
         self._alignment_extent_um = None
+        # Registration map: each tile's footprint as fused, in fusion order.
+        self._map_layout = {}
+        self._map_tiles = []
+        self._map_shift_rows = {}
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -5193,6 +5212,181 @@ class StitchingPipeline:
         self._log_verbose_alignment(report)
         for path in written.values():
             self.logger.info(f"  Wrote {path}")
+
+    @staticmethod
+    def _map_key(tile) -> Tuple[float, float, float]:
+        return (
+            round(float(getattr(tile, "x_mm", 0.0)), 4),
+            round(float(getattr(tile, "y_mm", 0.0)), 4),
+            round(float(getattr(tile, "z_min_mm", 0.0)), 4),
+        )
+
+    def _record_map_layout(self, sims, tile_data, transform_key) -> None:
+        """Remember each tile's footprint as fused (world µm, y0 x0 y1 x1).
+
+        Taken from the very spatial images handed to fusion, through the same
+        transform key, so the map cannot show a placement other than the one
+        written. The mid-plane's four corners go through the full affine, so
+        a rigid solve's rotation widens the box rather than being ignored."""
+        try:
+            from multiview_stitcher import spatial_image_utils as si_utils
+
+            layout = self.__dict__.setdefault("_map_layout", {})
+            order = self.__dict__.setdefault("_map_tiles", [])
+            for sim, (_vol, tile_info) in zip(sims, tile_data):
+                key = self._map_key(tile_info)
+                if key not in layout:
+                    order.append(tile_info)
+                props = si_utils.get_stack_properties_from_sim(sim)
+                origin = np.array([props["origin"][d] for d in ("z", "y", "x")], float)
+                spacing = np.array([props["spacing"][d] for d in ("z", "y", "x")], float)
+                shape = np.array([props["shape"][d] for d in ("z", "y", "x")], float)
+                aff = np.asarray(si_utils.get_affine_from_sim(sim, transform_key)).squeeze()
+                zmid = origin[0] + (shape[0] - 1) / 2 * spacing[0]
+                ys = (origin[1], origin[1] + (shape[1] - 1) * spacing[1])
+                xs = (origin[2], origin[2] + (shape[2] - 1) * spacing[2])
+                pts = np.array([[zmid, y, x, 1.0] for y in ys for x in xs])
+                world = (aff @ pts.T).T[:, :3]
+                layout[key] = (
+                    float(world[:, 1].min()), float(world[:, 2].min()),
+                    float(world[:, 1].max()), float(world[:, 2].max()),
+                )
+        except Exception as exc:  # a picture must never fail a run
+            self.logger.debug(f"Registration map layout not recorded: {exc}")
+
+    def _map_tile_mip(self, tile):
+        """The microscope's own per-tile max projection (both light paths,
+        brightest), oriented exactly as the tile was stitched; None if the
+        acquisition has no ``*_MP.tif`` for it."""
+        from flamingo_stitcher.orientation import MosaicOrientation, _read_mip_companion
+
+        ch = getattr(self, "_reg_channel_choice", None) or self.config.reg_channel
+        files = tile.raw_files.get(ch) if ch is not None else None
+        if not files:
+            files = tile.raw_files.get(sorted(tile.raw_files)[0]) if tile.raw_files else {}
+        mip = None
+        for raw in (files or {}).values():
+            m = _read_mip_companion(Path(raw))
+            if m is None:
+                continue
+            m = np.asarray(m, np.float32)
+            while m.ndim > 2:
+                m = m.max(axis=0)
+            mip = m if mip is None or mip.shape != m.shape else np.maximum(mip, m)
+        if mip is None:
+            return None
+        ori_name = self.config.tile_orientation or (
+            "flip_h" if self.config.camera_x_inverted else "identity"
+        )
+        from flamingo_stitcher.registration_map import shrink_for_map
+
+        return shrink_for_map(MosaicOrientation.from_name(ori_name).apply2d(mip))
+
+    def _write_registration_map(self, output_path, acquisition_dir, basename=""):
+        """One PNG of the mosaic as fused, with registration's verdicts on it."""
+        from flamingo_stitcher import registration_map as rmap
+        from flamingo_stitcher.center_out import tile_label
+
+        layout = getattr(self, "_map_layout", None) or {}
+        tiles = [t for t in (getattr(self, "_map_tiles", None) or [])]
+        if not layout or not tiles:
+            return None
+        report = self._registration_report
+        shifts = {}
+        if report is not None and report.ran and report.applied:
+            for ts in report.tiles:
+                shifts[(round(ts.x_mm, 4), round(ts.y_mm, 4), round(ts.z_min_mm, 4))] = ts
+        placement = self._tile_placement() or {}
+        reg_tiles = list(getattr(self, "_alignment_tiles", None) or [])
+        reg_index = {self._map_key(t): i for i, t in enumerate(reg_tiles)}
+
+        map_tiles, map_index, missing_mip = [], {}, 0
+        for i, tile in enumerate(tiles):
+            key = self._map_key(tile)
+            if key not in layout:
+                continue
+            ts = shifts.get(key)
+            how = []
+            ri = reg_index.get(key)
+            p = placement.get(ri, "") if ri is not None else ""
+            if p.startswith("carried"):
+                how.append("carried")
+            elif p == "no neighbour":
+                how.append("no neighbour")
+            if ts is not None and ts.any_clamped:
+                axes = "".join(a for a, f in (("Z", ts.clamped_z), ("Y", ts.clamped_y), ("X", ts.clamped_x)) if f)
+                how.append(f"clamped {axes}")
+            mip = self._map_tile_mip(tile)
+            if mip is None:
+                missing_mip += 1
+            map_index[ri if ri is not None else -1 - i] = len(map_tiles)
+            label = tile_label(tile, ri if ri is not None else i)
+            gm = re.match(r"X(\d+)\s+Y(\d+)$", label or "")
+            map_tiles.append(rmap.MapTile(
+                label=label,
+                bbox_um=layout[key],
+                dz_um=float(ts.dz_um) if ts is not None else 0.0,
+                how=", ".join(how),
+                mip=mip,
+                grid=(int(gm.group(1)), int(gm.group(2))) if gm else None,
+            ))
+            shifts_by_map = self.__dict__.setdefault("_map_shift_rows", {})
+            shifts_by_map[len(map_tiles) - 1] = ts
+        seams = []
+        tile_shift = self.__dict__.get("_map_shift_rows", {})
+        if report is not None:
+            for s in report.seams:
+                a, b = map_index.get(s.index_a), map_index.get(s.index_b)
+                if a is None or b is None:
+                    continue
+                # measured minus placed: the pairwise shift is (tile a's
+                # correction) - (tile b's) when the solve honours it exactly.
+                disagree = None
+                ta, tb = tile_shift.get(a), tile_shift.get(b)
+                if (
+                    report.ran and ta is not None and tb is not None
+                    and None not in (s.dz_um, s.dy_um, s.dx_um)
+                ):
+                    disagree = (
+                        float(s.dz_um) - (ta.dz_um - tb.dz_um),
+                        float(s.dy_um) - (ta.dy_um - tb.dy_um),
+                        float(s.dx_um) - (ta.dx_um - tb.dx_um),
+                    )
+                seams.append(rmap.MapSeam(
+                    a, b, s.status if report.ran else "not_run",
+                    s.quality, s.residual_px, axis=str(s.axis or "").lower()[:1],
+                    disagree_um=disagree,
+                ))
+
+        cfg = self.config
+        acq = Path(acquisition_dir).name or "acquisition"
+        placed = "registered" if (report is not None and report.ran and report.applied) else "stage positions (registration not applied)"
+        up = int(getattr(cfg, "registration_upsample_factor", 0) or 0)
+        zs = getattr(cfg, "registration_z_spacing_um", None)
+        info = [
+            f"Placement: {placed}",
+            f"Z spacing: {'every plane' if zs == 0 else (f'{zs:g} µm' if zs else 'legacy setting')}",
+            f"Peak refinement: 1/{up if up > 0 else MVS_DEFAULT_3D_UPSAMPLE} voxel",
+            f"Solve model: {getattr(cfg, 'registration_solve_transform', 'translation')}",
+            f"Quality threshold: {cfg.quality_threshold:g}",
+        ]
+        note = (
+            f"{missing_mip} tile(s) have no *_MP.tif: shown without image"
+            if missing_mip else "Image: microscope's per-tile max projections"
+        )
+        out_dir = Path(output_path)
+        if not out_dir.is_dir():
+            out_dir = out_dir.parent
+        prefix = basename or self._build_output_basename(Path(acquisition_dir))
+        path = rmap.render(
+            map_tiles, seams, out_dir / f"{prefix}_registration_map.png",
+            tol_um=getattr(self, "_abs_tol_um", None),
+            title=f"{acq} -- tile placement as fused ({placed.split(' (')[0]})",
+            info_lines=info, background_note=note,
+        )
+        if path is not None:
+            self.logger.info(f"  Wrote {path} (registration map: Z correction per tile, seam verdicts, labels)")
+        return path
 
     def _border_qc_offsets_um(self):
         """Registered (dz, dy, dx) µm per tile, keyed for border QC; None when
@@ -5956,6 +6150,11 @@ class StitchingPipeline:
                 self._write_registration_report(output_path, acquisition_dir, basename)
             except Exception as exc:  # evidence must never fail a run
                 self.logger.warning(f"Registration report skipped: {exc}")
+        if getattr(self.config, "registration_map_enabled", True):
+            try:
+                self._write_registration_map(output_path, acquisition_dir, basename)
+            except Exception as exc:  # evidence must never fail a run
+                self.logger.warning(f"Registration map skipped: {exc}")
 
         elapsed = time.time() - t0
         self._log_tile_profiles()
@@ -6777,6 +6976,11 @@ class StitchingPipeline:
                 self._write_registration_report(output_path, acquisition_dir, basename)
             except Exception as exc:  # evidence must never fail a run
                 self.logger.warning(f"Registration report skipped: {exc}")
+        if getattr(self.config, "registration_map_enabled", True):
+            try:
+                self._write_registration_map(output_path, acquisition_dir, basename)
+            except Exception as exc:  # evidence must never fail a run
+                self.logger.warning(f"Registration map skipped: {exc}")
 
         elapsed = time.time() - t0
         self._log_tile_profiles()
@@ -8361,6 +8565,45 @@ class StitchingPipeline:
         except Exception as e:  # noqa: BLE001 - a preferences file must never
             # stop a stitch; the defaults are always a working configuration.
             self.logger.warning(f"Could not apply per-microscope options: {e}")
+
+    def _blending_widths(self, tile_data, voxel_size_um) -> Dict[str, float]:
+        """Blend cross-fade widths, µm: a fraction of the measured overlap in
+        X/Y (blending_width_overlap_fraction), the configured value in Z and
+        wherever the overlap cannot be measured. Logged once, with the source
+        of each number."""
+        fixed = {k: float(v) for k, v in dict(self.config.blending_widths).items()}
+        frac = float(getattr(self.config, "blending_width_overlap_fraction", 0.0) or 0.0)
+        widths, source = dict(fixed), {a: "fixed setting" for a in fixed}
+        if frac > 0 and tile_data:
+            try:
+                extent = self._frame_extent_um(tile_data, voxel_size_um)
+                layout = tile_geometry.grid_overlap(
+                    [t for _v, t in tile_data],
+                    extent_x_um=extent["x"], extent_y_um=extent["y"],
+                )
+                for axis in ("x", "y"):
+                    ov = getattr(layout.get(axis), "overlap_um", None)
+                    if ov is not None and ov > 0:
+                        floor = 2.0 * float(voxel_size_um.get(axis, 1.0))
+                        widths[axis] = max(floor, frac * float(ov))
+                        source[axis] = (
+                            f"{frac:g} x the measured {ov:.0f} µm overlap"
+                        )
+            except Exception as exc:  # fall back to the fixed widths
+                self.logger.debug(f"Blend width from overlap unavailable: {exc}")
+        if (
+            self.config.tile_overlap_fusion == "blend"
+            and not getattr(self, "_blend_width_logged", False)
+        ):
+            self._blend_width_logged = True
+            self.logger.info(
+                "  Blend width: "
+                + ", ".join(
+                    f"{a.upper()} {widths[a]:.0f} µm ({source[a]})"
+                    for a in ("x", "y", "z") if a in widths
+                )
+            )
+        return widths
 
     def _frame_extent_um(self, tile_data, voxel_size_um) -> Dict[str, float]:
         """What one tile covers along each axis, in processing-frame µm."""
@@ -10538,6 +10781,7 @@ class StitchingPipeline:
                 )
 
         sims = [msi_utils.get_sim_from_msim(msim) for msim in msims]
+        self._record_map_layout(sims, tile_data, transform_key)
 
         if getattr(self.config, "intensity_adjustment", "off") in ("measure", "apply"):
             sims = self._intensity_adjust_sims(
@@ -10547,7 +10791,7 @@ class StitchingPipeline:
         fuse_kwargs: Dict[str, Any] = dict(
             transform_key=transform_key,
             output_chunksize=self._fuse_chunksize(tile_data),
-            blending_widths=self.config.blending_widths,
+            blending_widths=self._blending_widths(tile_data, voxel_size_um),
         )
 
         if self.config.tile_overlap_fusion == "max":
@@ -11315,7 +11559,7 @@ class StitchingPipeline:
         fuse_kwargs: Dict[str, Any] = dict(
             transform_key=fuse_transform_key,
             output_chunksize=self._fuse_chunksize(tile_data),
-            blending_widths=self.config.blending_widths,
+            blending_widths=self._blending_widths(tile_data, voxel_size_um),
         )
 
         if self.config.content_based_fusion:

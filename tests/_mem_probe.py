@@ -82,6 +82,7 @@ def main() -> None:
         # scaling test was blind to the whole registration stage, and to the
         # Z-refinement pass added on top of it.
         cfg.registration_z_refine = cfg_in.get("z_refine", False)
+        cfg.registration_map_enabled = cfg_in.get("registration_map", True)
         cfg.tile_orientation = cfg_in.get("tile_orientation", "") or ""
         cfg.resource_guard_enabled = False  # never abort tiny probe runs
         # Chunk finer than the mosaic so the fusion geometry mirrors real
