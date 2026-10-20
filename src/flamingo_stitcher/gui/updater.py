@@ -153,6 +153,28 @@ def fetch_latest_release_info(api_url: str) -> dict:
     }
 
 
+
+def render_release_notes(box, notes: str) -> None:
+    """Show release notes as Markdown with raw HTML OFF.
+
+    A release body is plain prose, and Qt's Markdown passes HTML through: the
+    0.13.12 notes said "<name>_registration_map.png", Qt read <name> as an
+    unknown HTML element, and the dialog showed the first line and nothing
+    else. With HTML off, angle brackets are just text.
+    """
+    try:
+        from PyQt5.QtGui import QTextDocument
+
+        features = QTextDocument.MarkdownFeatures(
+            int(QTextDocument.MarkdownDialectGitHub) | int(QTextDocument.MarkdownNoHTML)
+        )
+        box.document().setMarkdown(notes, features)
+        if box.toPlainText().strip():
+            return
+    except Exception:  # noqa: BLE001 - older Qt without setMarkdown
+        pass
+    box.setPlainText(notes)
+
 class _UpdateCheckThread(QThread):
     """Runs the GitHub releases/latest query off the GUI thread.
 
@@ -563,10 +585,7 @@ class UpdatePanel(QWidget):
             notes_box.setMinimumHeight(150)
             notes_box.setMaximumHeight(300)
             notes_box.setLineWrapMode(QTextEdit.WidgetWidth)
-            try:
-                notes_box.setMarkdown(notes)
-            except Exception:
-                notes_box.setPlainText(notes)
+            render_release_notes(notes_box, notes)
             layout.addWidget(notes_box)
 
         footer = QHBoxLayout()
