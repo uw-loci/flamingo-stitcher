@@ -4821,6 +4821,8 @@ class StitchingPipeline:
         self._map_tiles = []
         self._map_shift_rows = {}
         self._map_proj = {}
+        self._reg_z_bands = None
+        self._reg_z_spans_um = None
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -8246,7 +8248,20 @@ class StitchingPipeline:
         rot_center_um = self._resolve_rotation_center_um(
             [ti for _, ti in tile_data]
         )
+        self._reg_z_bands = None
         z_ranges = self._content_z_ranges(tile_data)
+        # Each tile's registered planes in world Z (stage position), so the
+        # verbose table can say how much of the stack each seam compared.
+        try:
+            vz = float(voxel_size_um.get("z", 1.0))
+            self._reg_z_spans_um = []
+            for i, (volume, ti) in enumerate(tile_data):
+                z_lo, z_hi = (z_ranges[i] if z_ranges and z_ranges[i] else (0, int(volume.shape[-3])))
+                base = float(ti.z_min_mm) * 1000.0
+                self._reg_z_spans_um.append((base + z_lo * vz, base + z_hi * vz))
+            self._reg_z_voxel_um = vz
+        except Exception:  # noqa: BLE001 - evidence must never fail a run
+            self._reg_z_spans_um = None
         msims = []
         # Lateral world position per tile, needed by the seam gate to work out
         # which edge band of each tile faces which neighbour.
@@ -9137,10 +9152,12 @@ class StitchingPipeline:
             tile_content.DEFAULT_MIN_STRUCTURE if threshold is None else float(threshold)
         )
         try:
-            ranges = [
-                tile_content.content_z_range(volume, min_structure=min_structure)
+            bands = [
+                tile_content.content_z_band(volume, min_structure=min_structure)
                 for volume, _ti in tile_data
             ]
+            ranges = [b.crop for b in bands]
+            self._reg_z_bands = bands
         except Exception as exc:  # noqa: BLE001 - a heuristic must not fail a run
             self.logger.warning(
                 f"  Could not profile tile content down Z ({exc}); "
@@ -9563,10 +9580,13 @@ class StitchingPipeline:
             return
         self._verbose_alignment_logged = True
         try:
+            tissue, shared = self._verbose_z_columns(report)
             lines = registration_report.format_verbose_alignment(
                 report,
                 labels=self._tile_labels(),
                 placement=self._tile_placement(),
+                tissue_z=tissue,
+                shared_z=shared,
             )
         except Exception as exc:  # evidence must never fail a run
             self.logger.warning(f"  Verbose alignment tables skipped: {exc}")
@@ -9574,6 +9594,35 @@ class StitchingPipeline:
         for line in lines:
             self.logger.info(line)
         self._log_stage_geometry(report)
+
+    def _verbose_z_columns(self, report):
+        """``({tile index: tissue planes}, {(a, b): shared planes})`` for the
+        verbose tables, or ``(None, None)`` when registration did not record
+        them.
+
+        Tissue planes are the tile's own band (where the per-plane structure
+        profile rises above that stack's empty-plane floor), whether or not
+        the crop was taken. Shared planes are the Z the two registered stacks
+        have in common at their STAGE positions -- the volume the pair was
+        compared over, in processing planes. A seam whose two tiles hold
+        tissue at different depths compares little, however high its quality.
+        """
+        bands = getattr(self, "_reg_z_bands", None)
+        spans = getattr(self, "_reg_z_spans_um", None)
+        vz = getattr(self, "_reg_z_voxel_um", None)
+        tissue = None
+        if bands:
+            tissue = {i: b.text() for i, b in enumerate(bands)}
+        shared = None
+        if spans and vz and report is not None:
+            shared = {}
+            for seam in report.seams:
+                try:
+                    (a0, a1), (b0, b1) = spans[seam.index_a], spans[seam.index_b]
+                except (IndexError, TypeError):
+                    continue
+                shared[(seam.index_a, seam.index_b)] = max(0, int(round((min(a1, b1) - max(a0, b0)) / vz)))
+        return tissue, shared
 
     def _log_stage_geometry(self, report) -> None:
         """Regress the corrections against grid position and report the fit.

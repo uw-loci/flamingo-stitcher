@@ -1374,8 +1374,14 @@ def format_verbose_alignment(
     *,
     labels: Optional[Mapping[int, str]] = None,
     placement: Optional[Mapping[int, str]] = None,
+    tissue_z: Optional[Mapping[int, str]] = None,
+    shared_z: Optional[Mapping[Tuple[int, int], int]] = None,
 ) -> List[str]:
     """Every tile's placement and every seam's measurement, in full.
+
+    ``tissue_z`` adds each tile's tissue band down Z (processing planes) and
+    ``shared_z`` the planes each seam's two registered stacks share; both
+    columns are left out when not given.
 
     ``format_report_text`` summarises: five worst corrections, ten unused seams,
     "... and 32 more (see registration_seams.csv)". That is the right length for
@@ -1417,7 +1423,9 @@ def format_verbose_alignment(
     header = (
         f"  {'tile':<14} {'stage X':>8} {'stage Y':>8} "
         f"{'dz µm':>8} {'dy µm':>8} {'dx µm':>8} "
-        f"{'dz fr':>7} {'dy px':>7} {'dx px':>7}  {'how':<10} note"
+        f"{'dz fr':>7} {'dy px':>7} {'dx px':>7}  {'how':<10} "
+        + (f"{'tissue planes':<14}" if tissue_z is not None else "")
+        + "note"
     )
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
@@ -1440,7 +1448,9 @@ def format_verbose_alignment(
             f"{_num(tile.x_mm, '8.3f')} {_num(tile.y_mm, '8.3f')} "
             f"{_num(tile.dz_um)} {_num(tile.dy_um)} {_num(tile.dx_um)} "
             f"{_num(tile.dz_frames, '7.2f')} {_num(tile.dy_px, '7.2f')} "
-            f"{_num(tile.dx_px, '7.2f')}  {how:<10} {note}"
+            f"{_num(tile.dx_px, '7.2f')}  {how:<10} "
+            + (f"{str(tissue_z.get(tile.index, '-')):<14}" if tissue_z is not None else "")
+            + note
         )
 
     lines.append("")
@@ -1448,7 +1458,9 @@ def format_verbose_alignment(
     header = (
         f"  {'tile A':<14} {'tile B':<14} {'axis':<6} {'status':<18} "
         f"{'qual':>6} {'dz µm':>8} {'dy µm':>8} {'dx µm':>8} "
-        f"{'resid µm':>9} {'ovl':>5}  note"
+        f"{'resid µm':>9} {'ovl':>5}  "
+        + (f"{'shared pl':>9}  " if shared_z is not None else "")
+        + "note"
     )
     lines.append(header)
     lines.append("  " + "-" * (len(header) - 2))
@@ -1461,7 +1473,20 @@ def format_verbose_alignment(
             f"{(seam.axis or ''):<6} {(seam.status or ''):<18} "
             f"{_num(seam.quality, '6.2f')} "
             f"{_num(seam.dz_um)} {_num(seam.dy_um)} {_num(seam.dx_um)} "
-            f"{_num(seam.residual_px, '9.2f')} {overlap_text}  {seam.note or ''}"
+            f"{_num(seam.residual_px, '9.2f')} {overlap_text}  "
+            + (
+                f"{str(shared_z.get((seam.index_a, seam.index_b), '-')):>9}  "
+                if shared_z is not None else ""
+            )
+            + (seam.note or "")
+        )
+    if tissue_z is not None or shared_z is not None:
+        lines.append(
+            "  tissue planes: where each tile has structure down Z (processing "
+            "planes, margin included; 'no band' = no distinct band: tissue in "
+            "more than ~80% of the planes, or in none). shared pl: planes the "
+            "two registered stacks have in common at stage Z -- what the seam "
+            "was measured over."
         )
     lines.append("=" * 71)
     return lines

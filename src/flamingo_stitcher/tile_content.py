@@ -388,6 +388,78 @@ def plane_structure_profile(volume) -> Optional[np.ndarray]:
         return None
 
 
+@dataclass
+class ZBand:
+    """Where a tile's tissue is down Z, and what registration did with it.
+
+    ``band`` is the planes with structure (margin included) even when the crop
+    was not taken; ``crop`` is what registration actually used (None = whole
+    stack). ``why`` says which, in words for the log."""
+
+    n_planes: int
+    band: Optional[tuple] = None
+    crop: Optional[tuple] = None
+    why: str = ""
+
+    def text(self) -> str:
+        if self.band is None:
+            return {"no band": "no band", "unmeasured": "-"}.get(self.why, self.why or "-")
+        return f"{self.band[0]}-{self.band[1]}"
+
+
+def content_z_band(
+    volume,
+    *,
+    min_structure: float = DEFAULT_MIN_STRUCTURE,
+    margin_planes: int = _Z_MARGIN_PLANES,
+) -> ZBand:
+    """:func:`content_z_range` with its reasoning kept, for the log.
+
+    Added 2026-10-21: a run's bottom-row seams failed and the question was
+    whether those tiles were empty at mid-stack. The crop knew, and nothing
+    printed it."""
+    profile = plane_structure_profile(volume)
+    if profile is None or not len(profile):
+        try:
+            n = int(volume.shape[0])
+        except Exception:  # noqa: BLE001
+            n = 0
+        return ZBand(n, why="unmeasured")
+    n_planes = int(len(profile))
+
+    # Calibrate against THIS stack rather than against a constant.
+    #
+    # `DEFAULT_MIN_STRUCTURE` is calibrated for the 3-D score, where smoothing
+    # runs across Z as well and drives the featureless floor to ~0.088. The
+    # per-plane profile smooths only in Y/X, so it removes less noise and its
+    # floor sits around 0.195 — applying the 3-D number here passes every plane
+    # and silently disables the crop. Rather than carry a second constant that
+    # has to be re-derived whenever the kernel changes, take the floor from the
+    # stack's own empty planes, which is what they are for.
+    #
+    # This is the same idea as ASHLAR's null distribution, done locally: measure
+    # what "no information" scores on this data, then require better than that.
+    floor = float(np.percentile(profile, 20))
+    peak = float(np.percentile(profile, 99))
+    separation = peak - floor
+    if separation < _MIN_PROFILE_SEPARATION:
+        # Whole stack alike: all tissue or none. The tile-content score
+        # (logged separately) says which.
+        return ZBand(n_planes, why="no band")
+    threshold = max(floor + _PROFILE_BAND_FRACTION * separation, float(min_structure))
+    above = np.flatnonzero(profile >= threshold)
+    if not len(above):
+        return ZBand(n_planes, why="no band")
+    z0 = max(0, int(above[0]) - int(margin_planes))
+    z1 = min(n_planes, int(above[-1]) + 1 + int(margin_planes))
+    band = (z0, z1)
+    if z1 - z0 < 4:
+        return ZBand(n_planes, band=band, why="band too thin to crop")
+    if (z1 - z0) > (1.0 - _MIN_Z_CROP_SAVING) * n_planes:
+        return ZBand(n_planes, band=band, why="band covers most of the stack")
+    return ZBand(n_planes, band=band, crop=band, why="cropped")
+
+
 def content_z_range(
     volume,
     *,
@@ -409,41 +481,9 @@ def content_z_range(
     (0.99 / 0.91 / 0.76) and reads a fraction of the planes. Quality and cost,
     not accuracy -- do not re-justify it as accuracy later.
     """
-    profile = plane_structure_profile(volume)
-    if profile is None or not len(profile):
-        return None
-
-    # Calibrate against THIS stack rather than against a constant.
-    #
-    # `DEFAULT_MIN_STRUCTURE` is calibrated for the 3-D score, where smoothing
-    # runs across Z as well and drives the featureless floor to ~0.088. The
-    # per-plane profile smooths only in Y/X, so it removes less noise and its
-    # floor sits around 0.195 — applying the 3-D number here passes every plane
-    # and silently disables the crop. Rather than carry a second constant that
-    # has to be re-derived whenever the kernel changes, take the floor from the
-    # stack's own empty planes, which is what they are for.
-    #
-    # This is the same idea as ASHLAR's null distribution, done locally: measure
-    # what "no information" scores on this data, then require better than that.
-    floor = float(np.percentile(profile, 20))
-    peak = float(np.percentile(profile, 99))
-    separation = peak - floor
-    if separation < _MIN_PROFILE_SEPARATION:
-        # No distinct band: either the whole stack has content or none of it
-        # does. Both are cases where cropping would be a guess.
-        return None
-    threshold = max(floor + _PROFILE_BAND_FRACTION * separation, float(min_structure))
-    above = np.flatnonzero(profile >= threshold)
-    if not len(above):
-        return None
-    n_planes = int(len(profile))
-    z0 = max(0, int(above[0]) - int(margin_planes))
-    z1 = min(n_planes, int(above[-1]) + 1 + int(margin_planes))
-    if z1 - z0 < 4:
-        return None
-    if (z1 - z0) > (1.0 - _MIN_Z_CROP_SAVING) * n_planes:
-        return None  # keeps nearly everything; not worth the bookkeeping
-    return z0, z1
+    return content_z_band(
+        volume, min_structure=min_structure, margin_planes=margin_planes
+    ).crop
 
 
 def describe_z_crop(ranges: Sequence, n_planes: int) -> str:

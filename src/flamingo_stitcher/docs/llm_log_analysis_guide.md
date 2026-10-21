@@ -369,14 +369,14 @@ unused seams and then says "... and N more (see registration_seams.csv)", which
 is the wrong length exactly when a run needs explaining.
 
     TILE PLACEMENT (25 tiles)
-      tile            stage X  stage Y    dz µm    dy µm    dx µm   dz fr   dy px   dx px  how        note
-      X001 Y001         0.100    0.100    10.00    -1.00     7.00    2.00   -0.50    3.50  registered
-      X000 Y000         0.000    0.000    10.00    -1.00     7.00    2.00   -0.50    3.50  carried r2
+      tile            stage X  stage Y    dz µm    dy µm    dx µm   dz fr   dy px   dx px  how        tissue planes note
+      X001 Y001         0.100    0.100    10.00    -1.00     7.00    2.00   -0.50    3.50  registered 1277-2399
+      X000 Y000         0.000    0.000    10.00    -1.00     7.00    2.00   -0.50    3.50  carried r2 no band
 
     SEAM MEASUREMENTS (40 adjacent pairs)
-      tile A         tile B         axis   status               qual    dz µm    dy µm    dx µm  resid µm   ovl  note
-      X002 Y001      X003 Y001      x      registered           0.58    10.00    -5.00     3.00      0.00   14%
-      X001 Y001      X002 Y001      x      below_quality       -0.10                                        22%  below quality threshold 0.4
+      tile A         tile B         axis   status               qual    dz µm    dy µm    dx µm  resid µm   ovl  shared pl  note
+      X002 Y001      X003 Y001      x      registered           0.58    10.00    -5.00     3.00      0.00   14%       1122
+      X001 Y001      X002 Y001      x      below_quality       -0.10                                        22%        310  below quality threshold 0.4
 
 How to read them:
 
@@ -389,6 +389,16 @@ How to read them:
 - **`resid µm` is micrometres.** The seam CSV column is named `residual_px`,
   which is a misnomer: multiview-stitcher's `edge_residuals` are physical units.
 - **`status`** is the seam's fate — see §7e for why `pruned` is not a failure.
+- **`tissue planes`** (from 0.13.14) is where each tile has structure down Z, in
+  processing planes, margin included. It is reported whether or not the Z crop
+  was taken. `no band` means no distinct band: tissue in more than ~80% of the
+  planes, or in none; the `Tile content` line says which.
+- **`shared pl`** (from 0.13.14) is how many planes the two registered stacks
+  have in common at their stage Z: the volume the seam was measured over. A
+  seam between a tile with tissue only deep in the stack and one with tissue
+  only shallow compares few planes, and a decent `qual` on few planes can
+  still be a wrong shift. The count is before the measured dz, and the
+  structure is judged over the whole tile, not only the shared strip.
 - A whole column of `no_content` down one edge of the grid is an empty rim, not
   a registration problem. That is what `center_xy` exists for.
 
