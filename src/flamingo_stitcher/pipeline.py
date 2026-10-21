@@ -4820,6 +4820,7 @@ class StitchingPipeline:
         self._map_layout = {}
         self._map_tiles = []
         self._map_shift_rows = {}
+        self._map_proj = {}
         # Streaming-mode flat-field models {ch_id: model}. Populated by
         # _run_streaming when flat_field_correction is on, and consumed inside
         # _preprocess_single_tile. Empty in the in-memory path (which applies
@@ -5255,12 +5256,21 @@ class StitchingPipeline:
             self.logger.debug(f"Registration map layout not recorded: {exc}")
 
     def _map_tile_mip(self, tile):
-        """The microscope's own per-tile max projection (both light paths,
-        brightest), oriented exactly as the tile was stitched; None if the
-        acquisition has no ``*_MP.tif`` for it."""
+        """The tile's max projection for the map, and where it came from.
+
+        First choice is the projection kept while preprocessing (the tile as
+        fused); failing that the microscope's own ``*_MP.tif`` (both light
+        paths, brightest), oriented exactly as the tile was stitched. Returns
+        ``(None, "")`` when neither exists."""
         from flamingo_stitcher.orientation import MosaicOrientation, _read_mip_companion
 
         ch = getattr(self, "_reg_channel_choice", None) or self.config.reg_channel
+        kept = getattr(self, "_map_proj", None) or {}
+        key = self._map_key(tile)
+        chans = [c for (k, c) in kept if k == key]
+        if chans:
+            pick = ch if ch in chans else sorted(chans)[0]
+            return kept[(key, pick)], "stitched"
         files = tile.raw_files.get(ch) if ch is not None else None
         if not files:
             files = tile.raw_files.get(sorted(tile.raw_files)[0]) if tile.raw_files else {}
@@ -5274,13 +5284,13 @@ class StitchingPipeline:
                 m = m.max(axis=0)
             mip = m if mip is None or mip.shape != m.shape else np.maximum(mip, m)
         if mip is None:
-            return None
+            return None, ""
         ori_name = self.config.tile_orientation or (
             "flip_h" if self.config.camera_x_inverted else "identity"
         )
         from flamingo_stitcher.registration_map import shrink_for_map
 
-        return shrink_for_map(MosaicOrientation.from_name(ori_name).apply2d(mip))
+        return shrink_for_map(MosaicOrientation.from_name(ori_name).apply2d(mip)), "mp"
 
     def _write_registration_map(self, output_path, acquisition_dir, basename=""):
         """One PNG of the mosaic as fused, with registration's verdicts on it."""
@@ -5300,7 +5310,7 @@ class StitchingPipeline:
         reg_tiles = list(getattr(self, "_alignment_tiles", None) or [])
         reg_index = {self._map_key(t): i for i, t in enumerate(reg_tiles)}
 
-        map_tiles, map_index, missing_mip = [], {}, 0
+        map_tiles, map_index, missing_mip, mip_sources = [], {}, 0, set()
         for i, tile in enumerate(tiles):
             key = self._map_key(tile)
             if key not in layout:
@@ -5316,9 +5326,11 @@ class StitchingPipeline:
             if ts is not None and ts.any_clamped:
                 axes = "".join(a for a, f in (("Z", ts.clamped_z), ("Y", ts.clamped_y), ("X", ts.clamped_x)) if f)
                 how.append(f"clamped {axes}")
-            mip = self._map_tile_mip(tile)
+            mip, src = self._map_tile_mip(tile)
             if mip is None:
                 missing_mip += 1
+            else:
+                mip_sources.add(src)
             map_index[ri if ri is not None else -1 - i] = len(map_tiles)
             label = tile_label(tile, ri if ri is not None else i)
             gm = re.match(r"X(\d+)\s+Y(\d+)$", label or "")
@@ -5370,9 +5382,13 @@ class StitchingPipeline:
             f"Solve model: {getattr(cfg, 'registration_solve_transform', 'translation')}",
             f"Quality threshold: {cfg.quality_threshold:g}",
         ]
+        image_from = " + ".join(
+            {"stitched": "max projection of each tile as fused",
+             "mp": "microscope's per-tile *_MP.tif"}[s] for s in sorted(mip_sources, reverse=True)
+        )
         note = (
-            f"{missing_mip} tile(s) have no *_MP.tif: shown without image"
-            if missing_mip else "Image: microscope's per-tile max projections"
+            f"{missing_mip} tile(s) have no projection: shown without image"
+            if missing_mip else f"Image: {image_from}"
         )
         out_dir = Path(output_path)
         if not out_dir.is_dir():
@@ -5385,7 +5401,10 @@ class StitchingPipeline:
             info_lines=info, background_note=note,
         )
         if path is not None:
-            self.logger.info(f"  Wrote {path} (registration map: Z correction per tile, seam verdicts, labels)")
+            self.logger.info(
+                f"  Wrote {path} (registration map: Z correction per tile, seam "
+                f"verdicts, labels; {note[0].lower() + note[1:]})"
+            )
         return path
 
     def _border_qc_offsets_um(self):
@@ -7274,8 +7293,38 @@ class StitchingPipeline:
         volume = MosaicOrientation.from_name(ori_name).apply_volume_xy(volume)
         if not shape_only:
             self._record_profile(ch_id, "tile as stitched", volume, raw=False)
+            self._record_map_projection(tile, ch_id, volume)
 
         return volume
+
+    def _record_map_projection(self, tile, ch_id, volume) -> None:
+        """Keep a small max projection of the tile exactly as it will be fused
+        (flat-fielded, light paths merged, downsampled, oriented) for the
+        registration map. Taken here, while the tile is already in RAM, so it
+        costs one pass over memory and no extra reads; the microscope's own
+        ``*_MP.tif`` is optional (the 2026-10-20 run saved none, and its map
+        came out with no image at all). Both light paths of a split run land
+        on the same key and are max-combined, like the MP files are."""
+        if not getattr(self.config, "registration_map_enabled", True):
+            return
+        try:
+            from flamingo_stitcher.registration_map import shrink_for_map
+
+            proj = volume.max(axis=0)
+            if hasattr(proj, "compute"):
+                proj = proj.compute()
+            proj = shrink_for_map(np.asarray(proj))
+            key = (self._map_key(tile), int(ch_id))
+            lock = self.__dict__.setdefault("_map_proj_lock", threading.Lock())
+            with lock:
+                store = self.__dict__.setdefault("_map_proj", {})
+                prev = store.get(key)
+                store[key] = (
+                    proj if prev is None or prev.shape != proj.shape
+                    else np.maximum(prev, proj)
+                )
+        except Exception as exc:  # a picture must never fail a run
+            self.logger.debug(f"Registration map projection not kept: {exc}")
 
     def _preprocessed_shape_stub(self, tile: RawTileInfo, illum_files) -> np.ndarray:
         """A zero-cost array with the shape preprocessing would produce.

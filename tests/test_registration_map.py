@@ -120,7 +120,62 @@ def test_the_pipeline_writes_it_from_the_microscope_mips(tmp_path, caplog):
     maps = list((tmp_path / "out").glob("*_registration_map.png"))
     assert len(maps) == 1
     assert "registration map:" in caplog.text
-    assert "have no *_MP.tif" not in caplog.text
+    assert "have no projection" not in caplog.text
+
+
+def test_without_microscope_mips_the_map_still_has_an_image(tmp_path, caplog):
+    """The 2026-10-20 rig run saved no *_MP.tif and its map came out as tint
+    and labels over black. The projection is now taken from each tile as it
+    is preprocessed, so the map never depends on the microscope saving MIPs."""
+    pytest.importorskip("multiview_stitcher")
+    from _synth_acq import write_synth_acquisition
+
+    from flamingo_stitcher.pipeline import StitchingConfig, StitchingPipeline
+
+    acq = write_synth_acquisition(
+        tmp_path / "acq", grid=(2, 2), overlap=0.25, n_planes=8,
+        frame_size=(64, 64), z_texture=True,
+    )
+    assert not list(acq.rglob("*_MP.tif"))
+    cfg = StitchingConfig.with_yaml_defaults()
+    for k, v in dict(
+        skip_registration=False, streaming_mode=True, output_format="ome-tiff",
+        resource_guard_enabled=False, flat_field_correction=False, reg_channel=1,
+        output_chunksize={"z": 4, "y": 16, "x": 16}, downsample_xy=1,
+        downsample_z=1, tile_orientation="identity", camera_x_inverted=False,
+        auto_tile_orientation=False, registration_z_spacing_um=0.0,
+    ).items():
+        setattr(cfg, k, v)
+    pipe = StitchingPipeline(cfg)
+    with caplog.at_level(logging.INFO):
+        pipe.run(acq, tmp_path / "out")
+    assert "have no projection" not in caplog.text
+    assert "max projection of each tile as fused" in caplog.text
+    projs = list(pipe._map_proj.values())
+    assert len(projs) == 4 and all(p.max() > 0 for p in projs)
+    # The PNG's mosaic area carries image, not just flat tint: many grey levels.
+    (png,) = (tmp_path / "out").glob("*_registration_map.png")
+    img = np.asarray(Image.open(png).convert("L"))
+    assert len(np.unique(img[: img.shape[0] // 2, : img.shape[1] // 2])) > 50
+
+
+def test_the_projection_is_kept_small():
+    from flamingo_stitcher.pipeline import RawTileInfo, StitchingConfig, StitchingPipeline
+
+    pipe = StitchingPipeline(StitchingConfig())
+    tile = RawTileInfo(folder=Path("/t"), x_mm=0, y_mm=0, z_min_mm=0, z_max_mm=1, n_planes=3)
+    vol = np.zeros((3, 1024, 1024), np.uint16)
+    vol[1, 500, 500] = 900
+    pipe._record_map_projection(tile, 1, vol)
+    vol2 = np.zeros_like(vol)
+    vol2[0, 10, 10] = 50                      # the other light path, same tile
+    pipe._record_map_projection(tile, 1, vol2)
+    (proj,) = pipe._map_proj.values()
+    assert max(proj.shape) <= 512 and proj.max() == 900 and (proj == 50).any()
+    pipe.config.registration_map_enabled = False
+    pipe._map_proj.clear()
+    pipe._record_map_projection(tile, 1, vol)
+    assert not pipe._map_proj
 
 
 def test_it_can_be_turned_off(tmp_path):
