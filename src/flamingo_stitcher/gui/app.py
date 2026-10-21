@@ -1,7 +1,8 @@
 """Standalone Flamingo Stitcher application.
 
-Launches a single window with two tabs — "Multi-Acquisition" and
-"Single Workflow" — each hosting the corresponding stitching dialog. This is
+Launches a single window with tabs for the three stitching dialogs (Single
+Workflow first, since it is what most runs are), Options and Updates, and
+reopens on whichever stitching or Options tab was open last. This is
 the entry point for both the ``flamingo-stitch-gui`` console script and the
 frozen Windows executable.
 
@@ -200,8 +201,10 @@ def main() -> int:
     multi.set_sample_view_available(False)
     single.set_sample_view_available(False)
     multiview.set_sample_view_available(False)
-    tabs.addTab(multi, "Multi-Acquisition")
+    # Single Workflow first: it is the microscope's native output and what
+    # most runs are, so a first launch should land on it.
     tabs.addTab(single, "Single Workflow")
+    tabs.addTab(multi, "Multi-Acquisition")
     tabs.addTab(multiview, "Multi-View")
 
     # Options — per-microscope, per-objective registration tuning. Its own tab
@@ -219,6 +222,27 @@ def main() -> int:
     tabs.currentChanged.connect(
         lambda idx: update_panel.on_tab_changed(tabs.widget(idx))
     )
+
+    from flamingo_stitcher.tab_memory import (
+        KEY_LAST_TAB,
+        REMEMBERED_TABS,
+        TAB_KEYS,
+        initial_tab_index,
+    )
+
+    # Reopen on the tab used last. Saved by a stable key, not by index or
+    # title, so reordering or renaming tabs cannot reopen the wrong one.
+    tab_keys = [TAB_KEYS.get(tabs.tabText(i), "") for i in range(tabs.count())]
+    tabs.setCurrentIndex(
+        initial_tab_index(tab_keys, settings.value(KEY_LAST_TAB, "", type=str))
+    )
+
+    def _remember_tab(idx: int) -> None:
+        key = tab_keys[idx] if 0 <= idx < len(tab_keys) else ""
+        if key in REMEMBERED_TABS:
+            settings.setValue(KEY_LAST_TAB, key)
+
+    tabs.currentChanged.connect(_remember_tab)
 
     window.setCentralWidget(tabs)
 

@@ -27,15 +27,16 @@ offers a one-click install when one exists.
 
 ### 2. Stitch your first dataset
 
-You'll see five tabs: **Multi-Acquisition**, **Single Workflow**, **Multi-View**,
-**Options**, and **Updates**. For a first run you want one of the first two —
+You'll see five tabs: **Single Workflow**, **Multi-Acquisition**, **Multi-View**,
+**Options**, and **Updates**. The app opens on Single Workflow the first time and on
+the tab you last used after that. For a first run you want one of the first two —
 [Which tab?](#which-tab-do-i-use) tells you which, by looking at your folder. Then:
 
 <!-- SCREENSHOT NEEDED -> docs/images/tabs.png
      Capture: the app window, the five tabs along the top clearly readable.
      Why: readers need to recognise the tab strip before they can choose.
      To publish it, drop the file in and uncomment the line below.
-![The five tabs across the top of Flamingo Stitcher: Multi-Acquisition, Single Workflow, Multi-View, Options, Updates](docs/images/tabs.png)
+![The five tabs across the top of Flamingo Stitcher: Single Workflow, Multi-Acquisition, Multi-View, Options, Updates](docs/images/tabs.png)
 -->
 
 1. **Add your data.** Click **Add…** and select your acquisition folder. (You can add
