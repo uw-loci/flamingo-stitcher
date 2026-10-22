@@ -113,6 +113,12 @@ def main(argv=None) -> int:
             "No tile orientation saved for this microscope. Pass --tile-orientation "
             "(the one the stitch log names on its 'Tile orientation:' line)."
         )
+    if (ori is None or not ori.name) and "auto" in (args.reverse_x, args.reverse_y):
+        raise SystemExit(
+            "No saved orientation preset for this microscope, so the tile order is "
+            "unknown too. Pass --reverse-x and --reverse-y (yes/no) as the stitch log's "
+            "'Tile orientation:' line says; for n7 Ket_Trial1: --reverse-x yes --reverse-y no."
+        )
     if args.reverse_x != "auto":
         cfg.reverse_x_tiles = args.reverse_x == "yes"
     if args.reverse_y != "auto":

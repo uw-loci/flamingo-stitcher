@@ -29,7 +29,7 @@ def test_both_strips_of_each_seam_show_the_same_tissue(tmp_path):
     seams = ["X000 Y000:X001 Y000", "X001 Y000:X001 Y001",
              "X001 Y002:X001 Y001", "X001 Y002:X000 Y002"]
     argv = [str(acq), str(tmp_path / "out"), "--pixel-um", "0.406", "--margin-um", "0",
-            "--tile-orientation", "identity"]
+            "--tile-orientation", "identity", "--reverse-x", "no", "--reverse-y", "no"]
     for s in seams:
         argv += ["--seam", s]
     assert tool.main(argv) == 0
@@ -50,4 +50,4 @@ def test_an_unknown_tile_is_named(tmp_path):
     acq = write_synth_acquisition(tmp_path / "acq", grid=(2, 2), frame_size=(32, 32))
     with pytest.raises(SystemExit, match="X009 Y009"):
         tool.main([str(acq), str(tmp_path / "o"), "--seam", "X009 Y009:X000 Y000",
-                   "--pixel-um", "0.4", "--tile-orientation", "identity"])
+                   "--pixel-um", "0.4", "--tile-orientation", "identity", "--reverse-x", "no", "--reverse-y", "no"])
