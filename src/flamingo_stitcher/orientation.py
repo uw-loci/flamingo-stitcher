@@ -70,16 +70,17 @@ class MosaicOrientation:
         "anti_transpose",
     )
 
-    # Human-friendly descriptions for UI labels.
+    # What each one does, in words, for anything a person reads (the preview
+    # dialog, the logs). The short names stay the stored/CLI values.
     LABELS: Dict[str, str] = {
-        "identity": "Identity (unchanged)",
-        "rot90": "Rotate 90° CCW",
+        "identity": "As captured (no change)",
+        "rot90": "Rotate 90° counter-clockwise",
         "rot180": "Rotate 180°",
-        "rot270": "Rotate 270° CCW",
+        "rot270": "Rotate 90° clockwise",
         "flip_h": "Mirror left–right",
-        "flip_v": "Mirror up–down",
-        "transpose": "Transpose (main diagonal)",
-        "anti_transpose": "Anti-transpose (anti-diagonal)",
+        "flip_v": "Mirror top–bottom",
+        "transpose": "Swap X and Y (mirror across the main diagonal)",
+        "anti_transpose": "Mirror across the other diagonal",
     }
 
     def __init__(self, name: str = "identity") -> None:
@@ -183,6 +184,26 @@ def preset_for_microscope(name: Optional[str]) -> Optional[str]:
 # blank name would have shared that one bogus key, for destripe settings AND
 # tile orientation.
 _NAME_RE = re.compile(r"Microscope name[^\S\r\n]*=[^\S\r\n]*([^\r\n]+)")
+
+
+def orientation_label(name: Optional[str]) -> str:
+    """The orientation in words; an unknown or empty name is returned as is
+    ("" reads as the default, as captured)."""
+    key = (name or "identity").strip().lower()
+    return MosaicOrientation.LABELS.get(key, name or "")
+
+
+def describe_orientation(name: Optional[str], reverse_x: bool = False,
+                         reverse_y: bool = False, *, with_name: bool = True) -> str:
+    """'Mirror left–right (flip_h), tile order reversed in X' -- the label, the
+    stored name for anyone matching it to a setting or the CLI, and the tile
+    order reversals."""
+    key = (name or "identity").strip().lower()
+    text = orientation_label(key) + (f" ({key})" if with_name else "")
+    axes = [a for a, on in (("X", reverse_x), ("Y", reverse_y)) if on]
+    if axes:
+        text += ", tile order reversed in " + " and ".join(axes)
+    return text
 
 
 def read_microscope_name(acquisition_dir: Path) -> Optional[str]:

@@ -76,7 +76,9 @@ class OrientationZoomDialog(QDialog):
 
     def __init__(self, name: str, arr: np.ndarray, parent=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Orientation: {name}")
+        from flamingo_stitcher.orientation import orientation_label
+
+        self.setWindowTitle(f"Orientation: {orientation_label(name)}")
         self._arr = arr
         self._zoom_idx = self._STEPS.index(1.0)
         self.chosen = False
@@ -477,10 +479,11 @@ class OrientationPreviewDialog(QDialog):
             img_label.setStyleSheet("background:#111; border:1px solid #444;")
             img_label.setMinimumSize(_CELL_PX, _CELL_PX)
             img_label.setToolTip(
-                f"Click to view '{key}' full size — the tile labels are "
+                f"Click to view '{MosaicOrientation.LABELS.get(key, key)}' full size — the tile labels are "
                 f"unreadable at thumbnail scale."
             )
-            radio = QRadioButton(f"{i + 1}. {key}")
+            radio = QRadioButton(f"{i + 1}. {MosaicOrientation.LABELS.get(key, key)}")
+            radio.setToolTip(f"Setting name: {key}")
             radio.setProperty("orientation_name", key)
             if key == self._selected_name:
                 radio.setChecked(True)
@@ -532,14 +535,11 @@ class OrientationPreviewDialog(QDialog):
             self._reverse_y,
             self._microscope_name or "",
         )
-        rev = []
-        if self._reverse_x:
-            rev.append("reverse X")
-        if self._reverse_y:
-            rev.append("reverse Y")
-        suffix = (" + " + ", ".join(rev)) if rev else ""
+        from flamingo_stitcher.orientation import describe_orientation
+
         self._header.setText(
-            f"Applied tile orientation <b>{self._selected_name}{suffix}</b>"
+            f"Applied tile orientation <b>"
+            f"{describe_orientation(self._selected_name, self._reverse_x, self._reverse_y)}</b>"
             f"{' and saved it for ' + self._microscope_name if self._microscope_name else ''}"
             ". Close this window; the next stitch uses it."
         )

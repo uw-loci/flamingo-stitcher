@@ -12152,14 +12152,13 @@ class StitchingPipeline:
             effective = self.config.tile_orientation or (
                 "flip_h" if self.config.camera_x_inverted else "identity"
             )
-            revs = []
-            if self.config.reverse_x_tiles:
-                revs.append("reverse-X order")
-            if self.config.reverse_y_tiles:
-                revs.append("reverse-Y order")
+            from flamingo_stitcher.orientation import describe_orientation
+
             self.logger.info(
-                f"Tile orientation: {effective}"
-                + (f" + {', '.join(revs)}" if revs else "")
+                f"Tile orientation: "
+                + describe_orientation(
+                    effective, self.config.reverse_x_tiles, self.config.reverse_y_tiles
+                )
                 + (" (auto, per-acquisition)" if self.config.auto_tile_orientation else "")
             )
         except Exception as e:  # never let the log line break a run

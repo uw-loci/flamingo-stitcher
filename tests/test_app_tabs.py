@@ -33,3 +33,16 @@ def test_it_reopens_where_it_was_left():
 def test_updates_and_unknown_keys_fall_back_to_the_first_tab():
     assert initial_tab_index(KEYS, "updates") == 0
     assert initial_tab_index(KEYS, "a tab that no longer exists") == 0
+
+
+def test_orientations_read_as_words_in_the_ui_and_logs():
+    """Requested 2026-10-22: the Orientation Preview showed 'flip_h' and the like."""
+    from flamingo_stitcher.orientation import MosaicOrientation, describe_orientation, orientation_label
+
+    assert set(MosaicOrientation.LABELS) == set(MosaicOrientation.NAMES)
+    assert orientation_label("flip_h") == "Mirror left–right"
+    assert orientation_label("") == "As captured (no change)"
+    assert describe_orientation("identity", True, False) == (
+        "As captured (no change) (identity), tile order reversed in X"
+    )
+    assert describe_orientation("rot270", with_name=False) == "Rotate 90° clockwise"

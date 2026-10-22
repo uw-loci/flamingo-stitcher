@@ -2039,18 +2039,14 @@ class StitchingDialog(PersistentDialog):
         self._session_orientation = TileOrientation(
             name=name, reverse_x=reverse_x, reverse_y=reverse_y
         )
-        rev = []
-        if reverse_x:
-            rev.append("reverse X")
-        if reverse_y:
-            rev.append("reverse Y")
-        suffix = (" + " + ", ".join(rev)) if rev else ""
+        from flamingo_stitcher.orientation import describe_orientation
+
         # Name the microscope so the log is unambiguous about what it applies to.
         scope = (
             f"microscope '{microscope_name}'" if microscope_name else "this microscope"
         )
         self._log(
-            f"Tile orientation '{name}{suffix}' saved for {scope}; "
+            f"Tile orientation '{describe_orientation(name, reverse_x, reverse_y)}' saved for {scope}; "
             f"it will auto-apply to its acquisitions."
         )
 
