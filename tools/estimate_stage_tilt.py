@@ -1,45 +1,46 @@
 #!/usr/bin/env python3
-"""Estimate how far the stage's X/Y travel is tilted out of the imaging plane,
-from the Z corrections registration made.
+"""Explain registration's Z corrections: stage tilt, curvature, or Z drift
+over time.
 
-If moving the stage in X also carries the sample a little along the detection
-axis, every tile's content turns up at a slightly different depth than the
-stage reported, and registration corrects it: tile dz grows linearly with
-stage position. The slope of that line is tan(tilt).
+If moving the stage in X also carries the sample along the detection axis,
+each tile's content turns up deeper or shallower than the stage reported, and
+registration corrects it. A straight, tilted axis makes that correction grow
+LINEARLY with stage position, at the same slope everywhere; the slope is
+tan(tilt). A slope that changes across the grid is not a tilt.
 
-Two independent estimates are printed, because they fail differently:
+**Fitted to seams, not tiles.** Each registered seam is one measured Z
+difference between two neighbours. A tile's solved dz is the sum of every
+seam on the path from the anchor, so one bad join shifts every tile beyond
+it; a seam is only itself. Every model here is fitted to seam differences
+(dz_A - dz_B = f(A) - f(B)), so dropping a bad join drops exactly that
+evidence and nothing else.
 
-* **Tile plane fit** -- dz = a*X + b*Y + c over the tiles registration placed
-  (tiles with at least one registered seam; carried tiles are left out, their
-  dz was copied from neighbours, not measured). Uses the global solve, so one
-  bad join that shifts a whole block of rows biases it.
-* **Seam slopes** -- each registered seam's own pairwise dz divided by the
-  stage step across it, median per axis. Independent of the solve and of
-  every other seam; quantised to one Z plane per seam (2.5 um over a 1.9 mm
-  pitch is 0.07 deg), which the median averages out.
+What is used, by default: seams the solve REGISTERED (not pruned, not below
+quality, not empty), between tiles registration placed (carried / no-
+neighbour tiles have no measurement of their own). Drop more with
+``--drop-join Y001-Y002`` (every seam across that join) and
+``--drop-tile "X000 Y006"``.
 
-When the two agree, the number is worth believing. When they don't, a block
-moved as a unit (look at the map's row joins) and the seam median is the safer
-one.
+Models, each with its residual RMS:
 
-What it cannot separate: a tilted stage axis, a tilted sample holder relative
-to the axis it rides on (same thing, optically), and sample drift in Z over
-the acquisition -- rows are acquired in order, so slow drift looks like a Y
-tilt. A second acquisition in a different tile order, or rotated 90 deg,
-separates them. One run is an observation, not a calibration.
+* **tilt**          dz = a*x + b*y
+* **tilt + curve**  adds x^2, y^2, x*y -- a stage cannot plausibly bend this
+                    much (see the printed sag), so a strong curve term points
+                    at time, not geometry
+* **tilt + drift**  with ``--acq-dir``: adds d*t (+ d2*t^2), t = each tile's
+                    acquisition time from its raw files' modification times.
+                    In a raster scan a STEADY drift is exactly a plane (t is
+                    linear in row and column), so it cannot be told from a
+                    tilt in one run; an accelerating drift, or a different
+                    tile order in a second run, can.
 
-Inputs (either):
-
-    python tools/estimate_stage_tilt.py run.log
-        The run log, with the VERBOSE ALIGNMENT tables (on by default).
+    python tools/estimate_stage_tilt.py run.log --drop-join Y000-Y001 --drop-join Y001-Y002
+    python tools/estimate_stage_tilt.py run.log --acq-dir D:/CTLSM1/2026...Ket_Trial1
     python tools/estimate_stage_tilt.py registration_report.csv registration_seams.csv
-        The two CSVs written next to the stitched output.
 
-Signs: dz is the correction applied to a tile (positive = its content sat
-deeper than the stage said). "dz grows +20 um per mm of +X" means the sample
-rises toward the detection objective... or falls, depending on your Z
-convention; the magnitude and which stage axis carry the tilt are the
-convention-free part.
+Signs: dz is the correction applied to a tile. Slopes are um of dz per mm of
+stage travel; angle = atan(slope). Which way is "up" depends on the Z
+convention; magnitude and axis do not.
 """
 
 from __future__ import annotations
@@ -51,7 +52,7 @@ import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -62,6 +63,9 @@ class Tile:
     x_mm: float
     y_mm: float
     dz_um: float
+    how: str = "registered"
+    label: str = ""          # "X### Y###"
+    t_s: Optional[float] = None
 
 
 @dataclass
@@ -86,7 +90,8 @@ class Data:
 _LABEL = r"X\d{3} Y\d{3}"
 _NUM = r"-?\d+(?:\.\d+)?"
 _TILE_ROW = re.compile(
-    rf"\s({_LABEL})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s"
+    rf"\s({_LABEL})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s+({_NUM})\s+"
+    rf"{_NUM}\s+{_NUM}\s+{_NUM}\s+(\S+(?: r\d+| neighbour)?)"
 )
 _SEAM_ROW = re.compile(rf"\s({_LABEL})\s+({_LABEL})\s+([xyz])\s+(\w+)\s+(.*)$")
 
@@ -111,8 +116,9 @@ def read_log(path: Path) -> Data:
         if not in_seams:
             m = _TILE_ROW.search(line)
             if m:
-                label, x, y, dz = m.group(1), *map(float, m.group(2, 3, 4))
-                data.tiles[label] = Tile(label, x, y, dz)
+                label = m.group(1)
+                x, y, dz = map(float, m.group(2, 3, 4))
+                data.tiles[label] = Tile(label, x, y, dz, how=m.group(7), label=label)
             continue
         m = _SEAM_ROW.search(line)
         if not m:
@@ -125,6 +131,15 @@ def read_log(path: Path) -> Data:
     return data
 
 
+def _grid_labels(tiles: Dict[str, Tile]) -> None:
+    """CSV rows carry no grid label: number columns and rows by ascending
+    stage position. (The microscope's own X### may run the other way.)"""
+    xs = sorted({round(t.x_mm, 3) for t in tiles.values()})
+    ys = sorted({round(t.y_mm, 3) for t in tiles.values()})
+    for t in tiles.values():
+        t.label = f"X{xs.index(round(t.x_mm, 3)):03d} Y{ys.index(round(t.y_mm, 3)):03d}"
+
+
 def read_csvs(tile_csv: Path, seam_csv: Optional[Path]) -> Data:
     data = Data()
     with tile_csv.open(newline="", encoding="utf-8") as f:
@@ -135,6 +150,7 @@ def read_csvs(tile_csv: Path, seam_csv: Optional[Path]) -> Data:
                 continue                       # not measured: kept stage Z
             k = row["tile_index"]
             data.tiles[k] = Tile(k, float(row["x_mm"]), float(row["y_mm"]), float(row["dz_um"]))
+    _grid_labels(data.tiles)
     if seam_csv is not None:
         with seam_csv.open(newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
@@ -146,6 +162,66 @@ def read_csvs(tile_csv: Path, seam_csv: Optional[Path]) -> Data:
     return data
 
 
+_FILE_LABEL = re.compile(r"_X(\d{3})_Y(\d{3})_")
+
+
+def read_times(acq_dir: Path, data: Data) -> int:
+    """Each tile's acquisition time: the latest modification time of its raw
+    files (written as the stack finishes). Flat layout only. Returns how many
+    tiles got a time. Copied data keeps these only if the copy preserved
+    them; the printed span shows whether it did."""
+    latest: Dict[str, float] = {}
+    for f in acq_dir.iterdir():
+        m = _FILE_LABEL.search(f.name)
+        if not m or f.suffix.lower() not in (".raw", ".tif", ".tiff", ".btf"):
+            continue
+        label = f"X{m.group(1)} Y{m.group(2)}"
+        latest[label] = max(latest.get(label, 0.0), f.stat().st_mtime)
+    n = 0
+    for t in data.tiles.values():
+        if t.label in latest:
+            t.t_s = latest[t.label]
+            n += 1
+    return n
+
+
+# --------------------------------------------------------------------------
+# Selecting the evidence
+# --------------------------------------------------------------------------
+
+
+def _join_key(label_a: str, label_b: str, axis: str) -> str:
+    """'Y001-Y002' for a Y-seam between rows 1 and 2; 'X000-X001' for X."""
+    i = 1 if axis == "y" else 0
+    parts = sorted((label_a.split()[i], label_b.split()[i]))
+    return f"{parts[0]}-{parts[1]}"
+
+
+def select_seams(
+    data: Data,
+    statuses: Sequence[str] = ("registered",),
+    drop_joins: Sequence[str] = (),
+    drop_tiles: Sequence[str] = (),
+) -> List[Tuple[Seam, Tile, Tile]]:
+    drop_j = {"-".join(sorted(j.upper().replace(" ", "").split("-"))) for j in drop_joins}
+    drop_t = {t.upper() for t in drop_tiles}
+    out = []
+    for s in data.seams:
+        if s.status not in statuses or s.dz_um is None or s.axis not in ("x", "y"):
+            continue
+        ta, tb = data.tiles.get(s.a), data.tiles.get(s.b)
+        if ta is None or tb is None:
+            continue
+        if ta.how != "registered" or tb.how != "registered":
+            continue
+        if ta.label.upper() in drop_t or tb.label.upper() in drop_t:
+            continue
+        if _join_key(ta.label, tb.label, s.axis) in drop_j:
+            continue
+        out.append((s, ta, tb))
+    return out
+
+
 # --------------------------------------------------------------------------
 # Fitting
 # --------------------------------------------------------------------------
@@ -155,71 +231,27 @@ def _deg(slope_um_per_mm: float) -> float:
     return math.degrees(math.atan(slope_um_per_mm / 1000.0))
 
 
-def plane_fit(tiles: List[Tile]) -> Optional[dict]:
-    """Least squares dz = a*X + b*Y + c (a, b in um per mm), with standard
-    errors. Tiles are not independent (they share seams), so the errors are
-    optimistic; read them as a floor."""
-    if len(tiles) < 4:
+def fit_seams(seams, terms: Dict[str, callable]) -> Optional[dict]:
+    """Least squares on dz_A - dz_B = sum_k c_k (f_k(A) - f_k(B))."""
+    names = list(terms)
+    if len(seams) <= len(names):
         return None
-    X = np.array([[t.x_mm, t.y_mm, 1.0] for t in tiles])
-    z = np.array([t.dz_um for t in tiles])
-    coef, *_ = np.linalg.lstsq(X, z, rcond=None)
-    resid = z - X @ coef
-    dof = max(1, len(z) - 3)
-    s2 = float(resid @ resid) / dof
-    cov = s2 * np.linalg.pinv(X.T @ X)
-    ss_tot = float(((z - z.mean()) ** 2).sum()) or 1e-12
+    A = np.array([[terms[n](ta) - terms[n](tb) for n in names] for _s, ta, tb in seams])
+    y = np.array([s.dz_um for s, _a, _b in seams])
+    coef, *_ = np.linalg.lstsq(A, y, rcond=None)
+    resid = y - A @ coef
+    dof = max(1, len(y) - len(names))
+    cov = float(resid @ resid) / dof * np.linalg.pinv(A.T @ A)
     return {
-        "a": float(coef[0]), "b": float(coef[1]),
-        "se_a": float(math.sqrt(cov[0, 0])), "se_b": float(math.sqrt(cov[1, 1])),
-        "r2": 1.0 - float(resid @ resid) / ss_tot,
+        "coef": dict(zip(names, coef)),
+        "se": dict(zip(names, np.sqrt(np.clip(np.diag(cov), 0, None)))),
         "rms": float(math.sqrt((resid ** 2).mean())),
-        "n": len(z),
-        "worst": sorted(zip(resid, (t.key for t in tiles)), key=lambda p: -abs(p[0]))[:3],
+        "n": len(y),
+        "resid": sorted(
+            ((float(r), f"{ta.label}|{tb.label}") for r, (_s, ta, tb) in zip(resid, seams)),
+            key=lambda p: -abs(p[0]),
+        ),
     }
-
-
-def seam_slopes(data: Data, statuses: Tuple[str, ...]) -> Dict[str, np.ndarray]:
-    """Per axis: each seam's dz / stage step (um per mm). Seam dz is tile A's
-    correction minus tile B's when the solve honours it, so the stage step is
-    A minus B as well."""
-    out: Dict[str, list] = {"x": [], "y": []}
-    for s in data.seams:
-        if s.status not in statuses or s.dz_um is None or s.axis not in out:
-            continue
-        ta, tb = data.tiles.get(s.a), data.tiles.get(s.b)
-        if ta is None or tb is None:
-            continue
-        step = (ta.x_mm - tb.x_mm) if s.axis == "x" else (ta.y_mm - tb.y_mm)
-        if abs(step) < 1e-6:
-            continue
-        out[s.axis].append(s.dz_um / step)
-    return {k: np.array(v) for k, v in out.items()}
-
-
-def join_slopes(data: Data, statuses: Tuple[str, ...]) -> Dict[str, List[tuple]]:
-    """Per axis, per join (the line between two columns or rows): stage
-    position of the join, seam count, median slope. A stage tilt gives the
-    same slope at every join; a step that grows across the grid is not a
-    tilt (drift over time, a sagging sample, or bad joins)."""
-    groups: Dict[Tuple[str, float], list] = {}
-    for s in data.seams:
-        if s.status not in statuses or s.dz_um is None or s.axis not in ("x", "y"):
-            continue
-        ta, tb = data.tiles.get(s.a), data.tiles.get(s.b)
-        if ta is None or tb is None:
-            continue
-        if s.axis == "x":
-            step, mid = ta.x_mm - tb.x_mm, (ta.x_mm + tb.x_mm) / 2
-        else:
-            step, mid = ta.y_mm - tb.y_mm, (ta.y_mm + tb.y_mm) / 2
-        if abs(step) < 1e-6:
-            continue
-        groups.setdefault((s.axis, round(mid, 2)), []).append(s.dz_um / step)
-    out: Dict[str, List[tuple]] = {"x": [], "y": []}
-    for (axis, mid), v in sorted(groups.items()):
-        out[axis].append((mid, len(v), float(np.median(v)), float(min(v)), float(max(v))))
-    return out
 
 
 # --------------------------------------------------------------------------
@@ -228,69 +260,115 @@ def join_slopes(data: Data, statuses: Tuple[str, ...]) -> Dict[str, List[tuple]]
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("inputs", nargs="+", type=Path,
-                    help="a run log, or registration_report.csv [registration_seams.csv]")
+                    help="a run log, or registration_report.csv registration_seams.csv")
+    ap.add_argument("--drop-join", action="append", default=[], metavar="Y001-Y002",
+                    help="ignore every seam across this row (Y) or column (X) join; repeatable")
+    ap.add_argument("--drop-tile", action="append", default=[], metavar="'X000 Y006'",
+                    help="ignore every seam touching this tile; repeatable")
     ap.add_argument("--include-pruned", action="store_true",
-                    help="also use seams the solve pruned (measured, but disagreed with the solve)")
-    ap.add_argument("--all-tiles", action="store_true",
-                    help="fit every tile, including carried ones (dz copied from neighbours)")
+                    help="also use seams the solve pruned (measured, but disagreed with it)")
+    ap.add_argument("--acq-dir", type=Path,
+                    help="the acquisition folder: tile times from the raw files, for the drift model")
     args = ap.parse_args(argv)
 
     first = args.inputs[0]
     if first.suffix.lower() == ".csv":
-        data = read_csvs(first, args.inputs[1] if len(args.inputs) > 1 else None)
+        if len(args.inputs) < 2:
+            raise SystemExit("CSV input needs registration_report.csv AND registration_seams.csv")
+        data = read_csvs(first, args.inputs[1])
     else:
         data = read_log(first)
-    if not data.tiles:
-        print("No tile rows found.", file=sys.stderr)
-        return 1
 
     statuses = ("registered", "pruned") if args.include_pruned else ("registered",)
-    placed = {k for s in data.seams if s.status == "registered" for k in (s.a, s.b)}
-    if args.all_tiles or not data.seams:
-        fit_tiles = list(data.tiles.values())
-        which = "all tiles" if args.all_tiles else "all tiles (no seam table to tell placed from carried)"
-    else:
-        fit_tiles = [t for k, t in data.tiles.items() if k in placed]
-        which = f"tiles with a registered seam ({len(fit_tiles)} of {len(data.tiles)})"
-
+    seams = select_seams(data, statuses, args.drop_join, args.drop_tile)
+    n_skip = sum(1 for t in data.tiles.values() if t.how != "registered")
     print(f"Input: {', '.join(str(p) for p in args.inputs)}")
-    print()
-    print(f"1. Tile plane fit over {which}")
-    p = plane_fit(fit_tiles)
-    if p is None:
-        print("   too few tiles to fit a plane")
-    else:
-        for axis, k in (("X", "a"), ("Y", "b")):
-            sl, se = p[k], p["se_" + k]
-            print(f"   along stage {axis}: dz {sl:+7.2f} +/- {se:5.2f} um per mm  ->  "
-                  f"{_deg(sl):+.3f} deg (+/- {abs(_deg(sl + se) - _deg(sl)):.3f})")
-        mag = math.hypot(p["a"], p["b"])
-        direction = math.degrees(math.atan2(p["b"], p["a"]))
-        print(f"   steepest: {_deg(mag):.3f} deg, toward {direction:+.0f} deg from +X (+90 = +Y)")
-        print(f"   R^2 {p['r2']:.2f}, residual RMS {p['rms']:.1f} um over {p['n']} tiles; "
-              f"worst: " + ", ".join(f"{k} {r:+.0f}" for r, k in p["worst"]))
+    print(f"Evidence: {len(seams)} {'/'.join(statuses)} seams between registered tiles"
+          f" ({n_skip} carried / unplaced tiles left out"
+          + (f"; dropped joins {', '.join(args.drop_join)}" if args.drop_join else "")
+          + (f"; dropped tiles {', '.join(args.drop_tile)}" if args.drop_tile else "") + ")")
+    if len(seams) < 4:
+        print("Too few seams to fit anything.")
+        return 1
+    xs = [t.x_mm for _s, a, b in seams for t in (a, b)]
+    ys = [t.y_mm for _s, a, b in seams for t in (a, b)]
+    x0, y0 = float(np.mean(xs)), float(np.mean(ys))   # centre: curve terms stay interpretable
+    X = lambda t: t.x_mm - x0          # noqa: E731
+    Y = lambda t: t.y_mm - y0          # noqa: E731
 
+    # --- 1. where the slope changes ----------------------------------------
     print()
-    label = "registered + pruned" if args.include_pruned else "registered"
-    print(f"2. Seam slopes ({label} seams; each seam's dz / stage step)")
-    for axis, v in seam_slopes(data, statuses).items():
-        if not len(v):
-            print(f"   {axis.upper()}-seams: none")
-            continue
-        q1, med, q3 = np.percentile(v, [25, 50, 75])
-        print(f"   {axis.upper()}-seams (n={len(v):2d}): median dz {med:+7.2f} um per mm  ->  "
-              f"{_deg(med):+.3f} deg   (middle half {_deg(q1):+.3f} to {_deg(q3):+.3f} deg)")
+    print("1. Slope at each seam, by row (X-seams) and column (Y-seams), deg.")
+    print("   A tilted straight axis gives the same number everywhere.")
+    for axis, idx, name in (("x", 1, "row"), ("y", 0, "column")):
+        groups: Dict[str, List[float]] = {}
+        for s, ta, tb in seams:
+            if s.axis != axis:
+                continue
+            step = (ta.x_mm - tb.x_mm) if axis == "x" else (ta.y_mm - tb.y_mm)
+            groups.setdefault(ta.label.split()[idx], []).append(_deg(s.dz_um / step))
+        for g in sorted(groups):
+            v = groups[g]
+            print(f"   {axis.upper()}-seams in {name} {g}: median {np.median(v):+.2f}   "
+                  + " ".join(f"{a:+.2f}" for a in v))
 
+    # --- 2. models ------------------------------------------------------------
     print()
-    print("3. Per join (median of its seams). A stage tilt is the same at every join.")
-    for axis, rows in join_slopes(data, statuses).items():
-        for mid, n, med, lo, hi in rows:
-            print(f"   {axis.upper()} join at {axis.upper()}={mid:7.2f} mm  n={n}  "
-                  f"{_deg(med):+.3f} deg  (seams {_deg(lo):+.2f} to {_deg(hi):+.2f})")
+    print("2. Models fitted to the seams (slopes in um of dz per mm; angle = atan)")
+    tilt = fit_seams(seams, {"x": X, "y": Y})
+    curve = fit_seams(seams, {"x": X, "y": Y, "xx": lambda t: X(t) ** 2,
+                              "yy": lambda t: Y(t) ** 2, "xy": lambda t: X(t) * Y(t)})
+    if tilt:
+        a, b = tilt["coef"]["x"], tilt["coef"]["y"]
+        print(f"   tilt:          X {a:+6.2f} +/- {tilt['se']['x']:.2f} ({_deg(a):+.3f} deg)   "
+              f"Y {b:+6.2f} +/- {tilt['se']['y']:.2f} ({_deg(b):+.3f} deg)   "
+              f"combined {_deg(math.hypot(a, b)):.3f} deg   residual RMS {tilt['rms']:.1f} um")
+    if curve:
+        c = curve["coef"]
+        span_x = (max(xs) - min(xs)) / 2
+        span_y = (max(ys) - min(ys)) / 2
+        print(f"   tilt + curve:  slope at the centre X {_deg(c['x']):+.3f}  Y {_deg(c['y']):+.3f} deg;"
+              f"   residual RMS {curve['rms']:.1f} um")
+        for corner, sx, sy in (("+X+Y", 1, 1), ("+X-Y", 1, -1), ("-X+Y", -1, 1), ("-X-Y", -1, -1)):
+            gx = c["x"] + 2 * c["xx"] * sx * span_x + c["xy"] * sy * span_y
+            gy = c["y"] + 2 * c["yy"] * sy * span_y + c["xy"] * sx * span_x
+            print(f"      slope at the {corner} corner: X {_deg(gx):+.3f}  Y {_deg(gy):+.3f} deg")
+        sag_x = abs(c["xx"]) * span_x ** 2
+        sag_y = abs(c["yy"]) * span_y ** 2
+        print(f"      departure from a straight line over the span: X {sag_x:.0f} um, Y {sag_y:.0f} um"
+              f" (a positioning stage is flat to a few um)")
 
-    print()
-    print("A tilt seen along only one axis, and not repeated by a second acquisition in a\n"
-          "different tile order, may be Z drift over time rather than stage geometry.")
+    if args.acq_dir is not None:
+        n = read_times(args.acq_dir, data)
+        timed = [(s, a, b) for s, a, b in seams if a.t_s is not None and b.t_s is not None]
+        print()
+        if len(timed) < 6:
+            print(f"3. Drift: only {n} tiles got a time from {args.acq_dir}; not fitted.")
+        else:
+            t0 = min(t.t_s for t in data.tiles.values() if t.t_s is not None)
+            T = lambda t: (t.t_s - t0) / 3600.0      # noqa: E731  hours
+            span_h = max(T(t) for t in data.tiles.values() if t.t_s is not None)
+            order = sorted((t for t in data.tiles.values() if t.t_s is not None), key=lambda t: t.t_s)
+            print(f"3. Drift, from file times: {n} tiles over {span_h:.2f} h; first "
+                  f"{order[0].label}, last {order[-1].label}"
+                  + ("  (all within a minute: these are COPY times, not acquisition times)"
+                     if span_h < 1 / 60 else ""))
+            drift = fit_seams(timed, {"x": X, "y": Y, "t": T})
+            accel = fit_seams(timed, {"x": X, "y": Y, "t": T, "tt": lambda t: T(t) ** 2})
+            for name, f in (("tilt + steady drift", drift), ("tilt + accelerating drift", accel)):
+                if not f:
+                    continue
+                c = f["coef"]
+                extra = f"drift {c['t']:+.1f} um/h" + (f", {c['tt']:+.2f} um/h^2" if "tt" in c else "")
+                print(f"   {name}: X {_deg(c['x']):+.3f}  Y {_deg(c['y']):+.3f} deg, {extra};"
+                      f" residual RMS {f['rms']:.1f} um")
+            print("   A steady drift in a raster scan is nearly a plane, so compare the RMS:"
+                  " drift only earns its place if it beats 'tilt + curve' with fewer terms.")
+
+    if tilt:
+        print()
+        print("Worst seams against the tilt model: "
+              + ", ".join(f"{k} {r:+.0f} um" for r, k in tilt["resid"][:4]))
     return 0
 
 
