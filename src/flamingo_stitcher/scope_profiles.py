@@ -333,6 +333,22 @@ TUNABLES: Tuple[Tunable, ...] = (
             "drifting dark or bright. BigStitcher's default is 0.1."
         ),
     ),
+    Tunable(
+        field="intensity_adjust_keep_range",
+        label="Intensity adjustment: keep the input brightness range",
+        kind="bool",
+        minimum=0.0,
+        maximum=1.0,
+        step=1.0,
+        help=(
+            "On, the scale and offset every tile shares are divided out after "
+            "the fit, so the median tile is left as acquired and only the "
+            "differences between tiles are corrected. Off, BigStitcher's raw "
+            "fit is applied, which on noisy overlaps scales every tile down "
+            "together (a = 0.3-0.5 on the n7 runs of 2026-10-22, turning raw "
+            "100-170 into about 40-80). Seams match the same either way."
+        ),
+    ),
 )
 
 TUNABLE_FIELDS: Tuple[str, ...] = tuple(t.field for t in TUNABLES)

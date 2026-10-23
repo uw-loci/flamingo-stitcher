@@ -225,6 +225,7 @@ _CONFIG_FIELD_ORDER = (
     "intensity_adjust_affine",
     "intensity_adjust_offset_regularization",
     "intensity_adjust_identity_regularization",
+    "intensity_adjust_keep_range",
     "downsample_xy",
     "downsample_z",
     "skip_registration",
@@ -1777,6 +1778,12 @@ class StitchingConfig:
     intensity_adjust_affine: bool = True  # scale + offset; False = offset only
     intensity_adjust_offset_regularization: float = 0.1  # pull toward offset-only
     intensity_adjust_identity_regularization: float = 0.1  # pull toward unchanged
+    # Divide out the scale and offset every tile shares after the fit
+    # (intensity_adjust.keep_input_range). BigStitcher's raw fit shrinks every
+    # scale together on noisy overlaps (a = 0.3-0.5 on n7, 2026-10-22) and we
+    # write a * v + b straight to uint16, so without this the output range is
+    # cut to ~40%. False = BigStitcher's numbers exactly.
+    intensity_adjust_keep_range: bool = True
 
     # Tile-overlap fusion method — how overlapping tiles are combined.
     #   "blend" : weighted-average (cosine) blending — seamless on dense,
@@ -11170,19 +11177,29 @@ class StitchingPipeline:
                 )
                 cache[key] = False
                 return sims
-            cache[key] = result
+            norm = (
+                ia.keep_input_range(result)
+                if getattr(self.config, "intensity_adjust_keep_range", True)
+                else None
+            )
+            cache[key] = result = (result, norm)
             self._log_intensity_adjustment(
-                result, params, tile_data, native_px, time.time() - t0, tile_label
+                result[0], params, tile_data, native_px, time.time() - t0,
+                tile_label, norm,
             )
         if result is False or mode != "apply":
             return sims
+        fit, norm = result
+        scales, offsets = (
+            (norm.scale, norm.offset) if norm is not None else (fit.scale, fit.offset)
+        )
         return [
             sim.copy(data=ia.apply_uint16(sim.data, float(a), float(b)))
-            for sim, a, b in zip(sims, result.scale, result.offset)
+            for sim, a, b in zip(sims, scales, offsets)
         ]
 
     def _log_intensity_adjustment(
-        self, result, params, tile_data, native_px, elapsed, tile_label
+        self, result, params, tile_data, native_px, elapsed, tile_label, norm=None
     ):
         n_pairs = sum(1 for b, _ in result.pair_counts.values() if b)
         n_before = sum(b for b, _ in result.pair_counts.values())
@@ -11198,12 +11215,23 @@ class StitchingPipeline:
             f"toward offset-only {params.offset_regularization:g}, toward "
             f"unchanged {params.identity_regularization:g}; {elapsed:.1f} s."
         )
-        self.logger.info(
-            f"    Every offset shifted by {-result.min_offset:+.1f} so the smallest "
-            f"is 0 (BigStitcher does the same). Per tile, output = a * input + b:"
-        )
+        if norm is None:
+            self.logger.info(
+                f"    Every offset shifted by {-result.min_offset:+.1f} so the smallest "
+                f"is 0 (BigStitcher does the same). Per tile, output = a * input + b:"
+            )
+            scales, offsets = result.scale, result.offset
+        else:
+            self.logger.info(
+                f"    BigStitcher's fit scaled every tile by about "
+                f"{norm.common_scale:.3f} together (median a); dividing out that "
+                f"shared scale and offset keeps the input range, with the median "
+                f"tile as acquired. Seams match exactly as fitted ('keep the input "
+                f"brightness range' in Options). Per tile, output = a * input + b:"
+            )
+            scales, offsets = norm.scale, norm.offset
         for i, ((_v, ti), a, b, c) in enumerate(
-            zip(tile_data, result.scale, result.offset, result.connected)
+            zip(tile_data, scales, offsets, result.connected)
         ):
             self.logger.info(
                 f"    {tile_label(ti, i):>12s}  a={a:7.4f}  b={b:9.1f}"

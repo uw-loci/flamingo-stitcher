@@ -144,6 +144,80 @@ def test_a_tile_with_no_overlap_is_left_unchanged():
     assert r.offset[-1] == pytest.approx(-r.min_offset)
 
 
+# --------------------------------------------------------------------------
+# Keeping the input range (not BigStitcher; divides out the shared map)
+# --------------------------------------------------------------------------
+
+
+def _noisy_identical(noise_sd, m=4, n=5000, gains=None, seed=1):
+    """A chain of m tiles seeing the same signal (background 100 + tissue)
+    through independent noise, optionally with a true per-tile gain."""
+    rng = np.random.default_rng(seed)
+    gains = gains or [1.0] * m
+    matches = {}
+    for i in range(m - 1):
+        sig = 100 + rng.gamma(2.0, 20.0, n)
+        x = gains[i] * sig + rng.normal(0, noise_sd, n)
+        y = gains[i + 1] * sig + rng.normal(0, noise_sd, n)
+        matches[(i, i + 1)] = np.stack([x, y], axis=1)
+    return matches, m
+
+
+def _fit(matches, m):
+    params = ia.IntensityAdjustParams()
+    a, b, conn, min_off = ia.solve(matches, m, params)
+    return ia.IntensityAdjustResult(
+        a, b, min_off, {}, conn, None, None, own_mean=ia.own_means(matches, m)
+    )
+
+
+@pytest.mark.parametrize("noise_sd", [10, 20])
+def test_raw_fit_shrinks_every_tile_and_keep_range_undoes_it(noise_sd):
+    """Tiles that need no correction: BigStitcher's fit scales them all down
+    together (regression dilution); keep_input_range returns them to a = 1,
+    b = 0."""
+    r = _fit(*_noisy_identical(noise_sd))
+    assert r.scale.max() < 0.75  # the shrink this exists to remove
+    n = ia.keep_input_range(r)
+    np.testing.assert_allclose(n.scale, 1.0, atol=0.03)
+    np.testing.assert_allclose(n.offset, 0.0, atol=3.0)
+    assert n.common_scale == pytest.approx(np.median(r.scale))
+
+
+def test_keep_range_leaves_the_seams_as_fitted():
+    """One common affine map on every tile: every pairwise difference scales
+    by the same 1/s, so the brightness step still drops as much as fitted."""
+    views, params, _, _ = _case("case1")
+    raw, _, _ = ia.collect_matches(views, params)
+    r = ia.compute(views, params)
+    n = ia.keep_input_range(r)
+    s = n.common_scale
+    for (i, j), arr in raw.items():
+        if not len(arr):
+            continue
+        fitted = r.scale[i] * arr[:, 0] + r.offset[i] - (r.scale[j] * arr[:, 1] + r.offset[j])
+        kept = n.scale[i] * arr[:, 0] + n.offset[i] - (n.scale[j] * arr[:, 1] + n.offset[j])
+        np.testing.assert_allclose(kept, fitted / s, rtol=1e-9, atol=1e-6)
+
+
+def test_keep_range_keeps_a_true_gain_difference():
+    r = _fit(*_noisy_identical(2, gains=[1.0, 1.0, 1.5, 1.0]))
+    n = ia.keep_input_range(r)
+    # The fit corrects the bright tile only partly (BigStitcher's pull toward
+    # unchanged); normalising keeps exactly the ratio the fit found.
+    assert n.scale[2] < 0.8 * n.scale[0]
+    assert n.scale[2] / n.scale[0] == pytest.approx(r.scale[2] / r.scale[0], rel=1e-12)
+    assert np.median(n.scale) == pytest.approx(1.0)
+
+
+def test_keep_range_leaves_a_lonely_tile_unchanged():
+    views, params, _, _ = _case("case1")
+    lonely = ia.View(views[0].data, views[0].affine.copy())
+    lonely.affine[0, 3] += 1e5
+    n = ia.keep_input_range(ia.compute(views + [lonely], params))
+    assert (n.scale[-1], n.offset[-1]) == (1.0, 0.0)
+
+
 def test_apply_rounds_and_clips_to_uint16():
     v = np.array([[[0, 100, 60000]]], dtype=np.uint16)
     out = ia.apply_uint16(v, 1.5, -20.4)
@@ -232,6 +306,10 @@ def test_the_pipeline_measures_and_applies(tmp_path, caplog):
     a1 = float(np.asarray(applied[1].data).mean())
     # the bright tile is brought toward its neighbour
     assert abs(a0 / a1 - 1) < abs(m0 / m1 - 1) / 2
+    # and the mosaic keeps its brightness: the unscaled neighbour stays close
+    # to as acquired instead of every tile sinking together
+    assert abs(a1 / m1 - 1) < 0.2
+    assert any("keeps the input range" in r.getMessage() for r in caplog.records)
 
 
 def test_streaming_tiles_backed_by_dask_give_the_same_fit():

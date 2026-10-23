@@ -107,6 +107,9 @@ class IntensityAdjustResult:
     connected: np.ndarray        # bool per view: had any overlap
     bbox: Tuple[np.ndarray, np.ndarray]          # world px, inclusive
     grid: Tuple[np.ndarray, np.ndarray]          # scaled, inclusive
+    # Mean of each view's OWN values over its (thinned) overlap samples; NaN
+    # for a view with none. What keep_input_range anchors the level to.
+    own_mean: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +443,72 @@ def compute(views: Sequence[View], params: Optional[IntensityAdjustParams] = Non
     thinned = thin_matches(raw, m, params.max_matches)
     a, b, connected, min_off = solve(thinned, m, params)
     counts = {k: (len(raw[k]), len(thinned[k])) for k in raw}
-    return IntensityAdjustResult(a, b, min_off, counts, connected, bbox, grid)
+    return IntensityAdjustResult(
+        a, b, min_off, counts, connected, bbox, grid,
+        own_mean=own_means(thinned, m),
+    )
+
+
+def own_means(matches: Dict[Tuple[int, int], np.ndarray], m: int) -> np.ndarray:
+    """Mean of each view's own values over its match samples; NaN if none."""
+    sums = np.zeros(m)
+    ns = np.zeros(m)
+    for (i, j), arr in matches.items():
+        if len(arr):
+            sums[i] += float(arr[:, 0].sum()); ns[i] += len(arr)
+            sums[j] += float(arr[:, 1].sum()); ns[j] += len(arr)
+    return np.where(ns > 0, sums / np.maximum(ns, 1), np.nan)
+
+
+@dataclass
+class RangeNormalization:
+    """The common map divided out of every tile by :func:`keep_input_range`."""
+
+    scale: np.ndarray       # a per view, after
+    offset: np.ndarray      # b per view, after
+    common_scale: float     # s: median a over the overlapping views, before
+    common_offset: float    # c, in the solve's output units
+
+
+def keep_input_range(result: IntensityAdjustResult) -> Optional[RangeNormalization]:
+    """Divide out the scale and offset that every tile shares.
+
+    BigStitcher's fit gives each tile's scale as a least-squares slope of its
+    neighbours' values on its own. Noise in its own values biases that slope
+    low (regression dilution), every tile alike, and nothing holds any tile
+    at a = 1, so the whole mosaic's scale sinks: on identical noisy tiles that
+    need no correction, the solve returns a = 0.57 at overlap r 0.82 and 0.33
+    at r 0.53. The min-offset shift then moves every value down further. On
+    the n7 runs of 2026-10-22 that turned raw 100-170 into roughly 40-80.
+    BigStitcher hides it by rescaling a float fusion at export; our output is
+    the uint16 ``a * v + b`` itself.
+
+    Any map applied to EVERY tile leaves the seams exactly as the solve made
+    them, so this keeps the relative corrections and removes the shared one:
+    with s = median a over the overlapping tiles and c chosen so the median
+    tile's mean overlap level is unchanged,
+
+        a_i' = a_i / s,   b_i' = (b_i - c) / s,
+        c = median_i (a_i m_i + b_i - s m_i),   m_i = tile i's own mean level.
+
+    Identical tiles come out at a = 1, b = 0. Views with no overlap stay at
+    a = 1, b = 0. None when there is nothing to normalise against.
+    """
+    a = np.asarray(result.scale, float)
+    b = np.asarray(result.offset, float)
+    conn = np.asarray(result.connected, bool)
+    mean = result.own_mean
+    if mean is None or not conn.any():
+        return None
+    mean = np.asarray(mean, float)
+    use = conn & np.isfinite(mean) & (a > 0)
+    if not use.any():
+        return None
+    s = float(np.median(a[use]))
+    c = float(np.median(a[use] * mean[use] + b[use] - s * mean[use]))
+    a2 = np.where(conn, a / s, 1.0)
+    b2 = np.where(conn, (b - c) / s, 0.0)
+    return RangeNormalization(a2, b2, s, c)
 
 
 def apply_uint16(volume, scale: float, offset: float):
