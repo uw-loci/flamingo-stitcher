@@ -207,6 +207,23 @@ registration:
   # larger correlation matrix per tile pair and nothing else.
   upsample_factor: 0
 
+  # How each seam's shift is chosen. Phase correlation finds a peak, and a peak
+  # stands for several shifts (either sign on each axis, or the same pattern one
+  # overlap-width over). "cells" picks the one where cell-sized detail lines up
+  # (a band-pass correlation, ~0 for a wrong shift); "ssim" is
+  # multiview-stitcher's own choice, by structural similarity, which is
+  # dominated by smooth brightness. On Ket_Trial1 (2026-10-22) SSIM picked a
+  # wrong shift on 3 of 4 seams checked, one of which opened a gap between
+  # tiles; "cells" picked right on all 4, ~10x faster per seam.
+  # Falls back to "ssim" when the registration voxel is too coarse to resolve
+  # cells (XY over ~4 um).
+  seam_choice: cells
+
+  # Drop a seam before the global solve when even its best shift does not line
+  # the cells up: cells r below this. Right shifts scored 0.32-0.68 on the
+  # Ket_Trial1 strips, wrong ones 0.00-0.23. 0 disables the check.
+  min_cell_r: 0.1
+
   # How the mosaic is assembled from the measured seams.
   #
   # "default"   — multiview-stitcher's own behaviour: each connected group of

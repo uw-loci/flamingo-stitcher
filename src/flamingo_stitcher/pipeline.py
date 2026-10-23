@@ -261,6 +261,8 @@ _CONFIG_FIELD_ORDER = (
     "registration_seam_content_gate",
     "scope_profile_source",
     "registration_upsample_factor",
+    "registration_seam_choice",
+    "registration_min_cell_r",
     "registration_z_refine",
     "registration_z_refine_range_um",
     "registration_z_refine_binning",
@@ -1010,6 +1012,10 @@ def _copy_config_with(config, **changes):
 # once the overlap is large (8-17 M voxels), the float32 transformed copies,
 # float64 rescale and complex FFT buffers. Pairs run one at a time for 3-D data
 # (n_parallel_pairwise_regs=1), so this is per seam, not summed.
+# Choosing the shift by cell match (seam_select, the default since 2026-10-23)
+# measured 100-101 B per compared voxel inside the pairwise function against
+# 107 for multiview-stitcher's own (tracemalloc, 5-10 M voxels), so this figure
+# covers both.
 REGISTRATION_BYTES_PER_COMPARED_VOXEL = 124.0
 # Plus dask's chunk buffers while the overlap is cut out and binned: small
 # overlaps peaked up to ~340 MB above the per-voxel term with 64x256x256
@@ -1597,6 +1603,17 @@ class StitchingConfig:
     # run is byte-identical to before); 4-10 costs a slightly larger correlation
     # matrix per pair and nothing else.
     registration_upsample_factor: int = 0
+
+    # How each seam's shift is chosen among the candidates one phase-correlation
+    # peak stands for (either sign per axis, or one overlap-width over).
+    # "cells": the candidate whose band-passed overlaps correlate best
+    # (seam_select). "ssim": multiview-stitcher's own SSIM choice, which on
+    # Ket_Trial1 picked wrong on 3 of 4 seams and opened a gap.
+    registration_seam_choice: str = "cells"
+    # Seams whose best candidate scores below this cells r are dropped before
+    # the global solve. Right shifts scored 0.32-0.68 on the Ket_Trial1 strips
+    # (2026-10-22), wrong ones 0.00-0.23. 0 = keep every seam.
+    registration_min_cell_r: float = 0.1
 
     # Dedicated second registration pass whose only job is Z. The main pass
     # compares planes at registration_z_spacing_um for speed, which is the wrong
@@ -8403,6 +8420,15 @@ class StitchingPipeline:
             )
             abs_tol_um = self._global_opt_abs_tol_um(voxel_size_um, reg_binning)
             self._abs_tol_um = abs_tol_um
+            seam_func, seam_kwargs, choices = self._seam_choice_setup(
+                voxel_size_um, reg_binning
+            )
+            reject = self._cell_match_reject(reject, choices)
+            reg_kwargs = self._pairwise_reg_kwargs(
+                self.config.registration_upsample_factor
+            )
+            if seam_kwargs:
+                reg_kwargs = {**(reg_kwargs or {}), **seam_kwargs}
             self.logger.info(
                 f"  Global solve tolerance: {self.config.global_opt_abs_tol:g} "
                 f"registration px = {abs_tol_um:.1f} µm. A seam whose placement "
@@ -8418,7 +8444,8 @@ class StitchingPipeline:
                         pairs=gate_pairs,
                         pairwise_reg_func=self._seam_progress_func(
                             len(gate_pairs) if gate_pairs is not None else
-                            max(1, len(reg_msims) * 2)
+                            max(1, len(reg_msims) * 2),
+                            inner=seam_func,
                         ),
                         transform_key=mvs_io.METADATA_TRANSFORM_KEY,
                         new_transform_key="registered",
@@ -8427,9 +8454,7 @@ class StitchingPipeline:
                         post_registration_quality_threshold=(
                             self.config.quality_threshold
                         ),
-                        pairwise_reg_func_kwargs=self._pairwise_reg_kwargs(
-                            self.config.registration_upsample_factor
-                        ),
+                        pairwise_reg_func_kwargs=reg_kwargs,
                         groupwise_resolution_kwargs=self._groupwise_kwargs(
                             tiles, index_map, abs_tol_um=abs_tol_um
                         ),
@@ -8462,14 +8487,16 @@ class StitchingPipeline:
                 quality_threshold=self.config.quality_threshold,
                 frame_extent_um=extent_um,
             )
+            self._attach_cell_scores(seams, choices)
             n_rejected = len(sink.get("rejected") or {})
             if n_rejected:
                 self.logger.warning(
                     f"  {n_rejected} seams passed the quality threshold but "
-                    f"proposed a shift the geometry forbids, and were dropped "
-                    f"before the global solve. A confident wrong correlation "
-                    f"peak scores WELL, so lowering the quality threshold makes "
-                    f"this worse, not better — see registration_seams.csv."
+                    f"proposed a shift the geometry forbids, or one where no "
+                    f"candidate lines the cells up, and were dropped before the "
+                    f"global solve. A confident wrong correlation peak scores "
+                    f"WELL, so lowering the quality threshold makes this worse, "
+                    f"not better — see the note on each in registration_seams.csv."
                 )
             coverage = registration_report.mosaic_coverage(len(tiles), seams)
             self.logger.info(f"  Registration coverage: {coverage.describe()}")
@@ -8865,7 +8892,7 @@ class StitchingPipeline:
             f"tile overlap."
         )
 
-    def _seam_progress_func(self, n_pairs: int):
+    def _seam_progress_func(self, n_pairs: int, inner=None):
         """Wrap multiview-stitcher's pairwise registration to report progress.
 
         multiview-stitcher runs 3-D pairwise registrations SERIALLY
@@ -8885,7 +8912,8 @@ class StitchingPipeline:
         import functools
         from multiview_stitcher import registration as _mvs_reg
 
-        inner = _mvs_reg.phase_correlation_registration
+        if inner is None:
+            inner = _mvs_reg.phase_correlation_registration
         total = max(1, int(n_pairs))
         state = {"done": 0}
 
@@ -8904,6 +8932,116 @@ class StitchingPipeline:
                     pass
 
         return _counting
+
+    def _seam_choice_setup(self, voxel_size_um, reg_binning):
+        """``(pairwise function, extra kwargs, choice log)`` for the main pass.
+
+        "cells" swaps multiview-stitcher's SSIM tie-break between the shifts one
+        correlation peak stands for for a band-pass cell correlation
+        (seam_select). The band is fixed in micrometres, so it is converted to
+        voxels of the data registration actually compares -- the processed
+        voxel times the registration binning. When that voxel is too coarse for
+        cells, or the setting is "ssim", the run keeps multiview-stitcher's
+        function and says why.
+        """
+        from flamingo_stitcher import seam_select
+
+        mode = str(getattr(self.config, "registration_seam_choice", "cells") or "ssim").lower()
+        if mode != "cells":
+            self.logger.info(
+                "  Seam choice: multiview-stitcher's (SSIM) — 'ssim' is set in "
+                "Options. SSIM follows smooth brightness, so on punctate samples "
+                "it can pick a sign-flipped or overlap-width-wrapped shift."
+            )
+            return None, None, None
+        b = reg_binning or {}
+        try:
+            reg_vox = {
+                k: float(voxel_size_um[k]) * max(1, int(b.get(k, 1) or 1))
+                for k in ("z", "y", "x")
+            }
+        except (KeyError, TypeError, ValueError):
+            reg_vox = None
+        sig = seam_select.band_sigmas_px(reg_vox) if reg_vox else None
+        if sig is None:
+            vox_txt = (
+                f"{reg_vox['x']:.1f} µm" if reg_vox else "unknown"
+            )
+            self.logger.info(
+                f"  Seam choice: multiview-stitcher's (SSIM). The registration "
+                f"voxel ({vox_txt} XY) is too coarse to resolve cells, which the "
+                f"cell match needs (XY voxel up to "
+                f"{seam_select.BAND_OUTER_UM[2] / seam_select.MIN_OUTER_SIGMA_PX:g} µm)."
+            )
+            return None, None, None
+        inner, outer = sig
+        choices = seam_select.SeamChoiceLog()
+        floor = float(getattr(self.config, "registration_min_cell_r", 0.0) or 0.0)
+        self.logger.info(
+            f"  Seam choice: by cell match — of the shifts each correlation peak "
+            f"stands for (either sign, or one overlap-width over), keep the one "
+            f"whose overlaps correlate best after a band-pass of "
+            f"{seam_select.BAND_INNER_UM[2]:g}-{seam_select.BAND_OUTER_UM[2]:g} µm "
+            f"XY, {seam_select.BAND_INNER_UM[0]:g}-{seam_select.BAND_OUTER_UM[0]:g} µm Z "
+            f"(= {inner[2]:.2f}-{outer[2]:.2f} XY, {inner[0]:.2f}-{outer[0]:.2f} Z "
+            f"registration voxels; band set on Ket_Trial1 seam strips 2026-10-22). "
+            + (
+                f"A seam whose best shift scores cells r below {floor:g} is dropped "
+                f"before the global solve."
+                if floor > 0 else "No minimum cells r (0 in Options)."
+            )
+        )
+        return (
+            seam_select.cell_matched_registration,
+            {"band_sigmas_px": sig, "choice_log": choices},
+            choices,
+        )
+
+    def _cell_match_reject(self, reject, choices):
+        """Wrap the pre-solve reject predicate with the cells-r floor.
+
+        The geometric check runs first: a shift the geometry forbids is reported
+        as that, whatever its cells r.
+        """
+        floor = float(getattr(self.config, "registration_min_cell_r", 0.0) or 0.0)
+        if choices is None or floor <= 0:
+            return reject
+
+        def combined(a, b, data):
+            reason = reject(a, b, data) if reject is not None else None
+            if reason:
+                return reason
+            choice = choices.by_quality(
+                data.get("quality") if hasattr(data, "get") else None
+            )
+            if choice is None or not np.isfinite(choice.cell_r):
+                return None
+            if choice.cell_r < floor:
+                return (
+                    f"no candidate shift lines the cells up: best cells r "
+                    f"{choice.cell_r:.2f} < {floor:g} (of {choice.n_candidates} "
+                    f"candidates); the overlap has no shared detail to measure"
+                )
+            return None
+
+        return combined
+
+    @staticmethod
+    def _attach_cell_scores(seams, choices) -> None:
+        """Copy each seam's cells r from the choice log onto its report row.
+
+        Matched by quality: multiview-stitcher stores the pairwise function's
+        quality on the edge unchanged and keeps nothing else it returned. A
+        quality shared by two seams matches neither, and the cell stays empty.
+        """
+        if choices is None:
+            return
+        for row in seams or []:
+            if row.quality is None:
+                continue
+            choice = choices.by_quality(row.quality)
+            if choice is not None and np.isfinite(choice.cell_r):
+                row.cell_r = float(choice.cell_r)
 
     @staticmethod
     def _pairwise_reg_kwargs(upsample_factor) -> Optional[Dict[str, Any]]:

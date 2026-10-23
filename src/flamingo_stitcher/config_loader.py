@@ -333,6 +333,10 @@ def apply_stitching_yaml_to_config(config_obj: Any) -> None:
         config_obj.registration_z_content_crop = bool(reg["z_content_crop"])
     if reg.get("upsample_factor") is not None:
         config_obj.registration_upsample_factor = int(reg["upsample_factor"])
+    if reg.get("seam_choice") is not None:
+        config_obj.registration_seam_choice = str(reg["seam_choice"])
+    if reg.get("min_cell_r") is not None:
+        config_obj.registration_min_cell_r = float(reg["min_cell_r"])
     if reg.get("report") is not None:
         config_obj.registration_report_enabled = bool(reg["report"])
     if reg.get("report_json") is not None:

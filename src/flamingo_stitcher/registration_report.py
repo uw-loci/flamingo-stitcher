@@ -144,6 +144,7 @@ SEAM_CSV_HEADER: Tuple[str, ...] = (
     "dx_px",
     "residual_px",
     "overlap_frac",
+    "cell_r",
     "note",
 )
 
@@ -204,6 +205,9 @@ class SeamResult:
     dx_px: Optional[float] = None
     residual_px: Optional[float] = None
     overlap_frac: Optional[float] = None
+    # Band-pass ("cells") correlation at the chosen shift, when the seam was
+    # chosen by seam_select. Unlike ``quality`` it is ~0 for a wrong shift.
+    cell_r: Optional[float] = None
     note: str = ""
 
 
@@ -1057,6 +1061,7 @@ def seam_rows_csv(report: RegistrationReport) -> str:
                 _cell(s.dx_px, 2),
                 _cell(s.residual_px, 2),
                 _cell(s.overlap_frac, 4),
+                _cell(s.cell_r, 3),
                 s.note,
             ]
         )
@@ -1315,6 +1320,7 @@ def report_to_json(
             "dx_um": s.dx_um,
             "residual_px": s.residual_px,
             "overlap_frac": s.overlap_frac,
+            "cell_r": s.cell_r,
             "note": s.note,
         }
 
@@ -1455,11 +1461,16 @@ def format_verbose_alignment(
 
     lines.append("")
     lines.append(f" SEAM MEASUREMENTS ({len(report.seams)} adjacent pairs)")
+    # Only when seams were chosen by cell match, so older runs' tables (and
+    # anything parsing them) are unchanged. Placed after the other numbers:
+    # tools/estimate_stage_tilt.py reads qual, dz, dy, dx, resid in order.
+    show_cells = any(s.cell_r is not None for s in report.seams)
     header = (
         f"  {'tile A':<14} {'tile B':<14} {'axis':<6} {'status':<18} "
         f"{'qual':>6} {'dz µm':>8} {'dy µm':>8} {'dx µm':>8} "
         f"{'resid µm':>9} {'ovl':>5}  "
         + (f"{'shared pl':>9}  " if shared_z is not None else "")
+        + (f"{'cells r':>7}  " if show_cells else "")
         + "note"
     )
     lines.append(header)
@@ -1478,6 +1489,7 @@ def format_verbose_alignment(
                 f"{str(shared_z.get((seam.index_a, seam.index_b), '-')):>9}  "
                 if shared_z is not None else ""
             )
+            + (f"{_num(seam.cell_r, '7.2f')}  " if show_cells else "")
             + (seam.note or "")
         )
     if tissue_z is not None or shared_z is not None:
@@ -1487,6 +1499,13 @@ def format_verbose_alignment(
             "more than ~80% of the planes, or in none). shared pl: planes the "
             "two registered stacks have in common at stage Z -- what the seam "
             "was measured over."
+        )
+    if show_cells:
+        lines.append(
+            "  cells r: correlation of the two overlaps after removing the smooth "
+            "brightness, at the chosen shift. A wrong shift scores ~0 even when "
+            "qual is high; each seam's shift was chosen as the candidate with "
+            "the highest cells r."
         )
     lines.append("=" * 71)
     return lines

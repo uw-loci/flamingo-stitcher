@@ -89,6 +89,11 @@ class StitchingWorker(QThread):
             f"approach {getattr(c, 'stitching_approach', 'default')}",
             f"Refine Z {'on' if getattr(c, 'registration_z_refine', False) else 'off'}",
             f"peak refinement 1/{int(getattr(c, 'registration_upsample_factor', 0) or 0) or 2}",
+            f"seam choice {getattr(c, 'registration_seam_choice', 'ssim')}"
+            + (
+                f" (min cells r {float(getattr(c, 'registration_min_cell_r', 0) or 0):g})"
+                if getattr(c, "registration_seam_choice", "ssim") == "cells" else ""
+            ),
             f"solve tolerance {getattr(c, 'global_opt_abs_tol', 3.5):g} px",
             f"solve model {getattr(c, 'registration_solve_transform', 'translation')}",
         ]

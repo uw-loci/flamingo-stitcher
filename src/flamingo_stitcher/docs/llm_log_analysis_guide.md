@@ -399,6 +399,18 @@ How to read them:
   only shallow compares few planes, and a decent `qual` on few planes can
   still be a wrong shift. The count is before the measured dz, and the
   structure is judged over the whole tile, not only the shared strip.
+- **`cells r`** (from 0.13.15, when the `Seam choice: by cell match` line is
+  in the log) is the correlation of the two overlaps after a band-pass that
+  removes smooth brightness, at the chosen shift. Each phase-correlation peak
+  stands for several shifts (either sign per axis, or one overlap-width over);
+  the run keeps the candidate with the highest `cells r`. A wrong shift scores
+  ~0 even at high `qual` (Ket_Trial1, 2026-10-22: right 0.32-0.68, wrong
+  0.00-0.23). Seams below `min_cell_r` (default 0.1) show as
+  `implausible_shift` with a note naming their `cells r`. Before 0.13.15 the
+  choice was multiview-stitcher's SSIM, which picked a sign-flipped or
+  overlap-width-wrapped shift on 3 of 4 checked Ket_Trial1 seams: a seam `dy`
+  or `dx` close to the overlap width, or a sign opposite to its neighbours, in
+  an older log is that failure.
 - A whole column of `no_content` down one edge of the grid is an empty rim, not
   a registration problem. That is what `center_xy` exists for.
 
