@@ -41,6 +41,33 @@ def _describe(ch_id: int) -> str:
 
 
 
+def _worker_failure_message(task, returncode, stdout, stderr) -> str:
+    """Why the worker failed, from wherever it said so.
+
+    A task that raises is caught by the worker, which reports
+    ``{"status": "error", "message", "type"}`` as JSON on STDOUT and exits 1
+    (isolated_worker.py); stderr is then empty. Reading stderr alone turned
+    every such failure into "Isolated worker failed (exit 1):" and nothing
+    else -- the flat-field failure on a one-tile acquisition, 2026-10-22.
+    A crash before the handler runs (import error, segfault) leaves no JSON,
+    so stderr and any stray stdout are kept too.
+    """
+    parts = []
+    try:
+        report = json.loads(stdout) if stdout and stdout.strip() else None
+    except (TypeError, ValueError):
+        report = None
+    if isinstance(report, dict) and report.get("message"):
+        kind = report.get("type")
+        parts.append(f"{kind}: {report['message']}" if kind else str(report["message"]))
+    elif stdout and stdout.strip():
+        parts.append(f"stdout: {stdout.strip()[-2000:]}")
+    if stderr and stderr.strip():
+        parts.append(f"stderr: {stderr.strip()[-2000:]}")
+    detail = "\n".join(parts) if parts else "the worker gave no reason (no output at all)"
+    return f"Isolated worker failed (exit {returncode}) on task '{task}': {detail}"
+
+
 def _no_window_kwargs() -> dict:
     """subprocess kwargs that prevent a console window flashing on Windows.
 
@@ -296,7 +323,7 @@ class IsolatedPreprocessingService:
 
         if proc.returncode != 0:
             raise RuntimeError(
-                f"Isolated worker failed (exit {proc.returncode}):\n{stderr}"
+                _worker_failure_message(task, proc.returncode, stdout, stderr)
             )
 
         try:
