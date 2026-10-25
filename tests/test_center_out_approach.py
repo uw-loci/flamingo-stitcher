@@ -170,6 +170,88 @@ class TestCarryingTheRim:
         assert out.carried == [] and out.rounds == 0
 
 
+class TestRotationAwareCarry:
+    """Under a rigid solve, carried tiles follow their neighbours' rotation.
+
+    Ket_Trial1 run 29 (2026-10-23): rows turned up to ~1° between each other,
+    so the correction changes steadily across the grid and a mean of the
+    neighbours' shifts lands an edge tile 20-40 µm from where the sample put
+    it. Here the whole sample turns 1° about Z: every core tile is solved
+    exactly, and a carried tile must come out where that motion puts it.
+    """
+
+    ANGLE = 1.0
+    PIVOT = np.array([15000.0, 20000.0, 7000.0])  # (z, y, x) µm
+    SHIFT = np.array([4.0, -30.0, 55.0])
+
+    def _R(self):
+        a = np.radians(self.ANGLE)
+        R = np.eye(3)  # (z, y, x) order: rotation in the YX plane
+        R[1, 1], R[1, 2] = np.cos(a), -np.sin(a)
+        R[2, 1], R[2, 2] = np.sin(a), np.cos(a)
+        return R
+
+    def _truth(self, c):
+        """Centre shift of a tile centred at c under the whole-sample motion."""
+        return (self._R() - np.eye(3)) @ (c - self.PIVOT) + self.SHIFT
+
+    def _setup(self, cols=7, rows=7, core=None):
+        tiles = _grid(cols, rows)
+        centres = [np.array([15130.0, t.y_mm * 1000.0, t.x_mm * 1000.0]) for t in tiles]
+        core = core if core is not None else _core_indices(cols, rows)
+        params = [_param((0.0, 0.0, 0.0)) for _ in tiles]
+        for i in core:
+            params[i] = _param(self._truth(centres[i]))
+        rotations = {i: self._R() for i in core}
+        return tiles, centres, core, params, rotations
+
+    def test_a_carried_tile_lands_where_the_rotation_puts_it(self):
+        tiles, centres, core, params, rotations = self._setup()
+        out = center_out.carry_deferred_tiles(
+            params, 49, core, _neighbours(), rotations=rotations, centres=centres
+        )
+        edge = 3 * 7 + 0  # col 0, row 3: one core neighbour
+        np.testing.assert_allclose(_t(out.params[edge]), self._truth(centres[edge]), atol=1e-6)
+        np.testing.assert_allclose(out.rotations[edge], self._R(), atol=1e-12)
+        # The old mean-of-shifts is one tile-step of rotation out (~32 µm).
+        old = center_out.carry_deferred_tiles(params, 49, core, _neighbours())
+        err = np.abs(_t(old.params[edge]) - self._truth(centres[edge])).max()
+        assert err > 25.0
+
+    def test_two_rings_out_is_still_exact(self):
+        tiles, centres, core, params, rotations = self._setup(
+            9, 9, core=[r * 9 + c for r in range(3, 6) for c in range(3, 6)]
+        )
+        out = center_out.carry_deferred_tiles(
+            params, 81, core, _neighbours(9, 9), rotations=rotations, centres=centres
+        )
+        assert out.rounds >= 3 and not out.orphans
+        for i in (0, 8, 72, 80, 4, 36):  # corners and edge midpoints, rings 2-3
+            np.testing.assert_allclose(_t(out.params[i]), self._truth(centres[i]), atol=1e-6)
+        assert out.max_rotation_deg() == pytest.approx(self.ANGLE)
+        assert "following their neighbours' rotation" in out.describe(81)
+
+    def test_without_rotations_nothing_changes(self):
+        tiles, centres, core, params, _ = self._setup()
+        a = center_out.carry_deferred_tiles(params, 49, core, _neighbours())
+        b = center_out.carry_deferred_tiles(
+            params, 49, core, _neighbours(), rotations=None, centres=centres
+        )
+        for x, y in zip(a.params, b.params):
+            np.testing.assert_array_equal(x, y)
+        assert b.rotations == {}
+
+    def test_identity_rotations_reduce_to_the_mean_of_shifts(self):
+        tiles, centres, core, params, _ = self._setup()
+        ident = {i: np.eye(3) for i in core}
+        a = center_out.carry_deferred_tiles(params, 49, core, _neighbours())
+        b = center_out.carry_deferred_tiles(
+            params, 49, core, _neighbours(), rotations=ident, centres=centres
+        )
+        for x, y in zip(a.params, b.params):
+            np.testing.assert_allclose(x, y, atol=1e-12)
+
+
 class TestTensionAlerts:
     """The L-shape: a tile whose overlaps cannot all be honoured."""
 

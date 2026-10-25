@@ -34,6 +34,17 @@ stage gave it with those neighbours, so no black gap opens between it and the
 mosaic, and no tile is left behind at a raw stage position while its neighbours
 have moved.
 
+Under a rigid solve a neighbour's correction is a rotation as well as a shift,
+and the mean of the neighbours' shifts is then the wrong answer: on a sample
+that rotated between rows, the shift changes steadily across the grid, and the
+mean of the tile to the right and the tile below is the value at the diagonal
+between them, not at the tile (20-40 µm out on Ket_Trial1, 2026-10-23, where
+rows turned up to ~1°). So with rotations given, each placed neighbour predicts
+where the tile goes by applying its WHOLE transform to the tile's stage
+position, as if the tile were rigidly attached to it, and the carried tile takes
+the neighbours' rotation too. With pure shifts the prediction is the
+neighbour's shift, i.e. exactly the mean-of-shifts above.
+
 Tiles are carried individually rather than as solved components. A component
 that registered internally but not to the core is, on this data, a pair of rim
 tiles that correlated on noise; trusting its internal solve is how a block
@@ -128,6 +139,15 @@ class CarryResult:
     # how far from registered ground a tile sits, which is the honest measure of
     # how much its placement is worth.
     provenance: Dict[int, Tuple[int, List[int]]] = field(default_factory=dict)
+    # Carried tiles that took their neighbours' rotation (rigid solve only).
+    rotations: Dict[int, np.ndarray] = field(default_factory=dict)
+
+    def max_rotation_deg(self) -> float:
+        angles = [
+            float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+            for R in self.rotations.values()
+        ]
+        return max(angles) if angles else 0.0
 
     def describe(self, n_tiles: int) -> str:
         parts = [
@@ -135,6 +155,11 @@ class CarryResult:
             f"{len(self.carried)} carried by their neighbours "
             f"({self.rounds} pass(es), largest move {self.max_step_um:.1f} µm)",
         ]
+        if self.rotations:
+            parts.append(
+                f"{len(self.rotations)} of those following their neighbours' "
+                f"rotation (largest {self.max_rotation_deg():.2f}°)"
+            )
         if self.orphans:
             parts.append(
                 f"{len(self.orphans)} with no placed neighbour at all, moved "
@@ -143,13 +168,34 @@ class CarryResult:
         return "; ".join(parts)
 
 
+def _nearest_rotation(m: np.ndarray) -> np.ndarray:
+    """The rotation closest to `m` (polar decomposition), for averaging."""
+    u, _s, vt = np.linalg.svd(m)
+    r = u @ vt
+    if np.linalg.det(r) < 0:
+        u[:, -1] *= -1
+        r = u @ vt
+    return r
+
+
 def carry_deferred_tiles(
     params: Sequence,
     n_tiles: int,
     core: Sequence[int],
     neighbour_pairs: Sequence[Tuple[int, int]],
+    rotations: Optional[Dict[int, np.ndarray]] = None,
+    centres: Optional[Sequence[Optional[np.ndarray]]] = None,
 ) -> CarryResult:
     """Place every tile outside `core` at its placed neighbours' mean correction.
+
+    ``params`` hold CENTRE shifts (translation-only). ``rotations`` (3x3 per
+    core tile, from a rigid solve) and ``centres`` (each tile's centre in world
+    µm at its stage position) switch on rotation-aware carrying: neighbour j's
+    full transform is x -> R_j (x - c_j) + c_j + d_j, so it predicts tile i's
+    centre shift as d_j + (R_j - I)(c_i - c_j), and the carried tile takes the
+    neighbours' mean rotation (projected back onto a rotation). Without them,
+    or for a neighbour lacking either, the prediction is d_j: the mean of the
+    neighbours' shifts, as before.
 
     Spreads outward one ring per pass, so a tile two rings out is carried by
     tiles that were themselves carried — which is what keeps a wide empty rim
@@ -186,6 +232,20 @@ def carry_deferred_tiles(
 
     placed = set(translations)
     pending = [i for i in range(n_tiles) if i not in placed]
+    rot: Dict[int, np.ndarray] = {}
+    if rotations is not None and centres is not None:
+        rot = {
+            int(i): np.asarray(R, dtype=float)
+            for i, R in rotations.items()
+            if int(i) in translations and R is not None
+        }
+
+    def _centre(i):
+        try:
+            c = centres[i] if centres is not None else None
+        except IndexError:
+            return None
+        return None if c is None else np.asarray(c, dtype=float)
 
     while pending:
         # Snapshot the frontier so the result does not depend on visit order:
@@ -197,10 +257,22 @@ def carry_deferred_tiles(
             break
         result.rounds += 1
         updates: Dict[int, np.ndarray] = {}
+        new_rot: Dict[int, np.ndarray] = {}
         for index in ring:
             from_indices = sorted(adjacency[index] & placed)
-            sources = [translations[j] for j in from_indices]
+            ci = _centre(index)
+            sources = []
+            rots = []
+            for j in from_indices:
+                cj = _centre(j)
+                if j in rot and ci is not None and cj is not None:
+                    sources.append(translations[j] + (rot[j] - np.eye(3)) @ (ci - cj))
+                    rots.append(rot[j])
+                else:
+                    sources.append(translations[j])
             updates[index] = np.mean(np.stack(sources, axis=0), axis=0)
+            if rots:
+                new_rot[index] = _nearest_rotation(np.mean(np.stack(rots), axis=0))
             result.provenance[index] = (result.rounds, from_indices)
         for index, value in updates.items():
             if index < len(result.params):
@@ -215,6 +287,11 @@ def carry_deferred_tiles(
             translations[index] = value
             placed.add(index)
             result.carried.append(index)
+        # After the ring, so every tile in it is predicted from the previous
+        # ring only (visit-order independence, as above).
+        for index, R in new_rot.items():
+            rot[index] = R
+            result.rotations[index] = R
         pending = [i for i in pending if i not in placed]
 
     # Anything still unplaced touches nothing that registered. Move it with the

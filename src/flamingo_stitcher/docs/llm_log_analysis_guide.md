@@ -320,6 +320,14 @@ tiles can never register:
        Centre-out: 9 of 25 tiles placed by registration; 16 carried by their
        neighbours (2 pass(es), largest move 10.0 um)
 
+   With Solve model = rigid (from 0.13.16) each neighbour predicts the carried
+   tile's place by applying its whole transform, rotation included, and the
+   carried tile takes the neighbours' rotation; the line then ends "N of those
+   following their neighbours' rotation (largest X°)". Before 0.13.16 carried
+   tiles were shift-only at the neighbours' mean shift, which on a sample that
+   turned between rows (Ket_Trial1, up to ~1°) put edge tiles 20-40 um out:
+   a doubled or stepped tissue edge at a carried tile is that.
+
 3. The seam-fraction guard is REPLACED, not dropped. An unregisterable rim is
    the expected shape of this data, and the tearing that guard prevents is what
    carrying removes. Carried and orphan counts are logged either way.

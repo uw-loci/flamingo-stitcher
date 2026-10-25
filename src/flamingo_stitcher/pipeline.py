@@ -8519,9 +8519,13 @@ class StitchingPipeline:
                 # prevent is precisely what carrying removes. Replaced, not
                 # dropped: every carried tile is counted in the log and report.
                 reason = None
-                params, carry = self._carry_deferred_tiles(params, tiles, coverage)
+                params, carry = self._carry_deferred_tiles(
+                    params, tiles, coverage, rigid_full, rigid_centres
+                )
                 if carry is not None:
                     coverage.bound_tiles = list(carry.carried) + list(carry.orphans)
+                    if rigid_full is not None and carry.rotations:
+                        rigid_full = self._with_rotations(rigid_full, carry.rotations)
             else:
                 reason = self._untrustworthy_registration_reason(coverage)
                 if reason is None and not coverage.is_safe_to_apply:
@@ -8562,12 +8566,9 @@ class StitchingPipeline:
                 """What fusion uses: rotations back on, for a rigid solve."""
                 if rigid_full is None:
                     return shift_params
-                drop = set(getattr(coverage, "bound_tiles", None) or [])
-                drop |= {
-                    int(r.index) for r in (clamp.records or [])
-                    if getattr(r, "clamped_xy", False) or getattr(r, "clamped_z", False)
-                    or getattr(r, "whole_matrix", False)
-                }
+                drop = self._rotation_drop_set(
+                    coverage, clamp, getattr(self, "_alignment_carry", None)
+                )
                 return self._recombine_rotation(
                     rigid_full, shift_params, rigid_centres, drop
                 )
@@ -9906,11 +9907,44 @@ class StitchingPipeline:
             out.append(view)
         return out
 
+    @staticmethod
+    def _rotation_drop_set(coverage, clamp, carry=None) -> set:
+        """Tiles that stay translations under a rigid solve.
+
+        Clamped tiles (an axis kept its stage position, so a measured rotation
+        would sit on an unmeasured shift) and tiles bound to the mosaic with no
+        rotation to follow: orphans, and anything the `default` approach bound.
+        Carried tiles that took their neighbours' rotation keep it -- without
+        it, an edge tile on a sample that rotated between rows lands 20-40 µm
+        out (Ket_Trial1 run 29)."""
+        drop = set(getattr(coverage, "bound_tiles", None) or [])
+        if carry is not None:
+            drop -= set(getattr(carry, "rotations", {}) or {})
+        drop |= {
+            int(r.index) for r in (getattr(clamp, "records", None) or [])
+            if getattr(r, "clamped_xy", False) or getattr(r, "clamped_z", False)
+            or getattr(r, "whole_matrix", False)
+        }
+        return drop
+
+    def _with_rotations(self, full_params, rotations):
+        """Copies of `full_params` with the rotation block of the given tiles
+        replaced; the translation is recomputed later by _recombine_rotation."""
+        out = list(full_params)
+        for i, R in (rotations or {}).items():
+            if not 0 <= i < len(out):
+                continue
+            p = out[i].copy()
+            buf = p.values if hasattr(p, "values") else p
+            mat = buf[0] if buf.ndim == 3 else buf
+            mat[:3, :3] = np.asarray(R, dtype=float)
+            out[i] = p
+        return out
+
     def _recombine_rotation(self, full_params, shift_params, centres, drop):
         """Put each tile's rotation back around its final centre shift.
 
-        ``drop``: tiles that were clamped or carried. Their placement was not
-        measured, so neither is their rotation, and they stay translations."""
+        ``drop``: tiles that stay translations (see _rotation_drop_set)."""
         out = []
         for i, (full, shifted, c) in enumerate(zip(full_params, shift_params, centres)):
             if c is None or i in drop:
@@ -10029,7 +10063,9 @@ class StitchingPipeline:
         )
         return kwargs
 
-    def _carry_deferred_tiles(self, params, tiles, coverage):
+    def _carry_deferred_tiles(
+        self, params, tiles, coverage, rigid_full=None, rigid_centres=None
+    ):
         """Place every tile outside the registered core at its neighbours' mean.
 
         The `default` approach hands each stranded component the mosaic's
@@ -10053,8 +10089,18 @@ class StitchingPipeline:
             pairs = find_neighbor_pairs(tiles, include_z=False)
         except Exception:
             pairs = []
+        rotations = None
+        if rigid_full is not None and rigid_centres is not None:
+            rotations = {}
+            for i in core:
+                if 0 <= i < len(rigid_full):
+                    try:
+                        rotations[i] = self._param_matrix(rigid_full[i])[:3, :3].copy()
+                    except Exception:
+                        pass
         carry = center_out.carry_deferred_tiles(
-            params, len(tiles), core, pairs
+            params, len(tiles), core, pairs,
+            rotations=rotations, centres=rigid_centres,
         )
         self._alignment_carry = carry
         self.logger.info(f"  Centre-out: {carry.describe(len(tiles))}")

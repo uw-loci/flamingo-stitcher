@@ -71,12 +71,37 @@ class TestCentreShift:
         np.testing.assert_allclose(out[:3, :3], R[:3, :3])
         np.testing.assert_allclose(out[:3, :3] @ c + out[:3, 3] - c, moved[:3, 3])
 
-    def test_clamped_or_carried_tiles_stay_shift_only(self):
+    def test_dropped_tiles_stay_shift_only(self):
         c = np.array([0.0, 5000.0, 5000.0])
         full = _rot_zyx(0.5)
         view = self.pipe._centre_shift_view([full], [c])[0]
         out = self.pipe._recombine_rotation([full], [view], [c], drop={0})[0]
         np.testing.assert_allclose(out[:3, :3], np.eye(3))
+
+    def test_clamped_and_orphan_tiles_drop_rotation_carried_tiles_keep_it(self):
+        """Carried tiles that followed their neighbours' rotation keep it
+        (without it an edge tile lands 20-40 µm out on a sample that turned
+        between rows, Ket_Trial1 run 29); orphans and clamped tiles do not."""
+        from types import SimpleNamespace as NS
+
+        coverage = NS(bound_tiles=[3, 5, 7])          # 3, 5 carried; 7 orphan
+        carry = NS(rotations={3: np.eye(3), 5: np.eye(3)})
+        clamp = NS(records=[NS(index=2, clamped_xy=True, clamped_z=False, whole_matrix=False)])
+        assert StitchingPipeline._rotation_drop_set(coverage, clamp, carry) == {2, 7}
+        # The `default` approach binds with no carry: everything bound drops.
+        assert StitchingPipeline._rotation_drop_set(coverage, clamp, None) == {2, 3, 5, 7}
+
+    def test_carried_rotation_is_written_into_the_full_params(self):
+        c = np.array([0.0, 5000.0, 5000.0])
+        full = [np.eye(4), np.eye(4)]
+        R = _rot_zyx(0.7)[:3, :3]
+        out = self.pipe._with_rotations(full, {1: R})
+        np.testing.assert_allclose(out[1][:3, :3], R)
+        np.testing.assert_allclose(full[1], np.eye(4))  # input untouched
+        view = self.pipe._centre_shift_view([out[1]], [c])[0]
+        view[:3, 3] = [1.0, 2.0, 3.0]
+        back = self.pipe._recombine_rotation([out[1]], [view], [c], drop=set())[0]
+        np.testing.assert_allclose(back[:3, :3] @ c + back[:3, 3] - c, [1.0, 2.0, 3.0])
 
 
 # --------------------------------------------------------------------------
