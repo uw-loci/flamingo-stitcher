@@ -93,3 +93,32 @@ def test_smoothing_damps_a_phase_boundary_step(tmp_path):
     # EMA: the second reading moved toward the new value but not all the way.
     live_new = 400.0 * (1 - 0.55) / 0.55
     assert live_new < second < first
+
+
+def test_each_phase_start_logs_its_prediction_and_the_end_checks_it(tmp_path, caplog):
+    """The live ETA was never logged, so its accuracy could not be checked.
+
+    2026-10-27: only the opening prior reached the log. Each phase start now
+    logs the predicted total, and the end of the run compares every one of
+    them with what the run actually took.
+    """
+    import logging
+
+    est = _make(tmp_path, prior=1000.0)
+    caplog.set_level(logging.INFO, logger="flamingo_stitcher.multi_phase_estimator")
+    _at(est, 300.0, 0.5)  # on pace for 600 s
+    est.start_phase("fuse")
+    assert any("at the start of fuse" in r.message for r in caplog.records)
+    labels = [label for label, _ in est._predictions]
+    assert labels == ["start", "fuse"]
+    assert est._predictions[1][1] < est._predictions[0][1]
+
+    line = est.format_prediction_check(600.0)
+    assert "start 16:40 (actual/predicted 0.60)" in line
+    assert "fuse" in line
+
+
+def test_a_phase_started_too_early_to_extrapolate_is_not_logged(tmp_path):
+    est = _make(tmp_path, prior=1000.0)
+    est.start_phase("discover")  # elapsed ~0
+    assert [label for label, _ in est._predictions] == ["start"]

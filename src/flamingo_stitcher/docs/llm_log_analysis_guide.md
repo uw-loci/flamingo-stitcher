@@ -484,6 +484,16 @@ at the end; the ETA cache key gains `|rz=<µm>` for any spacing other than
 (`Stitching ETA phase shares (...)`), so a registration-heavy run does not
 send the estimate running away mid-phase.
 
+**Checking the ETA (from 2026-10-27).** `Stitching ETA: cold start, rough prior
+~Ns` or `seeded from cache (total ~Ns)` is the opening estimate.
+`Stitching ETA at the start of <phase>: ... (total ~H:MM:SS, done ~HH:MM)` is
+the live estimate the user saw as each phase began, and the last ETA line,
+`Stitching ETA check: actual total ...; predicted at start ... (actual/predicted
+r), preprocess ...`, compares every one of them with what the run took. A
+ratio far from 1 at `start` with a cold prior means the rough model is off
+for that configuration. A cache seed is only as good as the earlier run it
+came from.
+
 ## 7i. The registration map
 
 Every run writes `<name>_registration_map.png` beside `registration_report.txt`

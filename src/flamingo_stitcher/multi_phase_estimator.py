@@ -35,7 +35,7 @@ from __future__ import annotations
 import logging
 import time
 from datetime import datetime, timedelta
-from typing import Dict, Optional
+from typing import Dict, List, Optional, Tuple
 
 from flamingo_stitcher.timing_cache import (
     PHASE_ORDER,
@@ -86,6 +86,10 @@ class MultiPhaseEstimator:
         self._current_phase: Optional[str] = None
         self._current_phase_start: Optional[float] = None
         self._phase_durations: Dict[str, float] = {}
+        # (label, predicted total s) at the run start and at each phase start,
+        # compared with the actual total in finalize() so every log says how
+        # good the ETA the user watched really was.
+        self._predictions: List[Tuple[str, float]] = []
 
         # Live global progress fraction (0..1), fed by the pipeline's monotone
         # percent. Kept monotone non-decreasing so a writer that reports its own
@@ -100,6 +104,8 @@ class MultiPhaseEstimator:
         # Cold-start prior: prefer the measured mean for this config; else the
         # caller's rough model. Used until live progress can carry the estimate.
         self._prior_total_s = self._cached_total_s or prior_total_s
+        if self._prior_total_s:
+            self._predictions.append(("start", float(self._prior_total_s)))
         if self._cached_total_s:
             logger.info(
                 f"Stitching ETA: seeded from cache (total ~{self._cached_total_s:.0f}s)"
@@ -128,6 +134,21 @@ class MultiPhaseEstimator:
         self.start()
         self._current_phase = phase
         self._current_phase_start = time.monotonic()
+        self._log_prediction(phase)
+
+    def _log_prediction(self, phase: str) -> None:
+        """Log the live ETA as a phase begins and keep it for the end check."""
+        elapsed = self.elapsed_seconds()
+        remaining = self.remaining_seconds()
+        if elapsed is None or remaining is None or elapsed < _MIN_ELAPSED_S:
+            return
+        total = elapsed + remaining
+        self._predictions.append((phase, total))
+        logger.info(
+            f"Stitching ETA at the start of {phase}: {_format_duration(elapsed)} "
+            f"elapsed, ~{_format_duration(remaining)} remaining "
+            f"(total ~{_format_duration(total)}, done ~{self.format_eta()})"
+        )
 
     def end_phase(self, phase: str) -> None:
         """End the named phase. No-op if it isn't the current phase."""
@@ -161,6 +182,23 @@ class MultiPhaseEstimator:
         logger.info(
             f"Stitching ETA: recorded run "
             f"(total={elapsed:.0f}s, phases={self._phase_durations})"
+        )
+        check = self.format_prediction_check(elapsed)
+        if check:
+            logger.info(check)
+
+    def format_prediction_check(self, actual_s: float) -> str:
+        """One line: each logged prediction of the total against the actual."""
+        if not self._predictions or actual_s <= 0:
+            return ""
+        parts = ", ".join(
+            f"{label} {_format_duration(pred)} (actual/predicted {actual_s / pred:.2f})"
+            for label, pred in self._predictions
+            if pred > 0
+        )
+        return (
+            f"Stitching ETA check: actual total {_format_duration(actual_s)}; "
+            f"predicted at {parts}"
         )
 
     # ------------------------------------------------------------------

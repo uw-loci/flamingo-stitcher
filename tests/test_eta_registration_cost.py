@@ -45,6 +45,9 @@ def _config(**kw):
     cfg.downsample_xy = cfg.downsample_z = 1
     cfg.flat_field_correction = True
     cfg.output_format = "imaris"
+    # Every run these tests were fitted to chose seams by SSIM; cell match
+    # (v0.13.15, the default since) is priced by its own factor.
+    cfg.registration_seam_choice = "ssim"
     for k, v in kw.items():
         setattr(cfg, k, v)
     return cfg
@@ -125,18 +128,29 @@ def test_binning_harder_makes_the_estimate_smaller():
 
 
 def test_registration_dominates_the_prior_for_a_large_mosaic():
-    """It was 71.8% of the measured run and ~1.4% of the old prediction."""
-    tiles, cfg = _grid(), _config()
+    """It was 71.8% of the measured run and ~1.4% of the old prediction.
+
+    Uses the 09-18 run's own geometry (Z step and registration binning), so
+    the share is judged against the run it was measured on.
+    """
+    tiles, ds_xy, ds_z, _reg = RUN_0918
+    cfg = _cfg(ds_xy, ds_z)
     share = _rough_register_seconds(tiles, cfg) / rough_run_seconds(tiles, cfg)
     assert 0.5 < share < 0.95
 
 
-def test_skipping_registration_returns_the_old_estimate_exactly():
-    """A skip-registration run must be unchanged by this, byte for byte."""
+def test_skipping_registration_leaves_only_load_and_fuse():
+    """Without registration the prior is the load and fuse terms alone.
+
+    The 2026-09-18 run spent 33697 - 24187 = 9510 s outside registration. The
+    first prior gave 5237 s for that part (0.55x); after the 2026-10-27
+    recalibration (load 260 MB/s, fuse 0.325 s per output unit) it gives 12346
+    s (1.30x).
+    """
     tiles = _grid()
     assert _rough_register_seconds(tiles, _config(skip_registration=True)) == 0.0
     assert rough_run_seconds(tiles, _config(skip_registration=True)) == pytest.approx(
-        5237.0, abs=1.0
+        12346.0, abs=1.0
     )
 
 
@@ -313,3 +327,46 @@ def test_the_whole_run_prior_is_now_within_a_factor_of_two():
         assert 0.5 < prior / total < 2.0, (
             f"XY={ds_xy}: prior {prior:.0f}s against {total}s measured"
         )
+
+
+# --------------------------------------------------------------------------
+# Recalibration against the n7 rig logs, 2026-10-27
+# --------------------------------------------------------------------------
+
+
+def test_destripe_is_priced_per_light_path_plane():
+    """Run 25 (10-21) destriped 84 stacks of 2999 planes at ~440 s each.
+
+    Before, the prior had no destripe term and that run took 2.3x its estimate.
+    """
+    from flamingo_stitcher.pipeline import rough_phase_seconds
+
+    tiles = _grid(6, 7, pitch=1.931, planes=2999)
+    off = rough_phase_seconds(tiles, _config(downsample_xy=2))
+    on = rough_phase_seconds(tiles, _config(downsample_xy=2, destripe=True))
+    extra = on["preprocess"] - off["preprocess"]
+    assert extra == pytest.approx(84 * 440, rel=0.1)
+
+
+def test_cell_match_seam_choice_registers_about_six_times_faster():
+    tiles = _grid(6, 7, pitch=1.931, planes=2999)
+    for t in tiles:
+        t.z_step_mm = 0.0025
+    cells = _rough_register_seconds(
+        tiles, _config(downsample_xy=2, registration_seam_choice="cells")
+    )
+    ssim = _rough_register_seconds(tiles, _config(downsample_xy=2))
+    assert cells / ssim == pytest.approx(0.16)
+
+
+def test_ket_trial1_fuse_and_load_match_the_rig():
+    """Runs 29/30: preprocess 8060/8152 s, fuse + write 14742/15142 s (Apply)."""
+    from flamingo_stitcher.pipeline import rough_phase_seconds
+
+    tiles = _grid(6, 7, pitch=1.931, planes=2999)
+    p = rough_phase_seconds(
+        tiles,
+        _config(downsample_xy=2, output_format="ome-tiff", intensity_adjustment="apply"),
+    )
+    assert p["preprocess"] == pytest.approx(8100, rel=0.05)
+    assert p["fuse"] == pytest.approx(14900, rel=0.05)

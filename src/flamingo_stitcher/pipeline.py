@@ -615,9 +615,32 @@ except Exception:
 #                          registration), on top of the volume term.
 #   _ROUGH_S_PER_OUT_UNIT: fuse + write, per OUTPUT voxel-unit (tile × plane ×
 #                          channel after XY/Z downsampling).
-_ROUGH_LOAD_MBPS = 200.0
+#
+# Recalibrated 2026-10-27 against the n7 rig logs 10-14 to 10-26 (Ket_Trial1,
+# 42 tiles x 2999 planes x 2 sides at 2048x2048, plus three small tests). The
+# start-of-run estimate had run 1.4-2.5x short: load was 30% slow, destripe
+# was not modelled at all, and fuse + write was 6x fast.
+#   * load: 8060 / 8080 / 7993 / 8152 s for 1968 GB without destripe = 259-264
+#     MB/s (four runs, 10-18 to 10-26).
+#   * destripe (native resolution): 84 "Destripe complete" lines on 10-21, one
+#     per light path per tile, 414-482 s for 2999 planes of 2048x2048 = 0.147
+#     s per plane = 0.035 s per megapixel-plane (24 threads). Load + this term
+#     reproduces the three small tests' preprocess (205 / 767 / 3356 s
+#     predicted vs 199 / 753 / 3377 measured).
+#   * fuse + write, per output unit at XY 2x, OME-TIFF: 0.354 s with intensity
+#     Measure (10-21), 0.46 / 0.468 / 0.481 / 0.455 with Apply (10-18 to
+#     10-26). Measure includes the fit (~900 s of 31490 units = 0.029), so off
+#     is ~0.325; Apply adds the per-tile a*v+b on top. The small tests (Apply)
+#     ran 0.18-0.28 per unit, so this over-estimates small mosaics by up to
+#     ~1.7x on that phase; the whole-brain runs are what the prior is for.
+#   * "separate" illumination keeps both light paths as channels: 10-14 (8x)
+#     preprocess took 16868 s = 2.0x the load term.
+_ROUGH_LOAD_MBPS = 260.0
 _ROUGH_S_PER_TILE_CH = 1.5
-_ROUGH_S_PER_OUT_UNIT = 0.08
+_ROUGH_S_PER_OUT_UNIT = 0.325
+_ROUGH_INTENSITY_FACTOR = {"measure": 1.09, "apply": 1.43}
+_ROUGH_S_PER_DESTRIPE_MPX = 0.035
+_ROUGH_SEPARATE_ILLUM_FACTOR = 2.0
 #   _ROUGH_S_PER_REG_MVOXEL: registration, seconds per MILLION voxels actually
 #                          compared. Pairwise registrations run SERIALLY for
 #                          3-D data (multiview-stitcher sets
@@ -663,6 +686,12 @@ _ROUGH_S_PER_REG_MVOXEL = 3.3
 # 10 or 20 cost 1.07-1.18x the default and no extra memory (same peak to the
 # MB under tracemalloc); the upsampled DFT only refines around the peak.
 _ROUGH_UPSAMPLE_TIME_FACTOR = 1.18
+# Registration time with seam choice "cells" (seam_select, v0.13.15) relative to
+# the SSIM choice the constant above was fitted on. The prior's own register
+# term for Ket_Trial1 at Z 10 µm / 1/10 is 21712 s; measured 3452 s (10-23) and
+# 3492 s (10-26) = 0.159 / 0.161. Cell match scores each candidate on a
+# band-passed overlap instead of MVS's SSIM over every candidate.
+_ROUGH_CELLS_SEAM_TIME_FACTOR = 0.16
 MVS_DEFAULT_3D_UPSAMPLE = 2
 
 # Global-progress percent boundaries for the pipeline phases. The estimator
@@ -789,15 +818,49 @@ def rough_phase_seconds(tiles, config) -> Dict[str, float]:
         in_bytes += float(t.n_planes) * fw * fh * 2.0 * n_illum * n_channels
     load_seconds = in_bytes / (_ROUGH_LOAD_MBPS * 1e6)
     overhead = _ROUGH_S_PER_TILE_CH * n_tiles * n_channels
-    load_register = load_seconds + overhead
+    separate = str(getattr(config, "illumination_fusion", "max") or "max") == "separate"
+    load_register = (load_seconds + overhead) * (
+        _ROUGH_SEPARATE_ILLUM_FACTOR if separate else 1.0
+    )
+    load_register += _rough_destripe_seconds(tiles, config, n_channels)
 
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
-    fuse_write = _ROUGH_S_PER_OUT_UNIT * out_units
+    if separate:
+        out_units *= _ROUGH_SEPARATE_ILLUM_FACTOR
+    mode = str(getattr(config, "intensity_adjustment", "off") or "off").lower()
+    fuse_write = (
+        _ROUGH_S_PER_OUT_UNIT * out_units * _ROUGH_INTENSITY_FACTOR.get(mode, 1.0)
+    )
     return {
         "preprocess": load_register,
         "register": _rough_register_seconds(tiles, config),
         "fuse": fuse_write,
     }
+
+
+def _rough_destripe_seconds(tiles, config, n_channels) -> float:
+    """Destripe cost: per megapixel-plane, once per light path at native size.
+
+    Fast mode destripes after the downsample; its cost is scaled by the
+    downsampled plane area and count (not measured on the rig).
+    """
+    if not getattr(config, "destripe", False):
+        return 0.0
+    fast = bool(getattr(config, "destripe_fast", False))
+    ds_xy = max(1, getattr(config, "downsample_xy", 1) or 1)
+    ds_z = max(1, getattr(config, "downsample_z", 1) or 1)
+    mpx_planes = 0.0
+    for t in tiles:
+        fw = int(getattr(t, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+        fh = int(getattr(t, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
+        n_illum = max(1, len(getattr(t, "illumination_sides", []) or [0]))
+        area = fw * fh / 1e6
+        planes = float(t.n_planes)
+        if fast:
+            area /= ds_xy * ds_xy
+            planes /= ds_z
+        mpx_planes += planes * area * n_illum * n_channels
+    return _ROUGH_S_PER_DESTRIPE_MPX * mpx_planes
 
 
 def progress_bands(shares: Dict[str, float]) -> Tuple[float, float]:
@@ -971,6 +1034,8 @@ def _rough_register_seconds(tiles, config) -> float:
     seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
     if int(getattr(config, "registration_upsample_factor", 0) or 0) > MVS_DEFAULT_3D_UPSAMPLE:
         seconds *= _ROUGH_UPSAMPLE_TIME_FACTOR
+    if _cells_seam_choice(config):
+        seconds *= _ROUGH_CELLS_SEAM_TIME_FACTOR
     # The Z-refinement pass is a second pairwise pass over the same seams at
     # its own binning (every plane, coarser XY), so cost it as such rather
     # than as a flat doubling: at a 2.5 µm step every plane is 4-8x the main
@@ -995,7 +1060,14 @@ def _rough_refine_seconds(tiles, config) -> float:
         return 0.0
     if geo is None:
         return 0.0
-    return _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
+    seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
+    if _cells_seam_choice(config):
+        seconds *= _ROUGH_CELLS_SEAM_TIME_FACTOR
+    return seconds
+
+
+def _cells_seam_choice(config) -> bool:
+    return str(getattr(config, "registration_seam_choice", "cells") or "cells") == "cells"
 
 
 def _copy_config_with(config, **changes):
