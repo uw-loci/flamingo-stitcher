@@ -119,7 +119,7 @@ def boundaries(tiles: Sequence["MapTile"], seams: Sequence["MapSeam"]) -> List[B
 # common colour-vision deficiencies). (key, legend text, RGB)
 SEAM_CATEGORIES: List[Tuple[str, str, Tuple[int, int, int]]] = [
     ("agrees", "Registered, agrees with the solve", (0, 158, 115)),
-    ("strained", "Registered, above solve tolerance", (240, 228, 66)),
+    ("strained", "Registered, but left visibly off", (240, 228, 66)),
     ("pruned", "Measured, dropped by the solve", (230, 159, 0)),
     ("below_quality", "Below quality threshold", (213, 94, 0)),
     ("implausible", "Shift beyond the allowed bound", (204, 121, 167)),
@@ -155,9 +155,27 @@ MAX_MAP_PIXELS = 14_000_000
 SEAM_ALPHA = 0.40
 
 
-def seam_category(status: str, residual_um: Optional[float], tol_um: Optional[float]) -> str:
+def seam_category(
+    status: str,
+    residual_um: Optional[float],
+    tol_um: Optional[float],
+    off_limits_um: Optional[Tuple[float, float]] = None,
+    disagree_um: Optional[Tuple[float, float, float]] = None,
+) -> str:
+    """A kept seam is "strained" when the placement leaves it visibly off.
+
+    With ``off_limits_um`` (Z, XY) and the seam's per-axis disagreement, Z and
+    XY are judged separately, each against its own limit; otherwise (older
+    callers) against the solve tolerance on the 3-D residual.
+    """
     s = (status or "").lower()
     if s == "registered":
+        if off_limits_um is not None and disagree_um is not None:
+            dz, dy, dx = disagree_um
+            z_lim, xy_lim = off_limits_um
+            if abs(dz) > z_lim or (dy * dy + dx * dx) ** 0.5 > xy_lim:
+                return "strained"
+            return "agrees"
         if tol_um and residual_um is not None and residual_um > tol_um:
             return "strained"
         return "agrees"
@@ -310,6 +328,7 @@ def render(
     out_path: Path,
     *,
     tol_um: Optional[float] = None,
+    off_limits_um: Optional[Tuple[float, float]] = None,
     title: str = "",
     info_lines: Sequence[str] = (),
     font_px: int = 16,
@@ -457,7 +476,7 @@ def render(
         r1, c1 = min(a[2], b[2], H), min(a[3], b[3], W)
         if r0 >= r1 or c0 >= c1:
             continue
-        cat = seam_category(s.status, s.residual_um, tol_um)
+        cat = seam_category(s.status, s.residual_um, tol_um, off_limits_um, s.disagree_um)
         counts[cat] = counts.get(cat, 0) + 1
         _blend(r0, c0, r1, c1, _SEAM_RGB[cat], SEAM_ALPHA)
         seam_boxes.append((s, cat, (r0, c0, r1, c1)))
@@ -628,6 +647,10 @@ def render(
             ly += int(font_px * 1.15)
         ly += int(font_px * 0.6)
     ly += int(font_px * 1.3)
+    if off_limits_um is not None:
+        d.text((lx, ly), f"Visibly off: Z > {off_limits_um[0]:.1f} µm or XY > "
+               f"{off_limits_um[1]:.1f} µm", font=small, fill=(170, 170, 170))
+        ly += int(font_px * 1.3)
     if tol_um:
         d.text((lx, ly), f"Solve tolerance {tol_um:.1f} µm", font=small, fill=(170, 170, 170))
         ly += int(font_px * 1.3)

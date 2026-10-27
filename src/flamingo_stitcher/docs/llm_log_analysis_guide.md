@@ -494,6 +494,19 @@ ratio far from 1 at `start` with a cold prior means the rough model is off
 for that configuration. A cache seed is only as good as the earlier run it
 came from.
 
+**Kept seams left visibly off (from 2026-10-27).** The solve tolerance is in
+LATERAL registration pixels, so it grows with the XY downsample while Z planes
+do not (XY 4x, Z 1x: 25 px = 105 µm = 42 planes of Z). `Kept seams left visibly
+off: N of M (Z more than ... µm = 2 output planes, or XY more than ... µm)`
+lists each kept seam the placement leaves off, with its Z and XY offsets
+separately; the map draws them yellow ("Registered, but left visibly off").
+A "registered" status alone does not mean the seam lines up.
+
+**`Window not responding for N s`** (ERROR, from 2026-10-27) is the GUI's
+freeze watchdog: the stack of every thread follows, the window's thread marked.
+It means the window froze, not the stitch; check the lines before it for
+whether the pipeline had finished.
+
 ## 7i. The registration map
 
 Every run writes `<name>_registration_map.png` beside `registration_report.txt`

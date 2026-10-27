@@ -292,3 +292,15 @@ def test_broken_links_get_a_red_x(tmp_path):
     img = np.asarray(Image.open(out).convert("RGB")).astype(int)
     red = np.array([235, 30, 30])
     assert (np.abs(img - red).sum(axis=2) < 10).sum() > 40
+
+
+def test_a_kept_seam_off_in_z_is_flagged_even_inside_the_solve_tolerance():
+    """2026-10-27, XY 4x / Z 1x: tolerance 25 lateral px = 105 µm let a seam
+    sit tens of µm off in Z and still be drawn green."""
+    limits = (5.0, 8.4)  # 2 planes of 2.5 µm; 2 output px of 4.19 µm
+    assert rm.seam_category("registered", 30.0, 105.0, limits, (30.0, 0.0, 0.0)) == "strained"
+    assert rm.seam_category("registered", 9.0, 105.0, limits, (0.0, 6.0, 6.0)) == "strained"
+    assert rm.seam_category("registered", 5.0, 105.0, limits, (4.0, 3.0, 3.0)) == "agrees"
+    # Without per-axis data the old rule still applies.
+    assert rm.seam_category("registered", 30.0, 105.0) == "agrees"
+    assert rm.seam_category("registered", 130.0, 105.0) == "strained"

@@ -62,6 +62,9 @@ _SETTINGS_GROUP = "StitchingDialog"
 # Shared (cross-dialog) key for the last folder browsed to via "Add…", so the
 # file picker reopens there even when the queue is empty.
 _LAST_BROWSE_KEY = "StitchingShared/last_browse_dir"
+# Lines the log panel keeps. A full 42-tile Ket_Trial1 run writes ~670 lines
+# (verbose alignment on), so this holds the last ~30 such runs.
+LOG_PANEL_MAX_LINES = 20000
 
 # Shown in the pinned memory-estimate label before tiles are discovered (the
 # estimate needs the tile geometry), so the always-visible row explains why it's
@@ -1788,6 +1791,10 @@ class StitchingDialog(PersistentDialog):
         log_layout.addLayout(log_opts_row)
         self._log_text = QTextEdit()
         self._log_text.setReadOnly(True)
+        # Keep only the newest lines. The panel lived for the whole app session
+        # and held every run since launch; the full log is in the file under
+        # <config dir>/logs either way.
+        self._log_text.document().setMaximumBlockCount(LOG_PANEL_MAX_LINES)
         self._log_text.setMinimumHeight(120)
         self._log_text.setStyleSheet(
             "QTextEdit { font-family: monospace; font-size: 11px; }"

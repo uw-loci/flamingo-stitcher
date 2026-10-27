@@ -5492,9 +5492,12 @@ class StitchingPipeline:
         if not out_dir.is_dir():
             out_dir = out_dir.parent
         prefix = basename or self._build_output_basename(Path(acquisition_dir))
+        off_limits = self._visible_offset_limits_um()
+        self._log_visibly_off_seams(report, seams, map_tiles, off_limits)
         path = rmap.render(
             map_tiles, seams, out_dir / f"{prefix}_registration_map.png",
             tol_um=getattr(self, "_abs_tol_um", None),
+            off_limits_um=off_limits,
             title=f"{acq} -- tile placement as fused ({placed.split(' (')[0]})",
             info_lines=info, background_note=note,
         )
@@ -5504,6 +5507,54 @@ class StitchingPipeline:
                 f"verdicts, labels; {note[0].lower() + note[1:]})"
             )
         return path
+
+    def _visible_offset_limits_um(self):
+        """(Z, XY) µm beyond which a kept seam is drawn and logged as off.
+
+        Separate from the solve tolerance, which is in LATERAL registration
+        pixels and so grows with the XY downsample while Z planes do not: at
+        XY 4x / Z 1x, 25 px was 105 µm, i.e. 42 planes of Z error passed as
+        "agrees" (2026-10-27). Z: two output planes. XY: the larger of two
+        output pixels and the largest cell the seam choice matches on
+        (seam_select.BAND_OUTER_UM) -- further off than one cell, the cells
+        either side no longer overlap and the edge shows doubled.
+        """
+        from flamingo_stitcher.seam_select import BAND_OUTER_UM
+
+        vox = getattr(self, "_output_voxel_um", None) or {}
+        vz = float(vox.get("z", 0.0) or 0.0)
+        vxy = max(float(vox.get("y", 0.0) or 0.0), float(vox.get("x", 0.0) or 0.0))
+        if vz <= 0 or vxy <= 0:
+            return None
+        return 2.0 * vz, max(2.0 * vxy, float(BAND_OUTER_UM[1]))
+
+    def _log_visibly_off_seams(self, report, seams, map_tiles, limits) -> None:
+        """One line per kept seam the placement leaves visibly off, by axis."""
+        if limits is None or report is None or not report.ran:
+            return
+        z_lim, xy_lim = limits
+        off = []
+        for s in seams:
+            if (s.status or "").lower() != "registered" or s.disagree_um is None:
+                continue
+            dz, dy, dx = s.disagree_um
+            dxy = (dy * dy + dx * dx) ** 0.5
+            if abs(dz) > z_lim or dxy > xy_lim:
+                off.append((max(abs(dz) / z_lim, dxy / xy_lim), s, dz, dxy))
+        kept = sum(1 for s in seams if (s.status or "").lower() == "registered")
+        self.logger.info(
+            f"  Kept seams left visibly off: {len(off)} of {kept} (Z more than "
+            f"{z_lim:.1f} µm = 2 output planes, or XY more than {xy_lim:.1f} µm). "
+            f"These passed the solve tolerance but do not line up in the output."
+        )
+        for _, s, dz, dxy in sorted(off, key=lambda o: -o[0]):
+            self.logger.info(
+                f"    {map_tiles[s.a].label} | {map_tiles[s.b].label}: "
+                f"Z off {dz:+.1f} µm, XY off {dxy:.1f} µm (quality {s.quality:.2f})"
+                if s.quality is not None else
+                f"    {map_tiles[s.a].label} | {map_tiles[s.b].label}: "
+                f"Z off {dz:+.1f} µm, XY off {dxy:.1f} µm"
+            )
 
     def _border_qc_offsets_um(self):
         """Registered (dz, dy, dx) µm per tile, keyed for border QC; None when
@@ -5914,6 +5965,7 @@ class StitchingPipeline:
             f"Voxel size: Z={voxel_size_um['z']:.3f} "
             f"Y={voxel_size_um['y']:.3f} X={voxel_size_um['x']:.3f} µm"
         )
+        self._output_voxel_um = dict(voxel_size_um)
 
         output_path = Path(output_path)
         output_path.mkdir(parents=True, exist_ok=True)

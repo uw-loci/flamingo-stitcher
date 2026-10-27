@@ -257,6 +257,17 @@ def main() -> int:
     update_panel.restore_badge_from_cache()
     QTimer.singleShot(0, update_panel.maybe_auto_check)
 
+    # If the window's thread stops responding, log every thread's stack (see
+    # freeze_watchdog). The timer only fires while the event loop runs, so a
+    # missing beat IS the freeze.
+    from flamingo_stitcher.freeze_watchdog import FreezeWatchdog
+
+    watchdog = FreezeWatchdog()
+    heartbeat = QTimer(window)
+    heartbeat.timeout.connect(watchdog.beat)
+    heartbeat.start(1000)
+    watchdog.start()
+
     return app.exec_()
 
 
