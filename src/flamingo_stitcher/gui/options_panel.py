@@ -82,6 +82,12 @@ class OptionsPanel(QWidget):
         self._scope_combo = QComboBox()
         self._scope_combo.setMinimumWidth(220)
         self._scope_combo.currentIndexChanged.connect(self._on_selection_changed)
+        self._scope_combo.setToolTip(
+            "The microscope to edit. Lists every microscope you have stitched "
+            "from or saved settings for. Choose '<add a microscope…>' to type a "
+            "new one exactly as 'Microscope name' appears in the acquisition's "
+            "ScopeSettings.txt."
+        )
         picker_layout.addWidget(QLabel("Name:"))
         picker_layout.addWidget(self._scope_combo, 1)
 
@@ -96,6 +102,13 @@ class OptionsPanel(QWidget):
         self._objective_combo = QComboBox()
         self._objective_combo.setMinimumWidth(150)
         self._objective_combo.currentIndexChanged.connect(self._on_objective_changed)
+        self._objective_combo.setToolTip(
+            "Which objective these settings are for. 'All objectives' covers "
+            "every objective on this microscope. Choose 'Specific objective…' "
+            "to save separate settings for one magnification. Those then "
+            "replace the 'All objectives' settings for that objective "
+            "completely; the two are not combined."
+        )
         picker_layout.addWidget(QLabel("Objective:"))
         picker_layout.addWidget(self._objective_combo, 1)
 
@@ -104,6 +117,10 @@ class OptionsPanel(QWidget):
         self._new_objective_edit.setDecimals(1)
         self._new_objective_edit.setSuffix("x")
         self._new_objective_edit.setValue(17.0)
+        self._new_objective_edit.setToolTip(
+            "The objective magnification, as the acquisition records it "
+            "(for example 17.0x)."
+        )
         self._new_objective_edit.setVisible(False)
         self._new_objective_edit.valueChanged.connect(self._on_objective_changed)
         picker_layout.addWidget(self._new_objective_edit)
@@ -143,22 +160,29 @@ class OptionsPanel(QWidget):
 
         self._defaults_btn = QPushButton("Reset to defaults")
         self._defaults_btn.setToolTip(
-            "Load the built-in defaults into the controls. Nothing is saved "
-            "until you press Save."
+            "Fill the controls with the built-in defaults. Nothing is saved "
+            "until you press 'Save'."
         )
         self._defaults_btn.clicked.connect(self._on_defaults)
         buttons.addWidget(self._defaults_btn)
 
         self._delete_btn = QPushButton("Delete profile")
         self._delete_btn.setToolTip(
-            "Forget this microscope's saved options. Its acquisitions will use "
-            "the defaults again."
+            "Delete the saved settings for this microscope at the selected "
+            "'Objective'. Acquisitions then use this microscope's 'All "
+            "objectives' settings if saved, otherwise the built-in defaults. "
+            "You are asked to confirm first. Grayed out when the selected "
+            "'Objective' has no saved settings of its own."
         )
         self._delete_btn.clicked.connect(self._on_delete)
         buttons.addWidget(self._delete_btn)
 
         self._save_btn = QPushButton("Save")
         self._save_btn.setDefault(True)
+        self._save_btn.setToolTip(
+            "Save these values for the selected microscope and 'Objective'. "
+            "Every later run from that microscope uses them automatically."
+        )
         self._save_btn.clicked.connect(self._on_save)
         buttons.addWidget(self._save_btn)
 
@@ -231,9 +255,11 @@ class OptionsPanel(QWidget):
             # cannot be run on the microscope PC; this is the way in.
             measure_btn = QPushButton("Measure from data…")
             measure_btn.setToolTip(
-                "Pick an acquisition folder and read the answer off the images "
-                "instead of typing it. Takes a few seconds — only a subsampled "
-                "slice of each raw file is read."
+                "Pick an acquisition folder that has both illumination sides. "
+                "The app reads a few tiles, works out which side lights the low "
+                "end, and offers to fill in 'Illumination side lighting the LOW "
+                "end of the frame'. Takes a few seconds. Press 'Save' afterward "
+                "to keep the value."
             )
             measure_btn.clicked.connect(self._on_measure_illumination_side)
             layout.addWidget(measure_btn)
@@ -435,7 +461,13 @@ class OptionsPanel(QWidget):
         finally:
             self._loading = False
 
-        self._delete_btn.setEnabled(bool(values))
+        # Delete removes only the entry for THIS objective. When the values
+        # shown are inherited from the 'All objectives' entry, there is nothing
+        # here to delete; pressing it used to do nothing, silently.
+        own = bool(values) and source == scope_profiles.profile_key(
+            scope, self._current_objective()
+        )
+        self._delete_btn.setEnabled(own)
         if not scope:
             self._name_hint.setText(
                 "Type the microscope name exactly as it appears in the "
@@ -443,6 +475,11 @@ class OptionsPanel(QWidget):
                 "The match ignores case and surrounding spaces, but nothing "
                 "else — a name that does not match is a profile that never "
                 "applies."
+            )
+        elif values and not own:
+            self._name_hint.setText(
+                f"Showing the saved profile '{source}' (no entry for this "
+                "objective). Save to give this objective its own entry."
             )
         elif values:
             self._name_hint.setText(f"Showing the saved profile '{source}'.")
@@ -501,7 +538,8 @@ class OptionsPanel(QWidget):
             self,
             "Delete profile?",
             f"Forget the saved options for '{key}'?\n\n"
-            "Acquisitions from this microscope will use the defaults again.",
+            "Acquisitions at this objective will use the 'All objectives' "
+            "entry for this microscope if there is one, otherwise the defaults.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
@@ -510,3 +548,5 @@ class OptionsPanel(QWidget):
         if scope_profiles.delete_profile(scope, objective):
             self._status.setText(f"Deleted '{key}'.")
             self._reload_scopes()
+        else:
+            self._status.setText(f"Nothing saved under '{key}' to delete.")

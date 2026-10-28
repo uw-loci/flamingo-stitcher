@@ -9537,8 +9537,8 @@ class StitchingPipeline:
             self.logger.info(
                 f"  Registration channel: {best} (structure {table}) — chosen "
                 f"over the configured channel {explicit}, which scored "
-                f"{scores[explicit]:.2f}. Set 'Registration channel' in the "
-                f"Options tab to override."
+                f"{scores[explicit]:.2f}. Turn off 'Choose the registration "
+                f"channel automatically' on the Options tab to override."
             )
         else:
             self.logger.info(
@@ -9713,7 +9713,7 @@ class StitchingPipeline:
                 f"That is a lot: if the mosaic is NOT mostly empty, the tile "
                 f"structure threshold ({min_structure:.2f}) is too high for "
                 f"this data — registration will run on very little. Set "
-                f"'Skip empty overlaps' off in the Options tab to disable it."
+                f"'Skip seams whose overlap is empty' off on the Options tab to disable it."
             )
         # Leaving NOTHING to register is the one outcome where this gate breaks
         # registration rather than informing it, so it is the one case worth
@@ -9800,7 +9800,7 @@ class StitchingPipeline:
         z_hint = (
             ""
             if source_z == "config"
-            else " — set per microscope with 'Max registration shift Z' in Options"
+            else " — set per microscope with 'Maximum axial correction' on the Options tab"
         )
         self.logger.info(
             f"  Pairwise shift bounds: xy {bound_xy:.1f} µm ({source_xy}), "
@@ -11109,7 +11109,7 @@ class StitchingPipeline:
             )
             self.logger.warning(
                 "  Falling back to default cosine blending "
-                "(turn off 'Content-based fusion' in Processing Options "
+                "(turn off 'Content-based blending' under 'Processing Options' "
                 "to silence this warning)."
             )
             retry_kwargs = dict(fuse_kwargs)
@@ -12593,7 +12593,7 @@ class StitchingPipeline:
             self.logger.warning(
                 f"  {' and '.join(thin)} overlap is below the "
                 f"{floor:.0%} registration floor "
-                f"('Minimum registration overlap' in the Options tab). Those "
+                f"('Minimum tile overlap to attempt registration' on the Options tab). Those "
                 f"seams will be skipped rather than registered."
             )
 

@@ -59,6 +59,10 @@ The header echoes the settings and provenance. Lines worth checking first:
 - `Tile overlap fusion: max|blend` — combines **adjacent tiles**. See [§7](#7-tile-overlap-fusion-max-vs-blend-and-why-seams-look-the-way-they-do).
 - `Flat-field correction: True|False` — BaSiC shading + baseline correction.
 - `Output format`, `Frame size (AOI)`, `Objective … → effective pixel ~X µm`.
+  `Frame size (AOI): W×H px (from data)` is the GUI's 'Auto (from file)': the
+  side is the square root of `bytes / (planes × 2)` for each 16-bit file.
+  `(manual override)` means a fixed 1024 or 2048 frame was chosen, and
+  `tiles disagree [...]` means the acquisition mixes frame sizes.
 - `Memory estimate: in-memory ~A GB, streaming ~B GB, output ~C GB → <mode>`.
 - `Input data on disk: ~X GB across N raw files`.
 
@@ -305,6 +309,10 @@ raw stage position while its neighbours move. `_bind_unconstrained_tiles` then
 gives each stranded component the mosaic's MEDIAN correction so nothing tears —
 but a median ignores where a tile sits, so on a mosaic whose corrections vary
 across the grid a rim tile still opens a gap against the tiles it touches.
+
+Both approaches solve all seams at once; neither places tiles one at a time,
+which could not satisfy an L-shaped set of neighbors. Tiles whose seams still
+disagree after the solve are logged as ERROR.
 
 **`center_xy`** ("Center XY Start") is for a rectangular collection around a
 round sample — a default single-workflow acquisition, where the rim of empty

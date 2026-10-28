@@ -161,12 +161,12 @@ class BackgroundZeroPanel(QWidget):
             "Zero voxels at or below per-channel threshold (lossy)"
         )
         self._enable_cb.setToolTip(
-            "When ON, voxels with intensity <= the per-channel threshold\n"
-            "are written as 0. Compresses empty space around the sample\n"
-            "to almost nothing under blosc/zstd.\n\n"
-            "LOSSY for the masked region. Click Preview... first to see\n"
-            "what would be zeroed at coarse resolution before committing\n"
-            "to a full-resolution run."
+            "Sets every voxel at or below its channel's threshold to 0\n"
+            "in the output, so empty space around the sample compresses\n"
+            "to almost nothing ('Compression' must not be None).\n"
+            "Use it on cleared samples with a lot of empty space when\n"
+            "disk space matters. Lossy: zeroed voxels cannot be recovered.\n"
+            "Click 'Preview…' first to choose the thresholds."
         )
         body_layout.addWidget(self._enable_cb)
 
@@ -189,10 +189,11 @@ class BackgroundZeroPanel(QWidget):
         btn_row = QHBoxLayout()
         self._preview_btn = QPushButton("Preview…")
         self._preview_btn.setToolTip(
-            "Run the stitching pipeline at coarse downsample without\n"
-            "writing any output, then open a napari viewer with sliders\n"
-            "to pick per-channel thresholds. Click Apply in the preview\n"
-            "to copy the chosen values back into this panel."
+            "Stitches the first discovered acquisition at low resolution\n"
+            "(8x XY, 4x Z) without saving anything, then opens a viewer\n"
+            "with a threshold slider per channel. Click 'Apply thresholds'\n"
+            "there to copy the values into this panel.\n"
+            "Run 'Discover Tiles' first."
         )
         self._preview_btn.clicked.connect(self.preview_requested)
         btn_row.addWidget(self._preview_btn)
@@ -250,7 +251,7 @@ class BackgroundZeroPanel(QWidget):
             sb.setSingleStep(10)
             sb.setValue(previous.get(ch_id, 0))
             sb.setToolTip(
-                f"Channel {ch_id}: voxels with value <= this threshold "
+                f"Channel {ch_id}: voxels at or below this threshold "
                 f"will be zeroed in the fused output. 0 disables thresholding "
                 f"for this channel."
             )
@@ -320,6 +321,8 @@ class StitchingDialog(PersistentDialog):
 
     # Emitted when user wants to load stitched output into SampleView
     load_stitched_requested = pyqtSignal(str)
+    # True while a batch is running; the Updates tab grays out 'Install update'.
+    run_state_changed = pyqtSignal(bool)
 
     # How many directory levels to go up when restoring the acq dir path.
     # Subfolder-per-tile layout: grandparent (2 levels up).
@@ -457,6 +460,12 @@ class StitchingDialog(PersistentDialog):
         self._queue_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self._queue_table.verticalHeader().setVisible(False)
         self._queue_table.setMaximumHeight(140)
+        self._queue_table.setToolTip(
+            "Acquisitions to stitch. Drag folders here or use 'Add...'.\n"
+            "Select a row before 'Orientation Preview…' or the destripe\n"
+            "'Preview…'. Double-click a finished row to run it again;\n"
+            "right-click for more options."
+        )
         # Right-click menu + double-click to re-queue a finished item, so the
         # reset-to-Pending action is discoverable without hunting for the button.
         self._queue_table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -476,7 +485,10 @@ class StitchingDialog(PersistentDialog):
         # Discover Tiles pointed the eye at a disabled button. Add All in Folder
         # sits beside it as the bulk variant of the same step, then Discover.
         self._add_btn = QPushButton("Add...")
-        self._add_btn.setToolTip("Add an acquisition directory to the queue")
+        self._add_btn.setToolTip(
+            "Add an acquisition folder to the queue.\n"
+            "You can also drag acquisition folders onto this window."
+        )
         self._add_btn.clicked.connect(self._add_to_queue)
         queue_btn_layout.addWidget(self._add_btn)
 
@@ -493,10 +505,11 @@ class StitchingDialog(PersistentDialog):
         # added since the last Discover (see _discover_needed and the timer).
         self._discover_btn = QPushButton("Discover Tiles")
         self._discover_btn.setToolTip(
-            "Scan all queued directories for tile data so channels, frame size\n"
-            "and Z step are detected before you Run.\n"
-            "Flashes when directories were added since the last Discover.\n"
-            "(Optional — Run will auto-discover if needed.)"
+            "Reads the queued acquisitions before you start: fills in\n"
+            "channels, frame size, pixel size and Z step, and shows any\n"
+            "data problems. Press it after adding acquisitions to check\n"
+            "what was found. It is optional, because 'Run All' discovers\n"
+            "anything not yet discovered."
         )
         self._discover_btn.clicked.connect(self._on_discover)
         queue_btn_layout.addWidget(self._discover_btn)
@@ -514,24 +527,30 @@ class StitchingDialog(PersistentDialog):
 
         self._orientation_btn = QPushButton("Orientation Preview…")
         self._orientation_btn.setToolTip(
-            "Preview all 8 whole-mosaic orientations for the selected\n"
-            "acquisition (built from its per-tile MIP files) so you can pick\n"
-            "the one where the sample is framed correctly. Useful when a new\n"
-            "microscope frames the mosaic differently. Does not run a stitch."
+            "Shows the selected acquisition's mosaic in all 8 possible\n"
+            "orientations. Pick the one where the sample is continuous\n"
+            "across tile seams and click 'Use for stitching'; it is\n"
+            "remembered for that microscope. You need it once per\n"
+            "microscope, and again whenever a stitch comes out mirrored\n"
+            "or rotated. It does not stitch anything."
         )
         self._orientation_btn.clicked.connect(self._on_orientation_preview)
         queue_btn_layout.addWidget(self._orientation_btn)
 
         self._requeue_btn = QPushButton("Re-queue")
         self._requeue_btn.setToolTip(
-            "Reset the selected Done / Cancelled / Error items back to Pending\n"
-            "so they can be stitched again. This re-enables the Run button."
+            "Sets the selected Done, Cancelled or Error rows back to\n"
+            "Pending so 'Run All' stitches them again, for example after\n"
+            "changing settings. Double-clicking a row does the same."
         )
         self._requeue_btn.clicked.connect(self._requeue_selected)
         queue_btn_layout.addWidget(self._requeue_btn)
 
         self._remove_btn = QPushButton("Remove")
-        self._remove_btn.setToolTip("Remove selected directories from the queue")
+        self._remove_btn.setToolTip(
+            "Remove the selected acquisitions from the queue.\n"
+            "Files on disk are not touched."
+        )
         self._remove_btn.clicked.connect(self._remove_from_queue)
         queue_btn_layout.addWidget(self._remove_btn)
 
@@ -539,25 +558,21 @@ class StitchingDialog(PersistentDialog):
 
         self._load_config_btn = QPushButton("Load Configuration…")
         self._load_config_btn.setToolTip(
-            "Load stitching settings from another run's stitch_metadata.json\n"
-            "or a saved configuration file — e.g. a setup that worked on the\n"
-            "microscope computer, reused here on your own data.\n\n"
-            "Applies everything that shapes the output: processing options,\n"
-            "destripe tuning, deconvolution parameters, registration\n"
-            "thresholds and border QC.\n\n"
-            "Left alone: pixel size, Z spacing and frame AOI (Discover measures\n"
-            "those from your own acquisition), the output location, and this\n"
-            "machine's memory and worker limits."
+            "Loads processing settings from a saved configuration file\n"
+            "or from a finished run's stitch_metadata.json, for example\n"
+            "a setup that worked on the microscope computer.\n"
+            "'Pixel size (µm)', 'Z step (µm)', 'Frame (AOI)', 'Channels',\n"
+            "the output and scratch folders, and this computer's memory\n"
+            "limits are not changed."
         )
         self._load_config_btn.clicked.connect(self._on_load_configuration)
         queue_btn_layout.addWidget(self._load_config_btn)
 
         self._save_config_btn = QPushButton("Save Configuration…")
         self._save_config_btn.setToolTip(
-            "Write the current settings to a file others can load.\n\n"
-            "The same thing a completed run records in its\n"
-            "stitch_metadata.json, but without having to finish a run first —\n"
-            "so a setup can be shared before it is used in anger."
+            "Saves the current settings to a .json file that you or a\n"
+            "colleague can open with 'Load Configuration…' to reuse them\n"
+            "on other data. You do not need to finish a run first."
         )
         self._save_config_btn.clicked.connect(self._on_save_configuration)
         queue_btn_layout.addWidget(self._save_config_btn)
@@ -614,6 +629,13 @@ class StitchingDialog(PersistentDialog):
         self._pixel_size_spin.setDecimals(3)
         self._pixel_size_spin.setValue(self._default_pixel_um)
         self._pixel_size_spin.setSingleStep(0.001)
+        self._pixel_size_spin.setToolTip(
+            "Filled in from each acquisition's objective when you press\n"
+            "'Discover Tiles', and each queued acquisition uses its own\n"
+            "value. Type a value only if the objective is not recorded or\n"
+            "the scale is known to be wrong: a typed value applies to\n"
+            "every queued acquisition."
+        )
         settings_layout.addWidget(self._pixel_size_spin, 0, 1)
 
         settings_layout.addWidget(QLabel("Z step (\u00b5m):"), 0, 2)
@@ -624,9 +646,10 @@ class StitchingDialog(PersistentDialog):
         self._z_step_spin.setValue(0.0)
         self._z_step_spin.setSpecialValueText("Auto")
         self._z_step_spin.setToolTip(
-            "Leave as detected: each queued acquisition then uses its OWN Z step,\n"
-            "from its data. Type a value only to override it, and that value then\n"
-            "applies to every queued acquisition this session."
+            "Each queued acquisition uses its own Z step from its data;\n"
+            "'Discover Tiles' shows it here. Type a value only to correct\n"
+            "a wrong Z step: it then applies to every queued acquisition.\n"
+            "Set it to 0 (shows Auto) to go back to per-acquisition values."
         )
         settings_layout.addWidget(self._z_step_spin, 0, 3)
 
@@ -643,11 +666,11 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._frame_size_combo.addItem(label, value)
         self._frame_size_combo.setToolTip(
-            "Raw frame (camera AOI) size.\n"
-            "Auto: inferred from each file's size (bytes / planes / 2 → "
-            "square side) — recommended.\n"
-            "Fix to 1024/2048 to force a crop when files may be partial or the "
-            "AOI metadata is missing/wrong."
+            "Size of the camera frame. 'Auto (from file)' reads it from\n"
+            "each file and is right in almost all cases. Choose\n"
+            "'1024 × 1024' or '2048 × 2048' only if the detected frame\n"
+            "size is wrong, for example when the acquisition metadata is\n"
+            "missing or files are incomplete."
         )
         settings_layout.addWidget(self._frame_size_combo, 0, 5)
 
@@ -657,7 +680,10 @@ class StitchingDialog(PersistentDialog):
         self._channels_edit = QLineEdit()
         self._channels_edit.setPlaceholderText("All (or e.g. 0,1)")
         self._channels_edit.setToolTip(
-            "Leave empty for all channels, or comma-separated list (e.g. 0,1)"
+            "Leave empty to stitch all channels, or list channel numbers\n"
+            "separated by commas (for example 0,1) to stitch only those.\n"
+            "'Discover Tiles' lists the channels found. Text that is not\n"
+            "a list of numbers stitches all channels."
         )
         settings_layout.addWidget(self._channels_edit, 1, 1)
 
@@ -694,20 +720,13 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._downsample_xy_combo.addItem(label, value)
         self._downsample_xy_combo.setToolTip(
-            "XY downsample factor.\n"
-            "1x…32x reduces tile width and height. The heavy factors\n"
-            "(16x/32x) are for fast overviews and test runs.\n\n"
-            "iso: auto-pick BOTH XY and Z factors so the output voxel\n"
-            "is as close to cubic as possible, using the allowed\n"
-            "factors (XY: 1/2/4/8/16/32, Z: 1/2/4/8/16). Resolved at run time\n"
-            "from the acquisition's own Z step, so each item in a\n"
-            "batch queue is sized independently. When iso is chosen\n"
-            "the Z downsample combo is ignored and greys out.\n\n"
-            "Examples at XY pixel = 0.406 \u00b5m:\n"
-            "  Z 0.5 \u00b5m  \u2192 XY 1x, Z 1x  (0.41 \u00d7 0.50 \u00b5m)\n"
-            "  Z 1.0 \u00b5m  \u2192 XY 2x, Z 1x  (0.81 \u00d7 1.00 \u00b5m)\n"
-            "  Z 2.5 \u00b5m  \u2192 XY 8x, Z 1x  (3.25 \u00d7 2.50 \u00b5m)\n"
-            "  Z 5.0 \u00b5m  \u2192 XY 8x, Z 1x  (3.25 \u00d7 5.00 \u00b5m)"
+            "Shrinks the output in X and Y by this factor. Use 1x for\n"
+            "full-resolution data, and 4x-32x for quick test runs and\n"
+            "overviews. 'iso' picks both the XY and Z factors for each\n"
+            "acquisition so voxels come out as close to cubic as possible\n"
+            "(useful for 3-D analysis); the 'Z' list is then grayed out.\n"
+            "Example at 0.406 µm pixels and a 2.5 µm Z step:\n"
+            "XY 8x, Z 1x (3.25 × 2.50 µm)."
         )
         ds_layout.addWidget(self._downsample_xy_combo)
         ds_layout.addSpacing(16)  # visible gap between the XY group and Z group
@@ -722,12 +741,10 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._downsample_z_combo.addItem(label, value)
         self._downsample_z_combo.setToolTip(
-            "Z downsample factor (independent of XY).\n"
-            "8x/16x are for fast overviews and test runs.\n\n"
-            "Averages each group of N planes (a block mean), streamed one\n"
-            "slab at a time — so it shrinks the output, speeds up fusion,\n"
-            "and lowers the memory peak.\n\n"
-            "Greys out when XY is set to 'iso' — iso overrides both."
+            "Shrinks the output in Z by averaging each group of this many\n"
+            "planes. Leave at 1x for final data; 2x-16x make test runs\n"
+            "faster and lighter on memory. Grayed out when 'Downsample' XY\n"
+            "is 'iso', which picks Z for you."
         )
         ds_layout.addWidget(self._downsample_z_combo)
         # Absorb leftover width on the right so each label hugs its own combo,
@@ -754,30 +771,16 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._fusion_combo.addItem(label, value)
         self._fusion_combo.setToolTip(
-            "Combines the LEFT and RIGHT light-sheet illumination sides of a\n"
-            "single tile. Has no effect when only one illumination side was\n"
-            "acquired. This is NOT how adjacent tiles are combined — see\n"
-            "'Tile overlap'.\n\n"
-            "  Max — take the brighter sample of the two. Cheap, and the\n"
-            "    historical default, but on a SCATTERING sample it is actively\n"
-            "    wrong: out-of-focus blur is bright and smooth, so Max prefers\n"
-            "    the blur to the in-focus signal underneath it.\n\n"
-            "  Split — each sheet owns its own half of the frame and the far\n"
-            "    half of each is discarded. The simplest answer when one half\n"
-            "    of every image is unusable. Needs 'Low-end side' set.\n\n"
-            "  Blend — as Split, with a smoothstep handover band so there is no\n"
-            "    step down the middle of the frame.\n\n"
-            "  Content — weight each sheet by local high-frequency energy,\n"
-            "    which is what distinguishes IN FOCUS from BRIGHT. Rejects\n"
-            "    out-of-focus blur however bright it is. Costs two gaussian\n"
-            "    filters per plane.\n\n"
-            "  Mean / Leonardo FUSE — average, or Leonardo's content-based fuse.\n\n"
-            "  Separate (keep light paths) — DIAGNOSTIC: do NOT fuse. Stitch each\n"
-            "    side independently and write it as its own output channel\n"
-            "    (Channel_<ch>_I0, Channel_<ch>_I1) in the same file, so you can\n"
-            "    flip between them in one viewer and tell a per-side artifact\n"
-            "    apart from one introduced by fusing. Doubles the output channel\n"
-            "    count and runs in streaming mode."
+            "How the left and right light sheets of each tile are combined\n"
+            "(no effect with one sheet; tiles are combined by 'Tile overlap').\n"
+            "'Max' (default) keeps the brighter value; on scattering samples\n"
+            "it can keep blur, so try 'Content (weight by local detail)' or\n"
+            "'Split (each sheet owns its half)'.\n"
+            "'Split (each sheet owns its half)' and 'Blend (split with a soft\n"
+            "handover)' give each sheet half the frame and need 'Illumination\n"
+            "side lighting the LOW end of the frame' set on the 'Options' tab.\n"
+            "'Separate (keep light paths)' keeps each sheet as its own\n"
+            "channel, to check which one causes an artifact."
         )
         settings_layout.addWidget(self._fusion_combo, 1, 3)
 
@@ -797,24 +800,13 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._tile_fusion_combo.addItem(label, value)
         self._tile_fusion_combo.setToolTip(
-            "How OVERLAPPING TILES are combined (distinct from 'Illum. fusion',\n"
-            "which combines left/right light-sheet sides of one tile):\n\n"
-            "  Blend   — weighted cosine blend. Seamless on dense, well\n"
-            "            flat-fielded samples. But in the overlap it averages\n"
-            "            each tile against its neighbour, so a sparse sample on\n"
-            "            a mostly-empty FOV (or any slight stage-only\n"
-            "            misregistration) gets diluted against background — a\n"
-            "            dark dip right at the seam.\n\n"
-            "  Maximum — pixel-wise maximum across tiles. Keeps the brighter\n"
-            "            tile in the overlap so signal can't be diluted. Best\n"
-            "            for sparse / sub-FOV samples (e.g. a thin object that\n"
-            "            doesn't fill the field of view).\n\n"
-            "  Brightest tile — winner-take-all. Ranks tiles by overall mean\n"
-            "            intensity and, in every overlap, takes ALL pixels from\n"
-            "            the brighter tile (not a per-pixel max). Avoids the\n"
-            "            per-pixel noise-picking of Maximum and the seam dip of\n"
-            "            Blend — a clean, self-consistent patchwork of whole\n"
-            "            tiles. Best when tiles differ in exposure/illumination."
+            "How neighboring tiles are combined where they overlap.\n"
+            "'Maximum' (default) keeps the brighter pixel; best for sparse\n"
+            "samples that do not fill the field of view.\n"
+            "'Blend' fades one tile into the next; best for dense, evenly\n"
+            "lit samples, but can leave a dark band at seams on sparse ones.\n"
+            "'Brightest tile' takes each whole overlap from the brighter\n"
+            "tile; try it when tiles differ in brightness."
         )
         tile_fuse_box.addWidget(self._tile_fusion_combo)
         # How wide Blend's cross-fade is. Only Blend uses it.
@@ -826,17 +818,11 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._blend_width_combo.addItem(_label, _value)
         self._blend_width_combo.setToolTip(
-            "How wide Blend's cross-fade between neighbouring tiles is.\n\n"
-            "Whole overlap (default): the fade spans the tile overlap measured\n"
-            "for THIS acquisition from its stage positions, so each tile hands\n"
-            "over to its neighbour gradually across the whole shared strip.\n"
-            "Half overlap: the middle half of it, a sharper hand-over.\n"
-            "Fixed 100 µm: the old setting, whatever the overlap (on a 214 µm\n"
-            "overlap that used half of it).\n\n"
-            "The run log prints the widths used. Only Blend uses this; Maximum\n"
-            "and Brightest tile do not cross-fade. A wide fade cannot hide\n"
-            "misalignment: in a misaligned overlap it averages two different\n"
-            "images over a wider band."
+            "Width of Blend's fade between tiles. 'Fade: whole overlap'\n"
+            "(default) uses the full overlap between tiles; 'Fade: half\n"
+            "overlap' gives a sharper hand-over; 'Fade: fixed 100 µm' uses\n"
+            "100 µm regardless of the overlap. Only used when 'Tile overlap'\n"
+            "is 'Blend'. A wider fade does not hide misaligned tiles."
         )
         tile_fuse_box.addWidget(self._blend_width_combo)
         self._tile_fusion_combo.currentIndexChanged.connect(
@@ -890,11 +876,13 @@ class StitchingDialog(PersistentDialog):
             pass
 
         self._format_combo.setToolTip(
-            "OME-Zarr (Fiji compatible): opens in Fiji, QuPath, BigDataViewer, napari\n"
-            "OME-Zarr Sharded: fewest files, napari only (Fiji cannot open)\n"
-            "OME-TIFF: single file, universal viewer support\n"
-            "Imaris (.ims): direct writer \u2014 opens correctly in Imaris (Windows only)\n"
-            "Both: write Zarr Sharded + TIFF"
+            "'OME-Zarr (Fiji compatible)': the safe default; opens in Fiji,\n"
+            "QuPath, BigDataViewer and napari.\n"
+            "'OME-Zarr Sharded': fewest files, but napari only.\n"
+            "'OME-TIFF (single file)': one file any viewer can read; good for\n"
+            "sharing.\n"
+            "'Imaris (.ims)': for Imaris users, Windows only.\n"
+            "'Both (Sharded + TIFF)': writes both."
         )
         self._format_combo.currentIndexChanged.connect(self._on_format_changed)
         settings_layout.addWidget(self._format_combo, 2, 1)
@@ -908,22 +896,15 @@ class StitchingDialog(PersistentDialog):
             "qproperty-alignment: AlignCenter; }"
         )
         format_help.setToolTip(
-            "<b>Output Format Guide</b><br><br>"
-            "<b>OME-Zarr (Fiji compatible)</b> &mdash; Zarr v2 + OME-NGFF v0.4<br>"
-            "Opens in <b>Fiji</b> (N5 plugin), <b>QuPath</b>, <b>BigDataViewer</b>, "
-            "<b>napari</b>, and most bio-imaging tools.<br><br>"
-            "<b>OME-Zarr Sharded</b> &mdash; Zarr v3 + OME-NGFF v0.5<br>"
-            "Fewest files via sharding. Only readable by "
-            "<b>napari</b> and zarr-python 3.x.<br><br>"
-            "<b>OME-TIFF</b> &mdash; Single file per channel<br>"
-            "Universally readable. Best for sharing and archiving.<br><br>"
-            "<b>Imaris (.ims)</b> &mdash; Direct writer via PyImarisWriter (Apache 2.0)<br>"
-            "Opens correctly in <b>Imaris</b> with auto-generated pyramids. "
-            "Avoids ImarisFileConverter's SubIFD-pyramid bug that otherwise "
-            "collapses all data into Z=0. Block-streamed write for TB-scale "
-            "datasets. <b>Windows only</b> (<code>pip install PyImarisWriter</code>).<br><br>"
-            "<b>Alternative for Imaris:</b> Export OME-TIFF with pyramids OFF, "
-            "then run through ImarisFileConverter."
+            "<b>Which format?</b><br>"
+            "<b>OME-Zarr (Fiji compatible)</b>: opens in Fiji (N5 plugin), "
+            "QuPath, BigDataViewer and napari. Use this if unsure.<br>"
+            "<b>OME-Zarr Sharded</b>: fewest files; opens in napari only.<br>"
+            "<b>OME-TIFF (single file)</b>: one file, readable almost "
+            "everywhere; best for sharing and archiving.<br>"
+            "<b>Imaris (.ims)</b>: opens directly in Imaris. Windows only.<br>"
+            "To convert with ImarisFileConverter instead, choose "
+            "'OME-TIFF (single file)' and uncheck 'TIFF pyramids'."
         )
         format_help.setFixedWidth(20)
         settings_layout.addWidget(format_help, 2, 2)
@@ -931,21 +912,12 @@ class StitchingDialog(PersistentDialog):
         settings_layout.addWidget(QLabel("Compression:"), 2, 3)
         self._compression_combo = QComboBox()
         self._compression_combo.setToolTip(
-            "Compression codec for the output file.\n\n"
-            "Options depend on the output format:\n"
-            "  Zarr: zstd (recommended), lz4 (fastest), blosc, none\n"
-            "  TIFF: zlib (best compatibility), lzw (balanced), "
-            "zstd (best ratio), none\n\n"
-            "Speed vs. storage tradeoff:\n"
-            "• 'None' skips encode on write and decode on read, so it's\n"
-            "  the fastest option on both ends when reading from a fast\n"
-            "  local SSD / NVMe — at the cost of a much larger file.\n"
-            "• Compressed codecs (zstd, lz4, zlib, lzw) produce smaller\n"
-            "  files that can read FASTER than 'None' over slow disks,\n"
-            "  network shares, or external HDDs, because disk I/O — not\n"
-            "  CPU decode — is the bottleneck.\n"
-            "• zstd / lz4 have modern fast decoders; zlib / lzw are the\n"
-            "  universally-readable TIFF fallbacks for older software."
+            "How the output is compressed. Keep the default ('zstd\n"
+            "(recommended)' for Zarr, 'zlib (best compatibility)' for TIFF)\n"
+            "unless you have a reason. 'None (no compression)' makes much\n"
+            "larger files that load fastest from a local SSD; compressed\n"
+            "files load faster from network or USB drives. Imaris always\n"
+            "uses its own compression."
         )
         settings_layout.addWidget(self._compression_combo, 2, 4)
         self._update_compression_options()
@@ -957,9 +929,14 @@ class StitchingDialog(PersistentDialog):
         self._streaming_combo.addItem("In-memory (fast)", False)
         self._streaming_combo.addItem("Streaming (low memory)", True)
         self._streaming_combo.setToolTip(
-            "Auto: automatically chooses based on estimated data size and RAM.\n"
-            "In-memory: fast, requires RAM > ~2.5x output size.\n"
-            "Streaming: low RAM, required for TB-scale data."
+            "'Auto' (recommended) streams when the in-memory estimate is\n"
+            "more than 60% of this computer's RAM.\n"
+            "'In-memory (fast)' is quicker but holds everything in RAM.\n"
+            "'Streaming (low memory)' keeps temporary files on disk\n"
+            "('Scratch dir') and handles any size.\n"
+            "Compare with the In-memory and Streaming estimates in the\n"
+            "'Output' box at the top. Choose 'Streaming (low memory)' if a\n"
+            "run fails for lack of memory."
         )
         self._streaming_combo.currentIndexChanged.connect(self._update_memory_indicator)
         settings_layout.addWidget(self._streaming_combo, 3, 1)
@@ -976,22 +953,12 @@ class StitchingDialog(PersistentDialog):
         self._scratch_dir_edit = QLineEdit()
         self._scratch_dir_edit.setPlaceholderText("(default: alongside output)")
         self._scratch_dir_edit.setToolTip(
-            "Where streaming's temporary spill files (.stitch_tmp: per-tile\n"
-            "memmaps + the fused memmap) are written.\n"
-            "\n"
-            "DEFAULT (blank): alongside the output — <output_dir>/.stitch_tmp.\n"
-            "\n"
-            "Point this at a FAST LOCAL disk (NVMe/SSD) when the input/output are\n"
-            "on a slow or network drive: streaming is I/O-bound on this spill, so\n"
-            "moving it off the busy drive can cut wall time a lot.\n"
-            "Cautions:\n"
-            "• No benefit if it is the SAME physical drive as the input/output\n"
-            "  (the run log warns in that case).\n"
-            "• It must have room for the tile spill + fused memmap (see the disk\n"
-            "  estimate); the run aborts up front if it lacks the space.\n"
-            "• The finished output still writes to the output folder, so the\n"
-            "  fused data crosses drives once (the normal fuse→write pass — NOT\n"
-            "  an extra copy of the result). .stitch_tmp is deleted at the end."
+            "Folder for the temporary files written while streaming; they\n"
+            "are deleted when the run ends. Leave blank to keep them next\n"
+            "to the output. Point it at a fast local SSD when the output is\n"
+            "on a network or USB drive; on the same drive as the output it\n"
+            "gives no speed-up. The run checks free space here before it\n"
+            "starts."
         )
         scratch_row = QHBoxLayout()
         scratch_row.setContentsMargins(0, 0, 0, 0)
@@ -1071,21 +1038,15 @@ class StitchingDialog(PersistentDialog):
         proc_layout.setSpacing(6)
 
         # Proc Row 0: Destripe + Content-based blending
+        # Its tooltip is set by _update_preprocessing_availability.
         self._destripe_cb = QCheckBox("Destripe (PyStripe) \u2731")
-        self._destripe_cb.setToolTip(
-            "\u2731 Processes every Z-plane at full resolution\n"
-            "before downsampling.\n\n"
-            "Removes stripe/shadow artifacts from light-sheet data\n"
-            "(orientation set by the Dir: control).\n"
-            "Uses multiple CPU cores automatically."
-        )
         proc_layout.addWidget(self._destripe_cb, 0, 0)
 
         self._destripe_fast_cb = QCheckBox("Fast")
         self._destripe_fast_cb.setToolTip(
-            "Destripe after downsampling instead of before.\n"
-            "Much faster but slightly lower quality.\n\n"
-            "Only effective when downsample factor > 1."
+            "Destripes the downsampled tile instead of every full-resolution\n"
+            "plane: much faster when 'Downsample' is above 1x, with slightly\n"
+            "lower quality. Good for test runs; leave it off for final data."
         )
         self._destripe_fast_cb.setEnabled(False)
         # Fast is a destripe-only variant (apply after downsample). When
@@ -1096,7 +1057,7 @@ class StitchingDialog(PersistentDialog):
 
         # Stripe orientation. The filter is axis-fixed AND destriping runs in the
         # raw camera frame (before the per-tile rot/flip), so the wrong axis
-        # removes nothing. "Auto" detects the stripe direction per tile.
+        # removes nothing. "Auto" derives it from the tile orientation.
         self._destripe_dir_combo = QComboBox()
         for _lbl, _val in (
             ("Dir: Auto", "auto"),
@@ -1105,11 +1066,12 @@ class StitchingDialog(PersistentDialog):
         ):
             self._destripe_dir_combo.addItem(_lbl, _val)
         self._destripe_dir_combo.setToolTip(
-            "Which stripe orientation to remove.\n"
-            "Auto (default): detect per tile.\n"
-            "Horizontal / Vertical: force it if Auto guesses wrong.\n\n"
-            "Note: orientation is judged in the raw CAMERA frame, before the\n"
-            "tile is rotated to stage — so it may look 90° off vs the final image."
+            "Direction of the stripes to remove. 'Dir: Auto' (default)\n"
+            "works it out from the tile orientation chosen for this\n"
+            "microscope. Choose 'Dir: Horizontal' or 'Dir: Vertical' only\n"
+            "if 'Preview…' shows stripes left behind. Directions refer to\n"
+            "the raw camera image, which can look rotated 90° from the\n"
+            "stitched result."
         )
         self._destripe_dir_combo.setEnabled(False)
 
@@ -1122,8 +1084,10 @@ class StitchingDialog(PersistentDialog):
         self._destripe_params: Dict[str, Any] = {}
         self._destripe_settings_btn = QPushButton("Settings…")
         self._destripe_settings_btn.setToolTip(
-            "Tune the destripe filter: sigma (strength), wavelet level/type,\n"
-            "and the foreground/background split."
+            "Adjust the destripe filter strength and its other settings.\n"
+            "Change them only if stripes remain or real structure is being\n"
+            "smoothed away; 'Preview…' lets you try them on a real tile.\n"
+            "Saved for the selected acquisition's microscope."
         )
         self._destripe_settings_btn.setEnabled(False)
         self._destripe_settings_btn.clicked.connect(self._on_destripe_settings)
@@ -1134,8 +1098,10 @@ class StitchingDialog(PersistentDialog):
         # split shifts the result between tiles) are invisible in the mosaic.
         self._destripe_preview_btn = QPushButton("Preview…")
         self._destripe_preview_btn.setToolTip(
-            "See the filter applied to one tile plane, before and after,\n"
-            "updating live as you change the settings. Pick a tile, scrub Z."
+            "Shows one plane of a tile from the selected acquisition before\n"
+            "and after destriping, updating as you change the settings.\n"
+            "Pick a tile with visible detail and move the 'Z plane' slider.\n"
+            "Click OK to use those settings for the run."
         )
         self._destripe_preview_btn.setEnabled(False)
         self._destripe_preview_btn.clicked.connect(self._on_destripe_preview)
@@ -1151,25 +1117,26 @@ class StitchingDialog(PersistentDialog):
 
         self._content_fusion_cb = QCheckBox("Content-based blending \u2731")
         self._content_fusion_cb.setToolTip(
-            "\u2731 Weights tile overlaps by local sharpness\n"
-            "(Preibisch local-variance, inspired by BigStitcher).\n\n"
-            "Improves fusion quality in overlap regions.\n\n"
-            "COST: Adds two NaN Gaussian filters per output chunk on\n"
-            "float32 — the fuse-store step becomes CPU-bound and can\n"
-            "be 5-10× slower than the default cosine blending. On a\n"
-            "66-tile TB-scale acquisition that's multiple hours of\n"
-            "fusion instead of ~10 min.\n\n"
-            "Leave off unless you've visually confirmed seams need it."
+            "Gives the sharper tile more weight in each overlap. Only used\n"
+            "when 'Tile overlap' is 'Blend' (grayed out otherwise). Can make\n"
+            "fusion many times slower. Leave it off unless Blend seams still\n"
+            "look soft or uneven."
         )
         proc_layout.addWidget(self._content_fusion_cb, 0, 2, 1, 2)
+        # Content-based weights only shape a BLEND; with Maximum or Brightest
+        # tile the pipeline ignores them (pipeline.py, content_based).
+        self._tile_fusion_combo.currentIndexChanged.connect(
+            lambda _i: self._content_fusion_cb.setEnabled(
+                self._tile_fusion_combo.currentData() == "blend"
+            )
+        )
+        self._content_fusion_cb.setEnabled(
+            self._tile_fusion_combo.currentData() == "blend"
+        )
 
         # Proc Row 1: Deconvolution + Flat-field
+        # Its tooltip is set by _update_preprocessing_availability.
         self._deconv_cb = QCheckBox("Deconvolution \u2731")
-        self._deconv_cb.setToolTip(
-            "\u2731 GPU Richardson-Lucy deconvolution per tile.\n"
-            "Requires pycudadecon or RedLionfish.\n\n"
-            "Significantly improves resolution."
-        )
         proc_layout.addWidget(self._deconv_cb, 1, 0)
 
         self._flat_field_cb = QCheckBox("Flat-field correction")
@@ -1178,20 +1145,22 @@ class StitchingDialog(PersistentDialog):
 
         self._ozx_cb = QCheckBox("Package as .ozx")
         self._ozx_cb.setToolTip(
-            "Create a single .ozx ZIP file from the OME-Zarr output\n"
-            "for easy sharing/copying"
+            "Also saves the result as one .ozx file, which is easier to\n"
+            "copy or send than a folder of many files. Available only when\n"
+            "'Output format' is 'OME-Zarr Sharded' or 'Both (Sharded + TIFF)'.\n"
+            "The .ome.zarr folder is kept, so this needs the same disk space\n"
+            "again."
         )
         proc_layout.addWidget(self._ozx_cb, 1, 2)
 
         self._tiff_pyramids_cb = QCheckBox("TIFF pyramids")
         self._tiff_pyramids_cb.setChecked(True)
         self._tiff_pyramids_cb.setToolTip(
-            "Write multi-resolution pyramid SubIFDs in the OME-TIFF output.\n\n"
-            "UNCHECK for ImarisFileConverter compatibility.\n"
-            "ImarisFileConverter may misread SubIFD pyramids as extra Z\n"
-            "planes, collapsing all real data into the first Z layer.\n\n"
-            "Pyramids help napari and QuPath viewing but are not required\n"
-            "for Fiji or Imaris (.ims has its own pyramid format)."
+            "Adds lower-resolution copies inside the OME-TIFF so napari and\n"
+            "QuPath can zoom quickly. Uncheck it if you will convert the file\n"
+            "with ImarisFileConverter, which can misread them as extra Z\n"
+            "planes. Available only when 'Output format' is 'OME-TIFF\n"
+            "(single file)' or 'Both (Sharded + TIFF)'."
         )
         proc_layout.addWidget(self._tiff_pyramids_cb, 1, 3)
 
@@ -1205,17 +1174,13 @@ class StitchingDialog(PersistentDialog):
         ):
             self._intensity_adjust_combo.addItem(label, value)
         self._intensity_adjust_combo.setToolTip(
-            "Per-tile brightness matching, ported from BigStitcher's Intensity\n"
-            "Adjustment and checked against BigStitcher's own code.\n\n"
-            "Fits output = a × input + b for each tile from the intensities\n"
-            "that overlapping tiles share, so correctly placed tiles stop\n"
-            "meeting at a brightness step (laser drift over a long run,\n"
-            "bleaching of each overlap by the tile that imaged it first).\n\n"
-            "Measure only: logs a and b for every tile and fuses unchanged.\n"
-            "Apply: fuses the adjusted tiles.\n\n"
-            "Works on the tiles after registration, before tile fusion.\n"
-            "Its parameters (BigStitcher's, with BigStitcher's defaults)\n"
-            "are per-microscope settings in the Options tab."
+            "Evens out brightness differences between tiles (laser drift,\n"
+            "bleaching over a long run) so tiles don't meet at a brightness\n"
+            "step.\n"
+            "'Measure only': logs each tile's correction and fuses unchanged;\n"
+            "use it to see whether correction is needed.\n"
+            "'Apply': fuses the corrected tiles.\n"
+            "Fine-tune it per microscope on the 'Options' tab."
         )
         _ia_box = QHBoxLayout()
         _ia_box.setContentsMargins(0, 0, 0, 0)
@@ -1243,12 +1208,11 @@ class StitchingDialog(PersistentDialog):
 
         self._skip_reg_cb = QCheckBox("Skip registration")
         self._skip_reg_cb.setToolTip(
-            "Use stage positions only \u2014 skip phase-correlation registration.\n\n"
-            "CHECK this when:\n"
-            "  \u2022 Tiles have no overlap\n"
-            "  \u2022 Stage positions are precise\n\n"
-            "UNCHECK (default) when:\n"
-            "  \u2022 Tiles overlap and you need sub-pixel alignment"
+            "Place tiles by stage position only, without measuring their\n"
+            "overlaps. Check it when tiles don't overlap, or for a fast test\n"
+            "run (registration can take hours). Leave unchecked (default)\n"
+            "for normal runs. The registration settings below are grayed\n"
+            "out while it is checked."
         )
         self._skip_reg_cb.toggled.connect(self._on_skip_reg_toggled)
         reg_layout.addWidget(self._skip_reg_cb, 0, 0, 1, 2)
@@ -1270,21 +1234,13 @@ class StitchingDialog(PersistentDialog):
         self._reg_binning_xy_combo = QComboBox()
         for _label, _value in [("1x", 1), ("2x", 2), ("4x", 4), ("8x", 8)]:
             self._reg_binning_xy_combo.addItem(_label, _value)
-        from flamingo_stitcher.pipeline import (
-            REGISTRATION_OVERLAP_TARGET_PX as _OVERLAP_PX,
-        )
-
         self._reg_binning_xy_combo.setToolTip(
-            "How much to bin tiles laterally for phase correlation.\n"
-            f"Applied AFTER the XY downsample, as a maximum: the run lowers it\n"
-            f"so the downsampled tile overlap keeps at least {_OVERLAP_PX} px\n"
-            "(the log shows the value used).\n"
-            "Applied to BOTH X and Y — a lateral peak is one joint\n"
-            "correlation, so splitting them further would not buy anything.\n\n"
-            "Cost scales with the square of this: 2x is a quarter of the work\n"
-            "of 1x. 4x (default) is enough for the lateral shifts a stage\n"
-            "makes; drop to 2x or 1x only if the seam report shows XY\n"
-            "disagreement."
+            "How much tiles are shrunk in X and Y before registration\n"
+            "compares them. Higher is faster (2x is about a quarter of the\n"
+            "work of 1x); lower measures X/Y more finely. 4x (default) suits\n"
+            "most runs; try 2x or 1x if the registration report shows seams\n"
+            "disagreeing in X/Y. It is a maximum: the run uses less when the\n"
+            "tile overlap would get too thin (the log shows the value used)."
         )
         rb_layout.addWidget(self._reg_binning_xy_combo)
         rb_layout.addSpacing(16)  # visible gap between the XY group and Z group
@@ -1299,90 +1255,41 @@ class StitchingDialog(PersistentDialog):
         self._reg_z_voxel_um = None
         self._rebuild_reg_z_choices(None, keep=20.0)
         self._reg_z_spacing_combo.setToolTip(
-            "The Z spacing registration compares tiles on. Planes are averaged\n"
-            "in groups to reach it, so the same choice means the same Z\n"
-            "resolution at any Z step; the run log shows the planes used.\n\n"
-            "This sets the FLOOR on Z precision: each seam's Z shift resolves to\n"
-            "about half the spacing.\n\n"
-            "COST: registration time and memory both grow with the planes\n"
-            "compared. Every plane of a 2.5 µm stack is 8x the work of 20 µm,\n"
-            "and one seam of a 2999-plane tile at XY 2x needs ~35 GB of RAM\n"
-            "instead of ~4 GB. The line below the registration settings gives\n"
-            "the rough time and memory for the acquisitions in the queue, and\n"
-            "the memory estimate and queue time include it.\n\n"
-            "Cheaper first: 'Refine Z alignment' runs a second pass on every\n"
-            "plane with coarser XY and keeps only its Z result."
+            "Registration compares tiles at this Z spacing, averaging planes\n"
+            "to reach it. Default 20 µm. Finer spacing measures Z more\n"
+            "precisely but costs more time and memory: the 'Registration Z'\n"
+            "line at the bottom of this box shows the cost for the queued\n"
+            "acquisitions. Each seam's Z is measured in steps of this\n"
+            "spacing times 'Peak refinement' (half the spacing at the\n"
+            "default)."
         )
         rb_layout.addWidget(self._reg_z_spacing_combo)
         rb_layout.addStretch(1)
         reg_layout.addLayout(rb_layout, 0, 3)
         self._set_registration_binning({"y": 4, "x": 4})
 
-        # Proc Row 3: Max registration shift (registration sub-option; only
-        # meaningful when registration runs, so it greys out with Skip reg).
-        self._max_reg_shift_label = QLabel("Max reg. shift:")
-        reg_layout.addWidget(self._max_reg_shift_label, 1, 0)
-        self._max_reg_shift_spin = _NoScrollDoubleSpinBox()
-        self._max_reg_shift_spin.setRange(0.0, 100000.0)
-        self._max_reg_shift_spin.setDecimals(1)
-        self._max_reg_shift_spin.setSingleStep(5.0)
-        self._max_reg_shift_spin.setSuffix(" µm")
-        # 0 shows "Auto" — the pipeline then uses one overlap width as the cap.
-        self._max_reg_shift_spin.setSpecialValueText("Auto (one overlap)")
-        self._max_reg_shift_spin.setValue(0.0)
-        self._max_reg_shift_spin.setToolTip(
-            "Cap how far registration may move a tile from its stage position.\n\n"
-            "multiview-stitcher bounds a phase-correlation shift to the tile SIZE,\n"
-            "not the overlap, so a low-content tile (background / featureless blur)\n"
-            "can be flung ~a full tile away and open a gap. Tiles whose correction\n"
-            "exceeds this cap are reset to their stage position.\n\n"
-            "Auto (0) = the smaller of the X/Y overlap widths, so a tile can never\n"
-            "move more than one overlap (gaps impossible). Set a smaller value to\n"
-            "allow only fine refinement. Ignored when Skip registration is on."
+        # Shift limits are a fact about the instrument, so they are set per
+        # microscope and objective on the Options tab only. Two places for one
+        # setting meant the saved profile silently replaced what was typed here.
+        self._shift_limits_note = QLabel(
+            "Shift limits: set on the Options tab ('Maximum lateral correction', "
+            "'Maximum axial correction')."
         )
-        reg_layout.addWidget(self._max_reg_shift_spin, 1, 1)
-
-        # Proc Row 4: axial registration controls. Z is separated from the
-        # lateral cap above because the two are not the same measurement: the
-        # lateral bound is a tile overlap width, and a mosaic tiled only in X/Y
-        # has no Z overlap to derive a bound from.
-        self._max_reg_shift_z_label = QLabel("Max Z shift:")
-        reg_layout.addWidget(self._max_reg_shift_z_label, 1, 2)
-        self._max_reg_shift_z_spin = _NoScrollDoubleSpinBox()
-        self._max_reg_shift_z_spin.setRange(0.0, 100000.0)
-        self._max_reg_shift_z_spin.setDecimals(1)
-        self._max_reg_shift_z_spin.setSingleStep(5.0)
-        self._max_reg_shift_z_spin.setSuffix(" µm")
-        self._max_reg_shift_z_spin.setSpecialValueText("Auto")
-        self._max_reg_shift_z_spin.setValue(0.0)
-        self._max_reg_shift_z_spin.setToolTip(
-            "Cap how far registration may move a tile along Z.\n\n"
-            "Separate from 'Max reg. shift', which bounds X/Y. They cannot share\n"
-            "a number: the lateral cap is one tile OVERLAP width, and tiles that\n"
-            "only tile in X/Y all span the same depth — there is no Z overlap to\n"
-            "derive a bound from, so the lateral value would be arbitrary in Z.\n\n"
-            "Auto (0) = at least 8 Z steps and never under 25 µm (enough for the\n"
-            "few-frame stage/focus drift seen in practice), capped at a quarter of\n"
-            "the stack so a peak found halfway down the volume is still rejected.\n\n"
-            "A tile clamped in Z was NOT measured — it kept its stage position.\n"
-            "The registration report says which tiles those were."
+        self._shift_limits_note.setWordWrap(True)
+        self._shift_limits_note.setToolTip(
+            "How far registration may move a tile is set per microscope and "
+            "objective on the Options tab. Leave both at Auto unless the log's "
+            "'Pairwise shift bounds' line shows real seams being dropped."
         )
-        reg_layout.addWidget(self._max_reg_shift_z_spin, 1, 3)
+        reg_layout.addWidget(self._shift_limits_note, 1, 0, 1, 4)
 
         self._z_refine_cb = QCheckBox("Refine Z alignment ✱")
         self._z_refine_cb.setToolTip(
-            "Run a second registration pass whose only job is Z.\n\n"
-            "The main pass compares planes at the 'Z spacing' setting, and\n"
-            "multiview-stitcher refines a 3-D match to only half a voxel, so Z\n"
-            "resolves to about half that spacing while X/Y resolve a fraction\n"
-            "of a pixel. This pass re-registers from the first pass's result on\n"
-            "EVERY plane, with XY binned 4x, refines to a tenth of a plane, and\n"
-            "contributes ONLY its Z component; X/Y stay as the first pass set\n"
-            "them.\n\n"
-            "Cost: a second pass over every seam on every plane. The cost line\n"
-            "below, the memory estimate and the queue time include it. Turn it\n"
-            "on when registration_seams.csv shows pairs disagreeing in Z while\n"
-            "X/Y is clean."
+            "Adds a second registration pass, on every Z plane, that\n"
+            "corrects only Z; X/Y stay as the first pass set them. Turn it\n"
+            "on when the registration report (registration_seams.csv) shows\n"
+            "neighboring tiles disagreeing in Z while X/Y line up. The\n"
+            "'Registration Z' line and the queue time include its cost."
         )
         reg_layout.addWidget(self._z_refine_cb, 2, 0, 1, 2)
 
@@ -1395,11 +1302,12 @@ class StitchingDialog(PersistentDialog):
         self._z_refine_range_spin.setSuffix(" µm")
         self._z_refine_range_spin.setValue(40.0)
         self._z_refine_range_spin.setToolTip(
-            "Half-width of the Z-refinement search.\n\n"
-            "A correction that comes back AT this limit is a lower bound on the\n"
-            "error, not the error, so it is rejected — the tile keeps its\n"
-            "first-pass Z and the report counts it separately. Widening the search\n"
-            "is the fix, not trusting the number."
+            "How far (± µm) 'Refine Z alignment' searches in Z; used only\n"
+            "when that box is checked. Default ±40 µm. It never searches\n"
+            "past the Z shift limit ('Maximum axial correction' on the\n"
+            "'Options' tab). A tile whose correction lands at the limit\n"
+            "keeps its first-pass Z (the log counts these). If many do,\n"
+            "raise this and, if needed, 'Maximum axial correction'."
         )
         reg_layout.addWidget(self._z_refine_range_label, 2, 2)
         reg_layout.addWidget(self._z_refine_range_spin, 2, 3)
@@ -1409,35 +1317,25 @@ class StitchingDialog(PersistentDialog):
         self._approach_combo.addItem("Default", "default")
         self._approach_combo.addItem("Center XY Start", "center_xy")
         self._approach_combo.setToolTip(
-            "How the mosaic is assembled from the measured seams.\n\n"
-            "Default — multiview-stitcher's own behaviour: each connected group\n"
-            "of tiles is solved on its own, and a tile with no registered seam\n"
-            "keeps its raw stage position while its neighbours move. On a\n"
-            "rectangular collection around a round sample the empty rim can\n"
-            "never register, so it both tears its seam with the mosaic and\n"
-            "drags the registered-seam share under the trust guard.\n\n"
-            "Center XY Start — anchors the solve at the centre-most tile, so\n"
-            "error accumulates outward from the middle of the sample, and then\n"
-            "CARRIES every tile outside the registered core to the mean\n"
-            "correction of its adjacent placed tiles. A carried tile keeps the\n"
-            "overlap the stage gave it, so no black gap opens between any pair,\n"
-            "and the seam-share guard is not the deciding factor.\n\n"
-            "Both solve all seams simultaneously — neither places tiles one at\n"
-            "a time, which is what would make an L of neighbours impossible to\n"
-            "satisfy. Tiles whose seams still disagree are logged as ERROR."
+            "How tiles are placed from the measured seams.\n"
+            "'Default': tiles with no usable seam move with the main\n"
+            "registered group. If fewer seams register than 'Minimum share\n"
+            "of seams that must register' ('Options' tab), registration is\n"
+            "not applied and all tiles use stage positions.\n"
+            "'Center XY Start': starts from the center tile and places each\n"
+            "unregistered tile from its placed neighbors, without that\n"
+            "minimum-share check. Use it for a round or partial sample on a\n"
+            "rectangular grid, where the edge tiles are empty."
         )
         reg_layout.addWidget(self._approach_combo, 4, 1, 1, 3)
 
         self._verbose_align_cb = QCheckBox("Verbose alignment log")
         self._verbose_align_cb.setChecked(True)
         self._verbose_align_cb.setToolTip(
-            "Log every tile's placement and every seam's measurement, in full.\n\n"
-            "The summary report elides — five worst corrections, ten unused\n"
-            "seams, '... and 32 more (see registration_seams.csv)'. That is the\n"
-            "right length for a run that worked and the wrong length for one\n"
-            "that did not, and the CSVs live on this machine while the log is\n"
-            "what gets shared.\n\n"
-            "Costs one line per tile and one per adjacent pair."
+            "Writes every tile's placement and every seam's measurement to\n"
+            "the log, not just a summary. Leave on (default) so a log you\n"
+            "share has the full detail if a run needs diagnosing; turn off\n"
+            "for a shorter log."
         )
         reg_layout.addWidget(self._verbose_align_cb, 5, 0, 1, 4)
 
@@ -1452,37 +1350,33 @@ class StitchingDialog(PersistentDialog):
         self._solve_tol_spin.setValue(3.5)
         self._solve_tol_spin.setSuffix(" reg. px")
         self._solve_tol_spin.setToolTip(
-            "How far a seam's measurement may disagree with where the solve puts\n"
-            "its two tiles before the seam is dropped, in registration pixels.\n"
-            "The line below and the run log give it in µm (registration pixel x\n"
-            "this, never less than one registration voxel's diagonal).\n\n"
-            "Lower: trust fewer seams. A row can end up hanging on ONE seam to\n"
-            "the row above (2026-10-18: the bottom row kept 1 of 4 Y-seams that\n"
-            "all passed the quality threshold).\n"
-            "Higher: keep more seams and AVERAGE their disagreement, which\n"
-            "spreads the error over the row instead of removing it.\n\n"
-            "No extra time or memory; the solve is a small part of registration."
+            "How far a seam may disagree with the solved tile positions\n"
+            "before it is dropped from the solve, in registration pixels\n"
+            "(default 3.5). A dropped seam no longer holds its two tiles\n"
+            "together. Raise it if the registration report shows many seams\n"
+            "pruned and a row held by only one seam; lower it if one bad\n"
+            "seam pulls tiles out of line.\n"
+            "The 'Registration Z' line shows the value in µm. It grows with\n"
+            "'Downsample' XY and 'Reg. binning' XY, and never goes below one\n"
+            "registration voxel (so at a coarse 'Z spacing', small changes\n"
+            "may have no effect). The same µm applies to Z, so a high value at\n"
+            "4x or more can hide Z errors: check the seams the registration\n"
+            "map marks as left visibly off."
         )
         reg_layout.addWidget(self._solve_tol_spin, 6, 1)
         self._solve_model_label = QLabel("Solve model:")
         reg_layout.addWidget(self._solve_model_label, 6, 2)
         self._solve_model_combo = QComboBox()
         self._solve_model_combo.addItem("Shift only", "translation")
-        self._solve_model_combo.addItem("Shift + rotation (rigid) ✱", "rigid")
+        self._solve_model_combo.addItem("Shift + rotation (rigid)", "rigid")
         self._solve_model_combo.setToolTip(
-            "What the global solve may do to each tile.\n\n"
-            "Shift only: every run so far. A tile is a block that can move.\n\n"
-            "Shift + rotation: each tile may also rotate slightly, inferred from\n"
-            "where its different neighbours' overlaps sit (as BigStitcher does).\n"
-            "This can absorb a tilt between rows -- on 2026-10-18 the Z offset\n"
-            "between the bottom two rows grew 105 -> 140 µm across four tiles,\n"
-            "which no shift can match.\n\n"
-            "✱ EXPERIMENTAL, not yet validated across datasets. A tilted tile is\n"
-            "resampled across Z planes in fusion (Snap Z cannot keep planes\n"
-            "intact for it). Tiles that were clamped or placed from their\n"
-            "neighbours stay shift-only. The log lists the rotations and flags\n"
-            "any too large to have come from the overlaps.\n\n"
-            "No extra time or memory."
+            "What the solve may do to each tile.\n"
+            "'Shift only' (default): tiles move but do not rotate.\n"
+            "'Shift + rotation (rigid)': tiles may also tilt slightly; try it\n"
+            "when rows sit at a Z offset that grows across the mosaic.\n"
+            "Experimental. Rotated tiles are resampled between Z planes even\n"
+            "with 'Snap Z shifts to whole planes' on. Check the rotations\n"
+            "listed in the log."
         )
         reg_layout.addWidget(self._solve_model_combo, 6, 3)
 
@@ -1497,20 +1391,10 @@ class StitchingDialog(PersistentDialog):
         self._z_snap_cb = QCheckBox("Snap Z shifts to whole planes")
         self._z_snap_cb.setChecked(True)
         self._z_snap_cb.setToolTip(
-            "Never place a tile between two acquired Z planes.\n\n"
-            "A Z step is ~10 µm where a pixel is ~1 µm, so a plane is the unit\n"
-            "the data arrives in, not a sample of a smooth axial signal.\n"
-            "multiview-stitcher fuses with linear interpolation, so a tile shifted\n"
-            "by a fraction of a plane is rebuilt from two acquired planes — across\n"
-            "the whole XY field, which is the plane you then analyse.\n\n"
-            "Measured on a single bright plane at a 10 µm step: 0.96 µm of shift\n"
-            "keeps 91% of the peak and bleeds 12% into the next plane, 2.72 µm\n"
-            "keeps 73%, half a plane keeps 51%. A whole-plane shift is exact.\n\n"
-            "ON snaps each tile to the nearest whole plane: at most half a plane\n"
-            "of placement accuracy, and no resampling. Z refinement makes\n"
-            "sub-plane shifts on purpose, so this is what keeps it honest.\n"
-            "Turn it off only when axial placement finer than one plane matters\n"
-            "more than keeping planes intact."
+            "Keeps every tile on whole Z planes, so no plane is blended from\n"
+            "two acquired planes. On (default) costs at most half a Z step\n"
+            "of placement accuracy. Turn it off only if placing tiles finer\n"
+            "than one Z step matters more than keeping planes intact."
         )
         reg_layout.addWidget(self._z_snap_cb, 3, 0, 1, 2)
 
@@ -1530,17 +1414,13 @@ class StitchingDialog(PersistentDialog):
         ]:
             self._reg_upsample_combo.addItem(_label, _value)
         self._reg_upsample_combo.setToolTip(
-            "How finely each seam's correlation peak is located, as a fraction of\n"
-            "a registration voxel (the Z spacing in Z, the binned pixel in XY).\n\n"
-            "The default, 1/2, is multiview-stitcher's own for 3-D: at a 10 µm Z\n"
-            "spacing each seam's Z shift moves in 5 µm steps, and a loop of seams\n"
-            "can miss by more than the solve tolerance from rounding alone, so\n"
-            "good seams get dropped. 1/10 locates it to 1 µm with the same data.\n\n"
-            "Measured on a synthetic pair offset by 3 planes and binned 4 in Z:\n"
-            "1/2 was off by a whole plane, 1/10 by 0.2 of a plane.\n\n"
-            "COST: about 1.1-1.2x the registration time, no extra memory. It\n"
-            "cannot find detail the Z spacing averaged away; for that, lower the\n"
-            "Z spacing. The cost line below and the queue time include it."
+            "How finely each seam's shift is measured, as a fraction of a\n"
+            "registration voxel ('Z spacing' in Z, the binned pixel in X/Y).\n"
+            "'1/2 voxel (default)' is the coarsest: at a 20 µm 'Z spacing' a\n"
+            "seam's Z moves in 10 µm steps, which can get good seams dropped\n"
+            "by 'Solve tolerance'. Choose '1/10 voxel' for finer shifts.\n"
+            "Adds up to about 20% registration time and no memory; the\n"
+            "'Registration Z' line shows the step size."
         )
         reg_layout.addWidget(self._reg_upsample_combo, 3, 3)
 
@@ -1567,18 +1447,12 @@ class StitchingDialog(PersistentDialog):
         )
         self._chunk_size_combo.setCurrentIndex(2)  # Large
         self._chunk_size_combo.setToolTip(
-            "Dask compute-chunk granularity for the fuse step.\n\n"
-            "This is internal to the fusion pipeline — it does NOT\n"
-            "affect the chunk size of the final OME-Zarr/Imaris output,\n"
-            "so pan/zoom performance in napari / Fiji / Imaris is\n"
-            "unchanged.\n\n"
-            "• Smaller chunks → less RAM per worker, more dask overhead\n"
-            "  (~47 graph tasks per chunk).\n"
-            "• Larger chunks → fewer scheduling decisions, faster fusion\n"
-            "  (7-8× fewer chunks from Small → XL).\n\n"
-            "Large (default) is a safe balance. Pick XL if the fuse\n"
-            "step is unexpectedly slow and you have RAM headroom.\n"
-            "Small helps on tight-RAM systems at the cost of throughput."
+            "Size of the blocks fusion works on. It does not change the\n"
+            "saved file's chunking or how fast viewers pan and zoom.\n"
+            "'Large (32 MB, 64×512×512)' (default) suits most runs. Choose\n"
+            "'XL (128 MB, 64×1024×1024)' if fusion is slow and you have\n"
+            "spare RAM; 'Small (4 MB, 32×256×256)' or 'Medium (16 MB,\n"
+            "128×256×256)' if memory runs short."
         )
         proc_layout.addWidget(self._chunk_size_combo, 5, 1, 1, 3)
 
@@ -1594,28 +1468,25 @@ class StitchingDialog(PersistentDialog):
         ):
             self._fusion_region_combo.addItem(_label, _gb)
         self._fusion_region_combo.setToolTip(
-            "How much of the output is fused at a time, when streaming.\n\n"
-            "The whole-output fuse lets dask's threaded scheduler hold far\n"
-            "more than n_workers blocks in flight \u2014 127 GB on a 623 GB\n"
-            "output \u2014 which the memory estimate does not model. Fusing in\n"
-            "regions bounds that, at the cost of re-fusing each region's\n"
-            "boundary: a 49-tile run fused in 81 regions.\n\n"
-            "The ~4 GB default was chosen against a machine that ran out of\n"
-            "memory. On a large-RAM system a bigger region should be faster;\n"
-            "by how much has NOT been measured. 'Whole output' restores the\n"
-            "unbounded path and can use far more RAM than the estimate says."
+            "When the run streams ('Memory mode' set to 'Streaming (low\n"
+            "memory)', or 'Auto' choosing it), fuse the output this many GB\n"
+            "at a time to keep memory in check. The ~4 GB default is\n"
+            "safest. On a large-RAM machine a bigger region may be faster\n"
+            "(not yet measured). 'Whole output (no regions)' can use far\n"
+            "more RAM than the memory estimate shows. Outputs under twice\n"
+            "the region size are always fused in one piece."
         )
         proc_layout.addWidget(self._fusion_region_combo, 6, 1, 1, 3)
 
         # Proc Row 7: Tile-border artifact QC (diagnostic)
         self._border_qc_cb = QCheckBox("Detect border artifacts (QC)")
         self._border_qc_cb.setToolTip(
-            "After preprocessing, scan neighboring-tile seams for sharp\n"
-            "intensity steps (stitching artifacts). Writes a plain-text report\n"
-            "next to the run log listing the offending tile pairs. Reference\n"
-            "channel only; cheap (reads only the thin border strips).\n\n"
-            "Most sensitive at downsample_xy \u2264 2 \u2014 heavy downsampling softens\n"
-            "single-pixel steps."
+            "After preprocessing, checks the seams between neighboring\n"
+            "tiles for sharp brightness steps and writes a text report, next\n"
+            "to the run log file, listing the tile pairs affected. Turn it\n"
+            "on when the stitched image shows visible seams. Checks the\n"
+            "registration channel only; quick. Most sensitive at\n"
+            "'Downsample' XY 1x or 2x."
         )
         proc_layout.addWidget(self._border_qc_cb, 8, 0)
         self._border_qc_label = QLabel("QC detail:")
@@ -1625,24 +1496,25 @@ class StitchingDialog(PersistentDialog):
         self._border_qc_mode_combo.addItem("Full (area + Z-range)", "full")
         self._border_qc_mode_combo.addItem("Pairs only", "pairs")
         self._border_qc_mode_combo.setToolTip(
-            "MIP length: Z max-project, report affected border length (fast).\n"
-            "Full: per-Z area + Z-range (richer; slower at native resolution).\n"
-            "Pairs only: just the list of offending tile pairs."
+            "How much the border QC report says.\n"
+            "'MIP length (fast)': length of each bad seam, from a Z max\n"
+            "projection. Enough to find which seams are bad.\n"
+            "'Full (area + Z-range)': also which Z planes are affected;\n"
+            "slower at full resolution.\n"
+            "'Pairs only': just the list of tile pairs.\n"
+            "Used only with 'Detect border artifacts (QC)' checked."
         )
         proc_layout.addWidget(self._border_qc_mode_combo, 8, 2)
 
         self._reg_report_cb = QCheckBox("Registration report")
         self._reg_report_cb.setChecked(True)
         self._reg_report_cb.setToolTip(
-            "Write registration_report.csv, registration_seams.csv and\n"
-            "registration_report.txt into the output folder, beside\n"
-            "stitch_metadata.json.\n\n"
-            "Registration is the one step whose effect is invisible in the output:\n"
-            "it either silently helped or silently hurt. These say how far each\n"
-            "tile moved, which seams were used, and which corrections were\n"
-            "rejected as implausible.\n\n"
-            "Stays on even with Skip registration — the report then says the tiles\n"
-            "were never registered, which is the thing worth knowing."
+            "Writes registration_report.txt, registration_report.csv and\n"
+            "registration_seams.csv into the output folder: how far each\n"
+            "tile moved, which seams were used and which were rejected.\n"
+            "Leave on (default); the files are small. With 'Skip\n"
+            "registration' checked, the report records that tiles were\n"
+            "placed by stage position."
         )
         proc_layout.addWidget(self._reg_report_cb, 8, 3)
 
@@ -1692,9 +1564,9 @@ class StitchingDialog(PersistentDialog):
             # preview but keep numeric background zeroing fully functional.
             self._bg_zero_panel._preview_btn.setEnabled(False)
             self._bg_zero_panel._preview_btn.setToolTip(
-                "Live preview requires napari (not installed in this build).\n"
-                "Background zeroing still works — set thresholds numerically.\n"
-                'Install with: pip install "flamingo-stitcher[preview]"'
+                "Live preview needs napari, which this build does not include.\n"
+                "Background zeroing still works: type each channel's value in\n"
+                "the 'Threshold (uint16)' column."
             )
         content_layout.addWidget(self._bg_zero_panel)
 
@@ -1705,13 +1577,17 @@ class StitchingDialog(PersistentDialog):
 
         self._run_btn = QPushButton("Run All")
         self._run_btn.setToolTip(
-            "Process all pending directories in the queue sequentially"
+            "Stitch every Pending item in the queue, one after another."
         )
         self._run_btn.setEnabled(False)
         self._run_btn.clicked.connect(self._on_run)
         btn_layout.addWidget(self._run_btn)
 
         self._cancel_btn = QPushButton("Cancel")
+        self._cancel_btn.setToolTip(
+            "Stop the run in progress and mark the remaining Pending items\n"
+            "Cancelled. Use 'Re-queue' to run them again later."
+        )
         self._cancel_btn.setEnabled(False)
         self._cancel_btn.clicked.connect(self._on_cancel)
         btn_layout.addWidget(self._cancel_btn)
@@ -1720,9 +1596,10 @@ class StitchingDialog(PersistentDialog):
 
         self._setup_env_btn = QPushButton("Set up flat-field…")
         self._setup_env_btn.setToolTip(
-            "One-click install of flat-field correction (basicpy).\n\n"
-            "Downloads a self-contained environment (~1–2 GB) — no Python\n"
-            "or technical setup required, just internet. CPU only; needed once."
+            "Installs what 'Flat-field correction' needs, once. Needs\n"
+            "internet and about 2-4 GB of disk; you'll be asked where to\n"
+            "install it. No GPU needed. Click this if 'Flat-field\n"
+            "correction' is grayed out."
         )
         self._setup_env_btn.clicked.connect(self._on_setup_env)
         # The earlier _update_preprocessing_availability() (when the flat-field
@@ -1739,10 +1616,10 @@ class StitchingDialog(PersistentDialog):
 
         self._help_btn = QPushButton("Help / Troubleshooting")
         self._help_btn.setToolTip(
-            "Hardware requirements, disk/RAM planning, and a diagnostic\n"
-            "matrix for stuck or slow runs. Opens\n"
-            "docs/stitching_hardware_troubleshooting.md in your default\n"
-            "markdown/text viewer."
+            "Opens the hardware and troubleshooting guide: disk and RAM\n"
+            "planning, and what to check when a run is stuck or slow. Opens\n"
+            "in your Markdown or text viewer, or on GitHub in your browser\n"
+            "if no local copy is found."
         )
         self._help_btn.clicked.connect(self._on_open_help_doc)
         btn_layout.addWidget(self._help_btn)
@@ -1763,6 +1640,10 @@ class StitchingDialog(PersistentDialog):
             "QPushButton:checked { background-color: #dbe7f3; "
             "border-color: #7aa7d0; }"
         )
+        self._log_toggle.setToolTip(
+            "Show or hide the run log. The full log of each session is\n"
+            "also saved in the app's logs folder."
+        )
         self._log_toggle.toggled.connect(self._on_log_toggle)
         layout.addWidget(self._log_toggle)
 
@@ -1781,10 +1662,10 @@ class StitchingDialog(PersistentDialog):
         log_opts_row.addWidget(self._verbose_log_cb)
         self._timestamp_log_cb = QCheckBox("Timestamps")
         self._timestamp_log_cb.setToolTip(
-            "Prefix each new log line with a compact date + time to the minute\n"
-            "(MM-DD HH:MM), so you can see when a line was printed — handy on\n"
-            "long runs where progress lines repeat with only the ETA changing.\n"
-            "Applies to lines printed from now on; takes effect immediately."
+            "Prefix each new log line with a compact date and time to the\n"
+            "minute (MM-DD HH:MM), so you can see when a line was printed.\n"
+            "Handy on long runs where progress lines repeat with only the\n"
+            "ETA changing. Applies to lines printed from now on."
         )
         log_opts_row.addWidget(self._timestamp_log_cb)
         log_opts_row.addStretch()
@@ -2219,6 +2100,11 @@ class StitchingDialog(PersistentDialog):
         self._output_dir_edit.setPlaceholderText(
             "Shared output folder (each acquisition gets a subfolder)..."
         )
+        self._output_dir_edit.setToolTip(
+            "Folder for the stitched results; each acquisition gets its own\n"
+            "subfolder. Required before 'Run All'. The line below shows the\n"
+            "expected output size and the free space on that drive."
+        )
         self._output_dir_edit.textChanged.connect(self._update_output_info)
         row.addWidget(self._output_dir_edit)
         out_browse_btn = QPushButton("Browse...")
@@ -2251,10 +2137,9 @@ class StitchingDialog(PersistentDialog):
         self._voxel_readout_label = QLabel("")
         self._voxel_readout_label.setStyleSheet("color: #444; font-size: 11px;")
         self._voxel_readout_label.setToolTip(
-            "Native voxel (XY pixel × XY pixel × Z step) from the fields\n"
-            "above, then the resulting output voxel after applying the\n"
-            "chosen downsample factors. For 'iso', the factors are\n"
-            "resolved from the native voxel and shown in parentheses."
+            "Native voxel size (from 'Pixel size (µm)' and 'Z step (µm)')\n"
+            "and the output voxel size after 'Downsample'. With 'iso', the\n"
+            "XY and Z factors it picks are shown in parentheses."
         )
         info_row.addWidget(self._voxel_readout_label)
         info_row.addStretch()
@@ -3119,15 +3004,11 @@ class StitchingDialog(PersistentDialog):
             self._reg_binning_label,
         ):
             _widget.setEnabled(not checked)
-        # Max reg. shift only applies when registration runs.
-        self._max_reg_shift_spin.setEnabled(not checked)
-        self._max_reg_shift_label.setEnabled(not checked)
+        self._shift_limits_note.setEnabled(not checked)
         # Same for the axial controls. The report checkbox deliberately stays
         # live: with registration skipped it writes a file saying the tiles were
         # never registered, which is exactly the fact that went unnoticed for
         # months.
-        self._max_reg_shift_z_spin.setEnabled(not checked)
-        self._max_reg_shift_z_label.setEnabled(not checked)
         self._z_refine_cb.setEnabled(not checked)
         self._z_refine_range_label.setEnabled(not checked)
         self._z_refine_range_spin.setEnabled(not checked)
@@ -3561,12 +3442,18 @@ class StitchingDialog(PersistentDialog):
                 "font-weight: bold; font-size: 10px; "
                 "border-radius: 8px; padding: 1px 3px; }"
             )
+            if will_stream:
+                _advice = "Raise 'Downsample' XY to reduce memory."
+            else:
+                _advice = (
+                    "Set 'Memory mode' to 'Streaming (low memory)' "
+                    f"(~{est['streaming_gb']:.1f} GB peak) or raise 'Downsample' XY."
+                )
             self._memory_indicator.setToolTip(
                 f"<b>Out of memory risk!</b><br>"
                 f"Estimated peak: ~{peak_gb:.0f} GB ({mode_name})<br>"
                 f"System RAM: {sys_ram:.0f} GB<br><br>"
-                f"Switch to <b>Streaming</b> mode (~{est['streaming_gb']:.1f} GB peak) "
-                f"or increase downsample factor."
+                f"{_advice}"
             )
         elif ratio > 0.70:
             # Orange — tight, might work but risky
@@ -3580,8 +3467,8 @@ class StitchingDialog(PersistentDialog):
                 f"<b>Memory is tight</b><br>"
                 f"Estimated peak: ~{peak_gb:.0f} GB ({mode_name})<br>"
                 f"System RAM: {sys_ram:.0f} GB ({ratio*100:.0f}% usage)<br><br>"
-                f"Should work but leave little room for other applications.<br>"
-                f"Streaming mode would use ~{est['streaming_gb']:.1f} GB."
+                f"Should work but leaves little room for other programs.<br>"
+                f"'Streaming (low memory)' would use ~{est['streaming_gb']:.1f} GB."
             )
         else:
             # Green — comfortable
@@ -3672,8 +3559,6 @@ class StitchingDialog(PersistentDialog):
         config.content_based_fusion = self._content_fusion_cb.isChecked()
         config.intensity_adjustment = self._intensity_adjust_combo.currentData()
         config.skip_registration = self._skip_reg_cb.isChecked()
-        config.max_registration_shift_um = float(self._max_reg_shift_spin.value())
-        config.max_registration_shift_z_um = float(self._max_reg_shift_z_spin.value())
         config.registration_z_refine = self._z_refine_cb.isChecked()
         config.registration_z_snap_to_plane = self._z_snap_cb.isChecked()
         config.stitching_approach = self._approach_combo.currentData()
@@ -4074,12 +3959,6 @@ class StitchingDialog(PersistentDialog):
             applied += self._set_combo_by_data(self._fusion_combo, "separate")
 
         # Spin-box value fields.
-        if has("max_registration_shift_um"):
-            self._max_reg_shift_spin.setValue(float(cfg["max_registration_shift_um"]))
-        if has("max_registration_shift_z_um"):
-            self._max_reg_shift_z_spin.setValue(
-                float(cfg["max_registration_shift_z_um"])
-            )
         if has("registration_z_refine_range_um"):
             self._z_refine_range_spin.setValue(
                 float(cfg["registration_z_refine_range_um"])
@@ -4500,6 +4379,7 @@ class StitchingDialog(PersistentDialog):
         self._batch_running = True
         self._mem_wait_popup_shown = False
         self._set_flamingos_marching(True)
+        self.run_state_changed.emit(True)
         self._batch_config = config
         self._batch_channels = self._parse_channels()
         self._batch_results = []
@@ -5679,6 +5559,7 @@ class StitchingDialog(PersistentDialog):
 
         self._batch_running = False
         self._set_flamingos_marching(False)
+        self.run_state_changed.emit(False)
         self._queue_index = -1
         self._batch_config = None
         self._batch_channels = None
@@ -5779,10 +5660,11 @@ class StitchingDialog(PersistentDialog):
     def _on_format_changed(self, _index=None):
         """Update compression options and .ozx/pyramid toggles for selected format."""
         fmt = self._format_combo.currentData()
-        has_zarr = fmt in ("ome-zarr-sharded", "ome-zarr-v2", "both")
         has_tiff = fmt in ("ome-tiff", "both")
-        self._ozx_cb.setEnabled(has_zarr)
-        if not has_zarr:
+        # .ozx is only packaged from the sharded OME-Zarr writer.
+        has_ozx = fmt in ("ome-zarr-sharded", "both")
+        self._ozx_cb.setEnabled(has_ozx)
+        if not has_ozx:
             self._ozx_cb.setChecked(False)
         # TIFF pyramids toggle only relevant for TIFF output
         if hasattr(self, "_tiff_pyramids_cb"):
@@ -5993,15 +5875,16 @@ class StitchingDialog(PersistentDialog):
         if _ff_available():
             self._flat_field_cb.setEnabled(True)
             self._flat_field_cb.setToolTip(
-                "Estimate and correct illumination non-uniformity\n"
-                "from tile data (BaSiC algorithm, no calibration needed).\n"
-                "Improves tile intensity consistency and reduces seams."
+                "Corrects uneven brightness across each tile's field of view,\n"
+                "estimated from the tiles themselves (no calibration images\n"
+                "needed). Turn it on when the same bright or dark pattern\n"
+                "repeats in every tile, or tiles meet at brightness seams."
             )
         else:
             self._flat_field_cb.setChecked(False)
             self._flat_field_cb.setEnabled(False)
             self._flat_field_cb.setToolTip(
-                "Flat-field correction requires basicpy.\n"
+                "Flat-field correction is not installed yet.\n"
                 "Click 'Set up flat-field…' to install it\n"
                 "in an isolated environment."
             )
@@ -6044,8 +5927,12 @@ class StitchingDialog(PersistentDialog):
         if pystripe_ok:
             self._destripe_cb.setEnabled(True)
             self._destripe_cb.setToolTip(
-                "PyStripe wavelet destriping per Z-plane.\n"
-                "Removes stripe artifacts from illumination-side scanning."
+                "Removes the stripes and shadows light-sheet images often show\n"
+                "along the sheet direction. Use it when stripes are visible in\n"
+                "the tiles. Slow: filters every plane at full resolution before\n"
+                "downsampling (check 'Fast' for test runs). Set the direction\n"
+                "with the 'Dir: Auto' list, tune with 'Settings…', and check the\n"
+                "result with the 'Preview…' button beside it."
             )
         else:
             self._destripe_cb.setChecked(False)
@@ -6056,10 +5943,9 @@ class StitchingDialog(PersistentDialog):
             self._destripe_settings_btn.setEnabled(False)
             self._destripe_preview_btn.setEnabled(False)
             self._destripe_cb.setToolTip(
-                "Destriping is unavailable — the destripe backend failed to load:\n"
+                "Destriping is unavailable: the destripe component failed to load.\n"
                 f"    {type(pystripe_err).__name__}: {pystripe_err}\n"
-                "(This build should bundle it; the error above names the missing "
-                "piece — likely pywt / scipy / scikit-image.)"
+                "Please report this message."
             )
 
         # --- Deconvolution (pycudadecon or RedLionfish) ---
@@ -6068,13 +5954,19 @@ class StitchingDialog(PersistentDialog):
         if _decon.is_available():
             self._deconv_cb.setEnabled(True)
             self._deconv_cb.setToolTip(
-                "Per-tile GPU deconvolution before stitching.\n"
-                "Uses pycudadecon (NVIDIA) or RedLionfish (any GPU)."
+                "Sharpens each tile on the GPU before stitching (needs an NVIDIA\n"
+                "or other OpenCL graphics card). Slow, and unless the stitching\n"
+                "config names a measured PSF file it uses a calculated blur\n"
+                "model. Try it on a small test run first and compare with the\n"
+                "result without it."
             )
         else:
             self._deconv_cb.setChecked(False)
             self._deconv_cb.setEnabled(False)
-            self._deconv_cb.setToolTip(_decon.unavailable_reason())
+            self._deconv_cb.setToolTip(
+                "Deconvolution needs a GPU library that is not installed in\n"
+                "this build. See 'For developers / Python users' in the README."
+            )
 
         # --- Leonardo FUSE illumination fusion combo item ---
         try:
@@ -6093,15 +5985,13 @@ class StitchingDialog(PersistentDialog):
                 item.setEnabled(leo_ok)
                 if leo_ok:
                     item.setToolTip(
-                        "Leonardo FUSE content-based illumination fusion\n"
-                        "(leonardo-toolset in the isolated preprocessing env)."
+                        "Combines the two light-sheet sides by image content.\n"
+                        "Needs a GPU. Experimental."
                     )
                 else:
                     item.setToolTip(
-                        "Leonardo FUSE requires leonardo-toolset (GPU/CUDA) in\n"
-                        "the isolated preprocessing environment. The flat-field\n"
-                        "setup does NOT install it — Leonardo needs a separate\n"
-                        "GPU env (see the preprocessing-env setup scripts)."
+                        "Not available: Leonardo fusion needs its own GPU setup, which\n"
+                        "'Set up flat-field…' does not install."
                     )
             # If the current selection is Leonardo but it's now disabled,
             # fall back to Max so the run doesn't pick an unavailable mode.
@@ -6456,8 +6346,6 @@ class StitchingDialog(PersistentDialog):
         s.setValue("reg_upsample", self._reg_upsample_combo.currentData())
         s.setValue("solve_tolerance_px", self._solve_tol_spin.value())
         s.setValue("solve_transform", self._solve_model_combo.currentData())
-        s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
-        s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
@@ -6646,10 +6534,6 @@ class StitchingDialog(PersistentDialog):
         self._set_combo_by_data(
             self._solve_model_combo, s.value("solve_transform", "translation", type=str)
         )
-        self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
-        self._max_reg_shift_z_spin.setValue(
-            s.value("max_reg_shift_z", 0.0, type=float)
-        )
         self._z_refine_cb.setChecked(s.value("z_refine", False, type=bool))
         # Default TRUE: a run that has never seen this setting must not
         # silently keep sub-plane Z shifts.
@@ -6708,6 +6592,7 @@ class StitchingDialog(PersistentDialog):
             self._worker.cancel()
             self._worker.wait(2000)
         self._batch_running = False
+        self.run_state_changed.emit(False)
         super().closeEvent(event)
 
     def hideEvent(self, event):
@@ -6802,8 +6687,6 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("reg_upsample", self._reg_upsample_combo.currentData())
         s.setValue("solve_tolerance_px", self._solve_tol_spin.value())
         s.setValue("solve_transform", self._solve_model_combo.currentData())
-        s.setValue("max_reg_shift", self._max_reg_shift_spin.value())
-        s.setValue("max_reg_shift_z", self._max_reg_shift_z_spin.value())
         s.setValue("z_refine", self._z_refine_cb.isChecked())
         s.setValue("z_snap_to_plane", self._z_snap_cb.isChecked())
         s.setValue("stitching_approach", self._approach_combo.currentData())
@@ -6991,10 +6874,6 @@ class NativeStitchingDialog(StitchingDialog):
         self._set_combo_by_data(
             self._solve_model_combo, s.value("solve_transform", "translation", type=str)
         )
-        self._max_reg_shift_spin.setValue(s.value("max_reg_shift", 0.0, type=float))
-        self._max_reg_shift_z_spin.setValue(
-            s.value("max_reg_shift_z", 0.0, type=float)
-        )
         self._z_refine_cb.setChecked(s.value("z_refine", False, type=bool))
         # Default TRUE: a run that has never seen this setting must not
         # silently keep sub-plane Z shifts.
@@ -7109,6 +6988,12 @@ class MultiViewStitchingDialog(StitchingDialog):
         self._mv_center_combo = QComboBox()
         self._mv_center_combo.addItem("Auto (tile centroid)", "auto")
         self._mv_center_combo.addItem("Manual (X, Z)", "manual")
+        self._mv_center_combo.setToolTip(
+            "The point the views rotate about, in stage coordinates.\n"
+            "'Auto (tile centroid)': the average X and middle Z of all tiles.\n"
+            "Choose 'Manual (X, Z)' and type it in mm if the views don't line\n"
+            "up with Auto."
+        )
         self._mv_center_combo.currentIndexChanged.connect(
             self._mv_update_center_enabled
         )
@@ -7118,12 +7003,20 @@ class MultiViewStitchingDialog(StitchingDialog):
         self._mv_cx_spin.setRange(-1000.0, 1000.0)
         self._mv_cx_spin.setDecimals(3)
         self._mv_cx_spin.setSuffix(" mm")
+        self._mv_cx_spin.setToolTip(
+            "X position of the rotation axis, in stage millimeters.\n"
+            "Used only with 'Manual (X, Z)'."
+        )
         center_row.addWidget(self._mv_cx_spin)
         center_row.addWidget(QLabel("Z"))
         self._mv_cz_spin = QDoubleSpinBox()
         self._mv_cz_spin.setRange(-1000.0, 1000.0)
         self._mv_cz_spin.setDecimals(3)
         self._mv_cz_spin.setSuffix(" mm")
+        self._mv_cz_spin.setToolTip(
+            "Z position of the rotation axis, in stage millimeters.\n"
+            "Used only with 'Manual (X, Z)'."
+        )
         center_row.addWidget(self._mv_cz_spin)
         center_row.addStretch()
         v.addLayout(center_row)
@@ -7134,8 +7027,9 @@ class MultiViewStitchingDialog(StitchingDialog):
         self._mv_sign_combo.addItem("+1", 1.0)
         self._mv_sign_combo.addItem("−1", -1.0)
         self._mv_sign_combo.setToolTip(
-            "Handedness relating the stage angle to the fusion rotation.\n"
-            "Confirm on the rig with a two-angle test if views don't align."
+            "Which way a stage angle turns the views when they are fused.\n"
+            "Leave at '+1'. If a two-angle test comes out mirrored or\n"
+            "misaligned, try '−1'."
         )
         sign_row.addWidget(self._mv_sign_combo)
         sign_row.addStretch()

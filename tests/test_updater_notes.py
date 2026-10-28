@@ -101,3 +101,20 @@ def test_dialog_without_notes_has_no_box(qapp):
     assert dlg is not None
     assert not dlg.findChildren(QTextEdit)
     dlg.reject()
+
+
+def test_install_is_grayed_out_while_any_tab_is_stitching(qapp, monkeypatch):
+    """Installing quits the app, which ended a running stitch (2026-10-27)."""
+    win, tabs, panel = _panel(qapp)
+    panel.set_run_active("multi", True)
+    panel.set_run_active("single", True)
+    assert not panel.btn_install.isEnabled()
+    panel.set_run_active("multi", False)
+    assert not panel.btn_install.isEnabled()  # the other tab is still running
+    called = []
+    monkeypatch.setattr(panel, "_latest_url", "https://example/dl.exe")
+    monkeypatch.setattr("urllib.request.urlretrieve", lambda *a, **k: called.append(a))
+    panel.install_update()
+    assert called == []
+    panel.set_run_active("single", False)
+    assert panel.btn_install.isEnabled()

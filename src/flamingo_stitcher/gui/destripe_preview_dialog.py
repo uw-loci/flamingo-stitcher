@@ -197,19 +197,28 @@ class DestripePreviewDialog(PersistentDialog):
         sel.addWidget(QLabel("Tile:"))
         self._tile_combo = QComboBox()
         self._tile_combo.setMinimumWidth(240)
+        self._tile_combo.setToolTip(
+            "The tile to preview, by grid position and stage position. Pick one "
+            "with visible sample; on a blank tile every setting looks the same."
+        )
         self._tile_combo.currentIndexChanged.connect(self._on_tile_changed)
         sel.addWidget(self._tile_combo, 1)
 
         sel.addWidget(QLabel("Channel:"))
         self._channel_combo = QComboBox()
+        self._channel_combo.setToolTip(
+            "The channel to preview. The destripe settings apply to every "
+            "channel."
+        )
         self._channel_combo.currentIndexChanged.connect(self._on_channel_changed)
         sel.addWidget(self._channel_combo)
 
         sel.addWidget(QLabel("Illum. side:"))
         self._illum_combo = QComboBox()
         self._illum_combo.setToolTip(
-            "Non-fast destriping runs per illumination side, BEFORE fusion, so "
-            "each side is previewed on its own."
+            "Which light-sheet side to preview. Unless 'Fast' is checked, each "
+            "side is destriped separately before the two are combined, so look "
+            "at both sides."
         )
         self._illum_combo.currentIndexChanged.connect(self._request_render)
         sel.addWidget(self._illum_combo)
@@ -221,6 +230,7 @@ class DestripePreviewDialog(PersistentDialog):
         self._z_slider = QSlider(Qt.Horizontal)
         self._z_slider.setMinimum(0)
         self._z_slider.setMaximum(0)
+        self._z_slider.setToolTip("Drag to choose which plane of the tile to preview.")
         self._z_slider.valueChanged.connect(self._on_z_changed)
         zrow.addWidget(self._z_slider, 1)
         self._z_label = QLabel("—")
@@ -258,24 +268,27 @@ class DestripePreviewDialog(PersistentDialog):
         drow = QHBoxLayout()
         drow.addWidget(QLabel("Direction:"))
         self._dir_combo = QComboBox()
-        self._dir_combo.addItem("Auto (detect)", "auto")
+        self._dir_combo.addItem("Auto (from orientation)", "auto")
         self._dir_combo.addItem("Horizontal stripes", "horizontal")
         self._dir_combo.addItem("Vertical stripes", "vertical")
         idx = self._dir_combo.findData(self._direction_setting)
         self._dir_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self._dir_combo.currentIndexChanged.connect(self._request_render)
         self._dir_combo.setToolTip(
-            "Which stripe orientation to remove, in the RAW CAMERA FRAME.\n"
-            "Auto derives it from the tile orientation and the known\n"
-            "output-frame stripe axis — it does not inspect image content."
+            "Which way the stripes run in the raw camera image, before tiles\n"
+            "are rotated, so it can look 90° off from the stitched result.\n"
+            "Auto works it out from the tile orientation. Pick 'Horizontal\n"
+            "stripes' or 'Vertical stripes' only if the 'After' pane shows\n"
+            "the stripes still there."
         )
         drow.addWidget(self._dir_combo)
 
         self._orient_cb = QCheckBox("Show oriented (as in the stitch)")
         self._orient_cb.setChecked(True)
         self._orient_cb.setToolTip(
-            "Display both panes with this acquisition's tile orientation "
-            "applied. Display only — the filter always runs in the camera frame."
+            "Show both panes turned the way they will appear in the stitched "
+            "image. This changes only the display; the filter result is the "
+            "same either way."
         )
         self._orient_cb.stateChanged.connect(self._redraw_only)
         drow.addWidget(self._orient_cb)

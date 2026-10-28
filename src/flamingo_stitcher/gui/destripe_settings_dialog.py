@@ -98,8 +98,10 @@ class DestripeParamsForm(QWidget):
         self._sigma_fg.setRange(0.0, 4096.0)
         self._sigma_fg.setDecimals(1)
         self._sigma_fg.setToolTip(
-            "Filter bandwidth (px) applied to the FOREGROUND (bright sample).\n"
-            "Larger = removes wider stripes. 0 disables foreground filtering."
+            "Filter strength, in pixels, on the bright sample. Larger removes\n"
+            "wider stripes but can smear real structure. Default 128; 0 turns\n"
+            "off filtering of the sample. Raise it if stripes remain on the\n"
+            "sample; lower it if fine detail is blurred."
         )
         form.addRow("Sigma — foreground:", self._sigma_fg)
 
@@ -107,8 +109,9 @@ class DestripeParamsForm(QWidget):
         self._sigma_bg.setRange(0.0, 4096.0)
         self._sigma_bg.setDecimals(1)
         self._sigma_bg.setToolTip(
-            "Filter bandwidth (px) applied to the BACKGROUND (dark regions).\n"
-            "Usually >= the foreground value. 0 disables background filtering."
+            "Filter strength, in pixels, on the dark background. Usually the\n"
+            "same as or larger than 'Sigma — foreground'. Default 256; 0 turns\n"
+            "off filtering of the background."
         )
         form.addRow("Sigma — background:", self._sigma_bg)
 
@@ -116,10 +119,10 @@ class DestripeParamsForm(QWidget):
         self._level.setRange(0, 12)
         self._level.setSpecialValueText("Auto (max)")
         self._level.setToolTip(
-            "Wavelet decomposition depth. Higher reaches broader, lower-frequency\n"
-            "stripes but costs time and can affect large-scale structure.\n"
-            "0 = auto (maximum supported by the image size).\n"
-            "Values deeper than the frame supports are clamped at run time."
+            "How many scales the filter works across. Higher reaches broader\n"
+            "stripes but takes longer and can change large-scale brightness.\n"
+            "Default 7. 'Auto (max)' uses the deepest level the image size\n"
+            "allows, and a level deeper than that is reduced automatically."
         )
         form.addRow("Wavelet level:", self._level)
 
@@ -127,8 +130,9 @@ class DestripeParamsForm(QWidget):
         self._wavelet.addItems(_WAVELETS)
         self._wavelet.setEditable(True)  # allow any pywt name
         self._wavelet.setToolTip(
-            "Mother wavelet (any PyWavelets name). db2/db3 are typical for\n"
-            "light-sheet stripe removal."
+            "The wavelet shape the filter uses. Leave it at db2 (default)\n"
+            "unless you are experimenting; db3 is the usual alternative.\n"
+            "You can also type another wavelet name."
         )
         form.addRow("Wavelet:", self._wavelet)
 
@@ -137,11 +141,11 @@ class DestripeParamsForm(QWidget):
         self._threshold.setDecimals(0)
         self._threshold.setSpecialValueText("Auto (Otsu)")
         self._threshold.setToolTip(
-            "Intensity separating foreground from background.\n"
-            "Auto (-1) computes Otsu's threshold per plane — the right default\n"
-            "for nearly all data. Set a value only to override it.\n"
-            "Because Otsu is per-plane, it is also why removal strength can\n"
-            "vary between a dim edge tile and a bright interior one."
+            "Brightness that separates sample from background. 'Auto (Otsu)'\n"
+            "(default) picks it separately for each plane, which suits nearly\n"
+            "all data. That is also why the filtering strength can differ\n"
+            "between a dim edge tile and a bright one. Type a value only to\n"
+            "force one level for every plane."
         )
         form.addRow("Threshold:", self._threshold)
 
@@ -149,8 +153,10 @@ class DestripeParamsForm(QWidget):
         self._crossover.setRange(0.0, 65535.0)
         self._crossover.setDecimals(1)
         self._crossover.setToolTip(
-            "Intensity width of the smooth blend between the background- and\n"
-            "foreground-filtered results around the threshold."
+            "How gradually the filter switches between the background and\n"
+            "sample settings around 'Threshold', in brightness units.\n"
+            "Default 10. Raise it if a visible edge appears where sample\n"
+            "meets background."
         )
         form.addRow("Crossover:", self._crossover)
 

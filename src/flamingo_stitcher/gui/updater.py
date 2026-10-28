@@ -76,6 +76,16 @@ _KEY_CACHED = "updates/cached_latest_version"
 # inside it even on a tight relaunch loop.
 _AUTO_CHECK_THROTTLE_S = 60
 
+# 'Install update' tooltip, set at build time and again whenever a run ends.
+_INSTALL_TIP = (
+    "Download the new installer and start it. Flamingo Stitcher then closes "
+    "so the installer can upgrade it. Your settings are kept."
+)
+_INSTALL_TIP_RUNNING = (
+    "Available when the current stitch finishes. Installing closes Flamingo "
+    "Stitcher, which would end the run."
+)
+
 
 def make_ssl_context() -> ssl.SSLContext:
     """SSL context that works inside a PyInstaller bundle.
@@ -286,19 +296,19 @@ class UpdatePanel(QWidget):
         row = QHBoxLayout()
         self.btn_check = QPushButton("Check for updates")
         self.btn_check.setToolTip(
-            "Query GitHub Releases for the latest Flamingo Stitcher installer "
-            "and report whether you're up to date."
+            "Check online for a newer version of Flamingo Stitcher and show the "
+            "result here."
         )
         self.btn_check.clicked.connect(lambda: self.check_for_updates(silent=False))
         row.addWidget(self.btn_check)
 
         self.btn_install = QPushButton("Install update")
-        self.btn_install.setToolTip(
-            "Download the latest installer and launch it. It upgrades over the "
-            "current install — your settings are preserved."
-        )
+        self.btn_install.setToolTip(_INSTALL_TIP)
         self.btn_install.setVisible(False)
         self.btn_install.clicked.connect(self.install_update)
+        # Stitching tabs with a run in progress. Installing quits the app,
+        # which would end the run, so the button is grayed out meanwhile.
+        self._running_sources = set()
         row.addWidget(self.btn_install)
 
         self.btn_releases = QPushButton("View all releases…")
@@ -312,8 +322,9 @@ class UpdatePanel(QWidget):
 
         self.chk_auto = QCheckBox("Auto-check for updates on launch")
         self.chk_auto.setToolTip(
-            "When checked, Flamingo Stitcher silently queries Releases on launch "
-            "(throttled) and flags this tab if an update is available."
+            "Each time Flamingo Stitcher starts, look quietly for a newer "
+            "version. If one is found, the 'Updates' tab is marked and a notice "
+            "pops up. Uncheck it to look only when you press 'Check for updates'."
         )
         self.chk_auto.setChecked(self._settings.value(_KEY_AUTO, True, type=bool))
         self.chk_auto.toggled.connect(
@@ -631,9 +642,23 @@ class UpdatePanel(QWidget):
         dlg.activateWindow()
 
     # -- Install -----------------------------------------------------------
+    def set_run_active(self, source: str, active: bool) -> None:
+        """A stitching tab started (or ended) a run: gray out installing."""
+        if active:
+            self._running_sources.add(source)
+        else:
+            self._running_sources.discard(source)
+        running = bool(self._running_sources)
+        self.btn_install.setEnabled(not running)
+        self.btn_install.setToolTip(
+            _INSTALL_TIP_RUNNING if running else _INSTALL_TIP
+        )
+
     def install_update(self) -> None:
         """Download the latest installer and launch it, then quit so it can
         overwrite the running .exe."""
+        if self._running_sources:
+            return  # grayed out; a queued click must not end the run
         url = self._latest_url
         version = self._latest_version or "?"
         if not url:

@@ -136,6 +136,21 @@ can leave all of them alone.** Everything more specialized lives in the collapse
 - **How should we save it?** — output format, compression, and memory mode. **OME-Zarr
   (Fiji compatible)** is a safe default. The size / time / memory estimates underneath
   update live as you change settings.
+  - **Formats.** OME-Zarr (Fiji compatible) is Zarr v2 + OME-NGFF v0.4; OME-Zarr
+    Sharded is Zarr v3 + OME-NGFF v0.5, which only napari and zarr-python 3.x read.
+    OME-TIFF writes all channels into one `<name>.ome.tif`. Imaris (.ims) uses
+    PyImarisWriter (Apache 2.0; `pip install "flamingo-stitcher[imaris]"`, Windows
+    only), writes block by block so it scales to TB-sized output, and builds its own
+    pyramids. It exists because ImarisFileConverter misreads OME-TIFF pyramid
+    SubIFDs as extra Z planes and collapses the data into Z = 0; to use the
+    converter anyway, write OME-TIFF with **TIFF pyramids** unchecked. Fiji and
+    Imaris do not need TIFF pyramids; napari and QuPath zoom faster with them.
+  - **Compression.** None skips encoding and decoding, so it is fastest from a fast
+    local SSD, at the cost of much larger files. Over network shares, USB or
+    spinning disks, compressed files often load faster than uncompressed ones
+    because the disk, not decoding, is the bottleneck. zstd and lz4 decode
+    quickly; zlib and lzw are the TIFF codecs older software reads. zstd for TIFF
+    is only offered when the `imagecodecs` package is installed.
 
 > Tip: hover over any control to get a tooltip explaining it. Open the **Log** panel
 > (collapsed at the bottom) to see full detail of what was detected and done.
@@ -178,6 +193,19 @@ each item's own microscope name, so a batch mixing systems orients each one
 correctly (a choice made for one scope never touches another). The effective
 orientation is printed in the log at the start of every run. Command line:
 `--tile-orientation NAME [--reverse-x-tiles] [--reverse-y-tiles]`.
+
+`NAME` is the stored value (also used in config files); the preview panels show the label:
+
+| `NAME` | Panel label |
+|---|---|
+| `identity` | As captured (no change) |
+| `rot90` | Rotate 90° counter-clockwise |
+| `rot180` | Rotate 180° |
+| `rot270` | Rotate 90° clockwise |
+| `flip_h` | Mirror left–right |
+| `flip_v` | Mirror top–bottom |
+| `transpose` | Swap X and Y (mirror across the main diagonal) |
+| `anti_transpose` | Mirror across the other diagonal |
 
 ## Re-running to the same folder
 
@@ -300,6 +328,16 @@ pip install "flamingo-stitcher[destripe]"  # destriping (vendored filter + PyWav
 pip install "flamingo-stitcher[deconv]"    # RedLionfish GPU deconvolution (OpenCL)
 conda install -c conda-forge pycudadecon   # NVIDIA GPU deconvolution
 ```
+
+Deconvolution is Richardson-Lucy, run by pycudadecon (NVIDIA, CUDA) or RedLionfish
+(OpenCL). Its engine, iteration count (default 10) and PSF are set in the
+`deconvolution:` block of `stitching_config.yaml`: `psf_path` names a measured PSF
+file; otherwise one is calculated from the objective NA and immersion index in
+`microscope_hardware.yaml` and one wavelength for all channels (default 488 nm).
+
+Leonardo FUSE illumination fusion needs its own GPU environment, which the in-app
+*Set up flat-field…* install does not include; `scripts/create_preprocessing_env.sh`
+(or `.bat`) builds one with leonardo-toolset.
 
 GUI:
 

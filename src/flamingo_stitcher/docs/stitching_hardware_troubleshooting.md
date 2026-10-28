@@ -36,6 +36,12 @@ The **memory estimate badge** in the stitching dialog (green / orange /
 red "OOM!" pill) is the best real-time check — it recomputes as you
 change settings.
 
+**Registration Z spacing drives registration RAM and time.** Both grow with the
+planes compared per seam: registering every plane of a 2.5 µm stack is 8x the
+work of the 20 µm default, and on one 2999-plane tile at registration XY 2x a
+single seam needed ~35 GB of RAM instead of ~4 GB. The 'Registration Z' line in
+the dialog's Registration box gives the rough cost for the queued acquisitions.
+
 ### Storage
 
 **Output drive must be fast, with sequential and random bandwidth to
@@ -79,7 +85,10 @@ or network scratch drive backs those writes up in RAM and can **freeze the
 whole machine** (see §2). Put scratch on the fastest local disk with room
 for `(tile spill + fused memmap)`; the final output can go to a larger,
 slower drive since it's written once. Added in v0.4.x (supersedes the old
-"no temp redirect" limitation).
+"no temp redirect" limitation). A scratch dir on the same physical drive as the
+output gives no speed-up (the run log warns). The fused data crosses from scratch
+to the output drive once, in the normal fuse-then-write pass, which is not an
+extra copy of the result; `.stitch_tmp` is deleted when the run ends.
 
 ### CPU
 

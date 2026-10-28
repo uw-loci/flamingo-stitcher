@@ -194,7 +194,8 @@ class TestTheNativeTabDoesNotForgetSettings:
     @pytest.mark.parametrize(
         "key",
         [
-            "max_reg_shift_z",
+            # "max_reg_shift_z" went with its spin box (2026-10-28): shift
+            # limits are set on the Options tab only.
             "z_refine",
             "z_refine_range_um",
             "z_snap_to_plane",

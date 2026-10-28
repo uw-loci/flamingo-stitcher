@@ -87,13 +87,12 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=0.05,
         decimals=2,
         help=(
-            "Tiles below this are held out of the registration and placed with "
-            "the mosaic. The score is texture relative to noise, so it does NOT "
-            "track brightness — bright, featureless agarose scores the same as "
-            "empty air, which is why an intensity threshold cannot do this job. "
-            "Featureless material sits at about 0.09; real structure crosses it "
-            "at a contrast-to-noise ratio near 1. Lower it if dim sample is "
-            "being held out; the per-tile scores are in the registration report."
+            "Tiles scoring below this are not registered: they keep their stage "
+            "position and move with the rest of the mosaic. The score measures "
+            "texture, not brightness. Empty gel, medium or air scores about 0.09 "
+            "(default 0.15). Lower it if tiles with dim but real sample are left out "
+            "(the run log lists each one with its score). This also sets what 'Skip "
+            "seams whose overlap is empty' counts as empty."
         ),
     ),
     Tunable(
@@ -105,30 +104,32 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=1,
         decimals=0,
         help=(
-            "Which illumination side (the I number in the file name) lights the "
-            "LOW-numbered end of the illumination axis — the left of the frame "
-            "when the sheets run across X. Only the Split and Blend fusion "
-            "modes use it, and without it they fall back to Max rather than "
-            "guess: choosing the wrong sheet everywhere is silent, because the "
-            "output stays smooth and plausible while being built from the worse "
-            "half of every frame. -1 means not set. On n7 this is 1."
+            "Which illumination side (the I number in the tile file names) lights the "
+            "low end of the illumination axis, that is, the left side of each raw "
+            "camera image when the sheets run across X. Needed only when 'Illum. "
+            "fusion' is 'Split (each sheet owns its half)' or 'Blend (split with a "
+            "soft handover)'. Those will not run while this is -1 (not set). Use "
+            "'Measure from data…' rather than guessing. If the data clearly disagrees "
+            "with this value, the run stops and says so."
         ),
     ),
     Tunable(
         field="illumination_pure_frac",
-        label="Share of the frame each sheet owns outright (Blend)",
+        label="Share of the mosaic each sheet owns outright (Blend)",
         kind="fraction",
         minimum=0.0,
         maximum=0.5,
         step=0.05,
         decimals=2,
-        suffix=" of the frame",
+        suffix=" of the mosaic",
         help=(
-            "Under Blend, how much of the frame nearest each sheet is taken "
-            "from that sheet alone; the rest is a smoothstep handover. 0.5 is a "
-            "hard split with no handover at all (the same as Split). Lower it "
-            "if the middle of the frame looks abruptly different; raise it if "
-            "the handover band itself looks soft."
+            "Used only when 'Illum. fusion' is 'Blend (split with a soft handover)'. "
+            "How much of the mosaic, measured in from each end along the illumination "
+            "axis, comes from the nearer sheet alone. The strip in between is a "
+            "gradual handover. Default 0.35. 0.5 gives a hard cut, the same as "
+            "'Split (each sheet owns its half)'. Lower it if there is a visible step "
+            "across the middle of the mosaic; "
+            "raise it if the handover strip looks blurred."
         ),
     ),
     Tunable(
@@ -140,14 +141,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=1,
         decimals=0,
         help=(
-            "Registration runs on ONE channel and costs hours, so which channel "
-            "it uses matters as much as any threshold here. On measures the "
-            "structure in a few tiles of each channel and registers on the "
-            "densest. Off uses the channel number below, which is what every "
-            "run before this did — and that number defaulted to the lowest "
-            "channel ID, an ordering with nothing to do with which channel "
-            "carries structure. The chosen channel and every channel's score "
-            "are written to the run log."
+            "On (default): before registering, the app scores the structure in 3 tiles "
+            "of each channel and registers on the channel with the most. Off: "
+            "registration uses 'Registration channel (when not automatic)'. Turn it "
+            "off if you know a different channel aligns better than the one chosen. "
+            "The run log lists the chosen channel and every channel's score."
         ),
     ),
     Tunable(
@@ -159,9 +157,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=1,
         decimals=0,
         help=(
-            "The channel to register on when the automatic choice above is off. "
-            "If this channel is not present in an acquisition, the first one "
-            "that is gets used instead."
+            "The channel number to register on when 'Choose the registration channel "
+            "automatically' is off. Pick the channel with the densest, sharpest "
+            "structure. If an acquisition does not have this channel, the first "
+            "channel being stitched is used instead."
         ),
     ),
     Tunable(
@@ -173,14 +172,12 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=1,
         decimals=0,
         help=(
-            "Two tiles can both contain plenty of sample while the strip they "
-            "actually SHARE is empty medium — the sample ends partway across "
-            "the mosaic. Phase correlation on such a strip does not fail "
-            "loudly; it returns a confident peak drawn from noise, which then "
-            "has to be caught by the quality threshold or the shift bound. On, "
-            "the pair is never scheduled and is reported as 'empty_overlap' "
-            "rather than counted as a failed seam. Turn it off if the seam "
-            "table shows real seams being skipped."
+            "On (default): two tiles whose shared strip has no structure (the sample "
+            "ends before the edge) are not registered against each other. The pair is "
+            "listed as 'empty_overlap' in the seam table (registration_seams.csv) and "
+            "does not count against 'Minimum share of seams that must register'. Turn "
+            "it off if seams with visible sample are being skipped. 'Minimum tile "
+            "structure to register' sets what counts as empty."
         ),
     ),
     Tunable(
@@ -192,11 +189,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=0.05,
         decimals=2,
         help=(
-            "Minimum correlation for a seam to be used. The score is a Spearman "
-            "rank correlation over the overlap, so a sparse or low-contrast "
-            "sample scores low even when the alignment is right. Raise it if the "
-            "seam table shows seams passing with implausible shifts; lower it if "
-            "good-looking seams are being rejected."
+            "Seams whose match score (0 to 1) is below this are not used. Default 0.4. "
+            "Sparse or low-contrast samples score low even when they are aligned. "
+            "Raise it if the seam table (registration_seams.csv) shows seams passing "
+            "with implausible shifts; lower it if seams that look well matched are "
+            "being rejected."
         ),
     ),
     Tunable(
@@ -209,9 +206,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=2,
         suffix=" of a frame",
         help=(
-            "Below this measured overlap, registration is not attempted at all. "
-            "Phase correlation on a sliver of shared content does not fail "
-            "loudly — it returns a confident wrong shift. 0 disables the check."
+            "If the measured tile overlap (as a share of the frame, on the thinner of "
+            "X and Y) is below this, registration is skipped and tiles are placed by "
+            "stage position. Default 0.05 (5%). Lower it only if your overlap really "
+            "is that small and you want registration to try anyway. 0 turns the check "
+            "off."
         ),
     ),
     Tunable(
@@ -224,12 +223,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=2,
         suffix=" of expected seams",
         help=(
-            "Below this, the registration is not applied and tiles are placed by "
-            "stage position. Registration routinely succeeds on the part of a "
-            "mosaic that contains sample and fails on the rest; when only a few "
-            "seams agree, those few are as likely to be a confident wrong "
-            "correlation peak as a measurement. Lower it for a sample that only "
-            "ever covers part of the grid. 0 disables the check."
+            "If fewer than this share of seams register, the registration is discarded "
+            "and every tile is placed by stage position. Default 0.5. Seams skipped as "
+            "empty do not count. Lower it for a sample that covers only part of the "
+            "grid. 0 turns the check off."
         ),
     ),
     Tunable(
@@ -242,10 +239,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=1,
         suffix=" µm",
         help=(
-            "A tile whose X/Y correction exceeds this keeps its stage position. "
-            "0 derives the bound from the measured tile overlap. Set it to what "
-            "this stage can actually be wrong by — the automatic bound is one "
-            "whole overlap, which is generous enough to admit a garbage peak."
+            "The largest X/Y shift registration may apply at one seam. A seam that "
+            "needs more is discarded before the tiles are placed, and a tile left "
+            "farther than this from all its neighbors is moved back in line with them. "
+            "0 = Auto: the measured tile overlap width. Set it to how far this stage "
+            "can really misplace a tile."
         ),
     ),
     Tunable(
@@ -258,9 +256,12 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=1,
         suffix=" µm",
         help=(
-            "As above, for Z. 0 derives a bound from the Z step and stack depth. "
-            "On an XY mosaic there is no Z overlap to measure a bound from, so "
-            "this is the honest place to state what the stage can do."
+            "The largest Z shift registration may apply at one seam. A seam that needs "
+            "more is discarded before the tiles are placed, and a tile left farther "
+            "than this in Z from all its neighbors is moved back in line with them. 0 "
+            "= Auto: at least 8 Z steps and at least 25 µm, but never more than a "
+            "quarter of the stack depth. Set it to how far this stage or focus can "
+            "really drift between tiles."
         ),
     ),
     # Intensity adjustment (BigStitcher's parameters and defaults). Used only
@@ -275,9 +276,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=1,
         suffix=" native px",
         help=(
-            "Overlapping tiles are compared on a grid this many native pixels "
-            "apart, in X, Y and Z. BigStitcher's default is 10. Larger is "
-            "faster with fewer samples; the time the fit took is in the log."
+            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. "
+            "Overlapping tiles are compared at points spaced this many native XY "
+            "pixels apart, in every direction. Default 10. Larger is faster but uses "
+            "fewer points. Raise it if the fit takes too long (the run log gives its "
+            "time)."
         ),
     ),
     Tunable(
@@ -288,9 +291,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         maximum=1000000,
         step=1000,
         help=(
-            "Each pair of overlapping tiles is thinned at random (BigStitcher's "
-            "fixed seed, so a run is repeatable) to one fewer than this. "
-            "BigStitcher's default is 10000."
+            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. The "
+            "most comparison points kept for each pair of overlapping tiles. Extra "
+            "points are dropped at random, the same way on every run, so results "
+            "repeat. Default 10000. Lower it to make the fit faster."
         ),
     ),
     Tunable(
@@ -301,8 +305,11 @@ TUNABLES: Tuple[Tunable, ...] = (
         maximum=1.0,
         step=1.0,
         help=(
-            "On, each tile gets output = a * input + b. Off, only an offset "
-            "(a = 1). BigStitcher's default is on."
+            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. On "
+            "(default): each tile's brightness is both scaled and shifted to match its "
+            "neighbors. Off: only shifted up or down, so each tile keeps its contrast. "
+            "Turn it off if you want to remove brightness offsets between tiles "
+            "without changing their contrast."
         ),
     ),
     Tunable(
@@ -314,9 +321,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=0.05,
         decimals=2,
         help=(
-            "How strongly the fitted scale is pulled toward an offset-only fit "
-            "(0 = pure scale + offset fit, 1 = offset only). BigStitcher's "
-            "default is 0.1."
+            "Used only when 'Intensity adjustment: fit scale as well as offset' is on. "
+            "Moves the fit between scale + offset (0) and offset only (1). Default "
+            "0.1. Raise it if tiles come out with visibly different contrast after "
+            "adjustment."
         ),
     ),
     Tunable(
@@ -328,9 +336,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=0.05,
         decimals=2,
         help=(
-            "How strongly every tile is pulled toward no change (a = 1, b = 0). "
-            "Nothing is held fixed, so this is what keeps the whole mosaic from "
-            "drifting dark or bright. BigStitcher's default is 0.1."
+            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. How "
+            "strongly every tile is pulled toward no change (0 = no pull, 1 = tiles "
+            "left as acquired). Default 0.1. Raise it if tiles are changed more than "
+            "the seams need; lower it if brightness steps remain at the seams."
         ),
     ),
     Tunable(
@@ -341,12 +350,13 @@ TUNABLES: Tuple[Tunable, ...] = (
         maximum=1.0,
         step=1.0,
         help=(
-            "On, the scale and offset every tile shares are divided out after "
-            "the fit, so the median tile is left as acquired and only the "
-            "differences between tiles are corrected. Off, BigStitcher's raw "
-            "fit is applied, which on noisy overlaps scales every tile down "
-            "together (a = 0.3-0.5 on the n7 runs of 2026-10-22, turning raw "
-            "100-170 into about 40-80). Seams match the same either way."
+            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply' "
+            "('Measure only' logs the values it would apply). On (default): only the "
+            "brightness differences between tiles are corrected, and the typical tile "
+            "keeps its acquired brightness. Off: the raw fit is applied unchanged, "
+            "which on noisy overlaps can darken the whole mosaic. Seams match equally "
+            "well either way. Leave it on unless you need numbers identical to the raw "
+            "fit."
         ),
     ),
 )

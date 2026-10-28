@@ -86,7 +86,7 @@ class OrientationZoomDialog(QDialog):
         outer = QVBoxLayout(self)
         hint = QLabel(
             "Ctrl + mouse wheel to zoom, drag the scrollbars to pan. "
-            "Pick the panel where neighbouring tiles CONNECT."
+            "Pick the panel where neighboring tiles CONNECT."
         )
         hint.setStyleSheet("color: palette(mid); font-size: 11px;")
         outer.addWidget(hint)
@@ -101,15 +101,24 @@ class OrientationZoomDialog(QDialog):
         outer.addWidget(self._scroll, 1)
 
         row = QHBoxLayout()
-        for text, delta in (("−", -1), ("Reset", 0), ("+", +1)):
+        for text, delta, tip in (
+            ("−", -1, "Zoom out (or Ctrl + mouse wheel)."),
+            ("Reset", 0, "Back to 1:1."),
+            ("+", +1, "Zoom in (or Ctrl + mouse wheel)."),
+        ):
             b = QPushButton(text)
+            b.setToolTip(tip)
             b.setFixedWidth(70)
             b.clicked.connect(lambda _c, d=delta: self._zoom(d))
             row.addWidget(b)
         self._zoom_label = QLabel()
         row.addWidget(self._zoom_label)
         row.addStretch(1)
-        use = QPushButton(f"Use {name}")
+        use = QPushButton("Choose this one")
+        use.setToolTip(
+            "Select this orientation and go back to the preview. Press 'Use "
+            "for stitching' there to apply it."
+        )
         use.setDefault(True)
         use.clicked.connect(self._accept_choice)
         row.addWidget(use)
@@ -281,7 +290,8 @@ class OrientationPreviewDialog(QDialog):
         self._channel_combo = QComboBox()
         self._channel_combo.setToolTip(
             "Which acquired channel to preview. Orientation is the same for "
-            "all channels, but a dim one may not show whether tiles connect."
+            "all channels, but a dim one may not show whether tiles connect, "
+            "so pick the channel with the clearest structure."
         )
         self._channel_combo.currentIndexChanged.connect(self._on_source_changed)
         top.addWidget(self._channel_combo)
@@ -289,9 +299,8 @@ class OrientationPreviewDialog(QDialog):
         top.addWidget(QLabel("Illum. side:"))
         self._illum_combo = QComboBox()
         self._illum_combo.setToolTip(
-            "Which light path to preview. The two sides are separate images "
-            "and can look different; this used to be fixed at the lowest side "
-            "with nothing saying so."
+            "Which light-sheet side to preview. Orientation is the same for "
+            "both sides, so pick the one where the sample looks sharpest."
         )
         self._illum_combo.currentIndexChanged.connect(self._on_source_changed)
         top.addWidget(self._illum_combo)
@@ -304,13 +313,19 @@ class OrientationPreviewDialog(QDialog):
         # tile-order reversal in Y.
         self._rev_x_cb = QCheckBox("Reverse X order")
         self._rev_x_cb.setToolTip(
-            "Lay tiles out X3 X2 X1 X0 instead of X0 X1 X2 X3 (stage X sign), "
-            "without flipping the images."
+            "Lay the tiles out in the opposite order along X (X3 X2 X1 X0 "
+            "instead of X0 X1 X2 X3) without flipping the images. Check it if "
+            "the tiles look right individually but sit in the wrong order left "
+            "to right."
         )
         self._rev_x_cb.toggled.connect(self._on_reverse_toggled)
         top.addWidget(self._rev_x_cb)
         self._rev_y_cb = QCheckBox("Reverse Y order")
-        self._rev_y_cb.setToolTip("Reverse the tile order along stage Y.")
+        self._rev_y_cb.setToolTip(
+            "Lay the tiles out in the opposite order along Y without flipping "
+            "the images. Check it if the tiles look right individually but sit "
+            "in the wrong order top to bottom."
+        )
         self._rev_y_cb.toggled.connect(self._on_reverse_toggled)
         top.addWidget(self._rev_y_cb)
 
@@ -331,16 +346,19 @@ class OrientationPreviewDialog(QDialog):
         for label, _rng in _Z_PRESETS:
             self._z_combo.addItem(label)
         self._z_combo.setToolTip(
-            "Which Z planes to project. Structure often lives in part of the "
-            "stack (e.g. the bottom), while the full-stack projection is washed "
-            "out by beads across all depths. Changing this rebuilds the preview "
-            "by reading those planes from the raw data."
+            "Which part of each stack to project for the preview. If 'Full "
+            "stack' looks washed out (for example by beads at every depth), "
+            "pick the part that holds the sample. Any choice other than 'Full "
+            "stack' reads the raw data, so it takes longer."
         )
         self._z_combo.currentIndexChanged.connect(self._on_z_changed)
         btn_row.addWidget(self._z_combo)
 
         self._rebuild_btn = QPushButton("Rebuild")
-        self._rebuild_btn.setToolTip("Re-read the data and rebuild the preview")
+        self._rebuild_btn.setToolTip(
+            "Read the data again and rebuild all panels. Changing any setting "
+            "here already does this; use it to retry after a failed build."
+        )
         self._rebuild_btn.clicked.connect(self._start_build)
         self._rebuild_btn.setEnabled(False)
         btn_row.addWidget(self._rebuild_btn)
@@ -348,9 +366,10 @@ class OrientationPreviewDialog(QDialog):
 
         self._apply_btn = QPushButton("Use for stitching")
         self._apply_btn.setToolTip(
-            "Select a panel (the one where tiles CONNECT), then apply that "
-            "orientation + tile order to the stitch and remember it for this "
-            "microscope."
+            "Select the panel where the tiles connect, then press this to use "
+            "that orientation and tile order for the next stitch. It is also "
+            "saved for this microscope, so later runs use it automatically "
+            "(not when the acquisition has no microscope name)."
         )
         self._apply_btn.setEnabled(False)
         self._apply_btn.clicked.connect(self._on_apply)
@@ -479,11 +498,14 @@ class OrientationPreviewDialog(QDialog):
             img_label.setStyleSheet("background:#111; border:1px solid #444;")
             img_label.setMinimumSize(_CELL_PX, _CELL_PX)
             img_label.setToolTip(
-                f"Click to view '{MosaicOrientation.LABELS.get(key, key)}' full size — the tile labels are "
-                f"unreadable at thumbnail scale."
+                f"Click to open '{MosaicOrientation.LABELS.get(key, key)}' full "
+                f"size, where the tile labels are readable. You can choose it "
+                f"from there too."
             )
             radio = QRadioButton(f"{i + 1}. {MosaicOrientation.LABELS.get(key, key)}")
-            radio.setToolTip(f"Setting name: {key}")
+            radio.setToolTip(
+                "Select this orientation, then press 'Use for stitching'."
+            )
             radio.setProperty("orientation_name", key)
             if key == self._selected_name:
                 radio.setChecked(True)

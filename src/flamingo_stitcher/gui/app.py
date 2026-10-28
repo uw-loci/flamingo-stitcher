@@ -218,6 +218,10 @@ def main() -> int:
     # build only; the in-app Py2Flamingo dialogs ship their own updates).
     settings = QSettings()
     update_panel = UpdatePanel(window, tabs, settings)
+    for _name, _dialog in (("multi", multi), ("single", single), ("multiview", multiview)):
+        _dialog.run_state_changed.connect(
+            lambda active, n=_name: update_panel.set_run_active(n, active)
+        )
     tabs.addTab(update_panel, "Updates")
     tabs.currentChanged.connect(
         lambda idx: update_panel.on_tab_changed(tabs.widget(idx))
