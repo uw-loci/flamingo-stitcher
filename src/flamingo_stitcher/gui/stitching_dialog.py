@@ -1045,8 +1045,11 @@ class StitchingDialog(PersistentDialog):
         self._destripe_fast_cb = QCheckBox("Fast")
         self._destripe_fast_cb.setToolTip(
             "Destripes the downsampled tile instead of every full-resolution\n"
-            "plane: much faster when 'Downsample' is above 1x, with slightly\n"
-            "lower quality. Good for test runs; leave it off for final data."
+            "plane: much faster when 'Downsample' is above 1x. The destripe\n"
+            "settings are converted for the smaller frame, so it removes the\n"
+            "same stripes the preview shows, but both illumination sides are\n"
+            "filtered together after they are merged. Good for test runs;\n"
+            "leave it off for final data."
         )
         self._destripe_fast_cb.setEnabled(False)
         # Fast is a destripe-only variant (apply after downsample). When
@@ -3042,9 +3045,15 @@ class StitchingDialog(PersistentDialog):
             DestripeSettingsDialog,
         )
 
-        dlg = DestripeSettingsDialog(self._destripe_params, parent=self)
+        params, direction, note = self._destripe_settings_for_selection()
+        dlg = DestripeSettingsDialog(params, source_note=note, parent=self)
         if dlg.exec_() == QDialog.Accepted:
             self._destripe_params = dlg.get_params()
+            # Save under the microscope's own direction, not whatever this
+            # window last showed.
+            idx = self._destripe_dir_combo.findData(direction)
+            if idx >= 0:
+                self._destripe_dir_combo.setCurrentIndex(idx)
             self._log(f"Destripe settings updated: {self._destripe_params}")
             self._save_destripe_preset_for_selection()
 
@@ -3079,10 +3088,11 @@ class StitchingDialog(PersistentDialog):
                 self._logger.debug(f"Preview tile discovery failed: {e!r}")
                 tiles = None
 
+        params, direction, _note = self._destripe_settings_for_selection()
         dlg = DestripePreviewDialog(
             acq_path,
-            self._destripe_params,
-            direction=str(self._destripe_dir_combo.currentData() or "auto"),
+            params,
+            direction=direction,
             tiles=tiles,
             parent=self,
         )
@@ -5004,6 +5014,51 @@ class StitchingDialog(PersistentDialog):
         for line in changed:
             self._log(f"   {line}")
         return item_config
+
+    def _destripe_settings_for_selection(self):
+        """``(params, direction, note)`` the selected queue row will run with.
+
+        A run swaps in the microscope's saved destripe settings
+        (``_apply_destripe_preset``), so the tuning dialogs must open on THOSE,
+        not on the last values edited in this window. Showing the window's own
+        values let run 32 (2026-10-27) run with Crossover 900 while the dialog
+        read 10.
+        """
+        params = dict(self._destripe_params)
+        direction = str(self._destripe_dir_combo.currentData() or "auto")
+        if not self._queue:
+            return params, direction, (
+                "No acquisition in the queue. These values are used for a "
+                "microscope with no saved destripe settings; add an "
+                "acquisition first to see and change its microscope's settings."
+            )
+        rows = sorted(set(idx.row() for idx in self._queue_table.selectedIndexes()))
+        row = rows[0] if rows else 0
+        acq_path = self._queue[row].get("path") if 0 <= row < len(self._queue) else None
+        if not acq_path:
+            return params, direction, ""
+        from flamingo_stitcher.destripe_presets import resolve_for_acquisition
+
+        try:
+            scope, preset = resolve_for_acquisition(acq_path)
+        except Exception as e:  # noqa: BLE001 - fall back to this window's values
+            self._logger.debug(f"Destripe preset lookup failed: {e!r}")
+            return params, direction, ""
+        if preset:
+            return dict(preset["params"]), preset["direction"], (
+                f"Saved for microscope '{scope}'. Every run of an acquisition "
+                "from this microscope uses these values; OK saves your changes "
+                "for it."
+            )
+        if scope:
+            return params, direction, (
+                f"Nothing saved yet for microscope '{scope}'. OK saves these "
+                "values for it."
+            )
+        return params, direction, (
+            "This acquisition has no readable microscope name, so these values "
+            "cannot be saved for its microscope."
+        )
 
     def _save_destripe_preset_for_selection(self) -> None:
         """Persist the current destripe settings under the selected scope."""

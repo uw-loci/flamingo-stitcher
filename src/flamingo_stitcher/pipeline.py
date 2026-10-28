@@ -9,6 +9,7 @@ Usage:
 """
 
 import json
+import math
 import logging
 import re
 import threading
@@ -703,6 +704,7 @@ MVS_DEFAULT_3D_UPSAMPLE = 2
 # the displayed "done at" slid from 17:58 to 08:49 against a true 02:42.
 # The band below is sized from that run's measured shares (register 72%, fuse
 # 25%) and registration now emits per seam inside it.
+_PCT_FLATFIELD = 4
 _PCT_REGISTER = 45
 _PCT_FUSE = 70
 _PCT_WRITE = 90
@@ -4516,6 +4518,7 @@ def destripe_volume(
     params: Optional[Dict[str, Any]] = None,
     in_place: bool = False,
     cancel_fn: Optional[Any] = None,
+    downsample_xy: int = 1,
 ) -> np.ndarray:
     """Apply PyStripe destriping to each Z-plane using parallel threads.
 
@@ -4542,6 +4545,14 @@ def destripe_volume(
     tile-sized thing actually in RAM. The saving is real only where the input
     is already a writable in-memory array, e.g. the ``destripe_fast`` path,
     which filters the downsampled tile this method produced.
+
+    ``downsample_xy`` is how far ``volume`` was shrunk in XY from the camera
+    frame (the "fast" variant). ``sigma`` and ``level`` are defined on the
+    native frame, where the destripe preview shows them; pystripe's notch width
+    is ``sigma / rows``, so the same sigma on a 2x-smaller frame filters twice
+    as wide a band at the same physical scale. Sigma is divided by the factor
+    and ``level`` lowered by log2 of it, so fast mode removes what the preview
+    showed.
 
     ``cancel_fn`` is polled per plane. Without it, Cancel did nothing until
     the whole tile finished: all N planes are submitted to the pool up front,
@@ -4623,6 +4634,20 @@ def destripe_volume(
     _ds_crossover = float(_pick("crossover", 10.0))
     # threshold: None/absent → -1, which makes filter_streaks pick it via Otsu.
     _ds_threshold = float(_pick("threshold", -1.0))
+
+    _ds_factor = max(1, int(downsample_xy or 1))
+    if _ds_factor > 1:
+        _native_sigma, _native_level = list(_ds_sigma), _ds_level
+        _ds_sigma = [v / _ds_factor for v in _ds_sigma]
+        if _ds_level > 0:
+            _ds_level = max(1, _ds_level - int(round(math.log2(_ds_factor))))
+        logger.info(
+            f"Destripe on the {_ds_factor}x-downsampled frame: sigma "
+            f"{_native_sigma[0]:g}/{_native_sigma[1]:g} -> "
+            f"{_ds_sigma[0]:g}/{_ds_sigma[1]:g}, level {_native_level} -> "
+            f"{_ds_level}, so it filters the same physical scales as on the "
+            "native frame (the destripe preview)."
+        )
 
     # Clamp the wavelet depth to what this frame size can actually support.
     # `level` is a fixed config value (default 7) but the usable depth is set by
@@ -4954,14 +4979,19 @@ class StitchingPipeline:
         # read as fusion.
         ("writing output", "write"),
         ("discover", "discover"),
-        ("loading reference", "register"),
+        # Before "materializing": the fusion step says "Fusing channel 3 (1/1)
+        # [materializing tiles]", which run 32 (2026-10-27) booked as
+        # preprocessing.
+        ("fusing", "fuse"),
+        # Streaming Step 2 loads and preprocesses the reference channel; it is
+        # preprocessing time even though registration is what it is for.
+        ("loading reference", "preprocess"),
         ("registering", "register"),
         ("skip registration", "register"),
         ("loading and preprocessing", "preprocess"),
         ("applying flat-field", "preprocess"),
         ("materializing", "preprocess"),
         ("preprocess", "preprocess"),
-        ("fusing", "fuse"),
         ("computing channel", "fuse"),
         ("storing channel", "fuse"),
         ("writing", "write"),
@@ -6092,7 +6122,7 @@ class StitchingPipeline:
         # replaces the old post-load estimate-then-apply-whole-volume step, so
         # both modes now flat-field identically.
         if self.config.flat_field_correction:
-            self._progress_fn(4, "Estimating flat-field profiles (BaSiCPy)...")
+            self._progress_fn(_PCT_FLATFIELD, "Estimating flat-field profiles (BaSiCPy)...")
             self.logger.info("Step 2b: Estimating flat-field profiles (BaSiCPy)...")
             self._flatfield_models = self._estimate_flatfield_models(
                 tiles, process_channels
@@ -6526,7 +6556,7 @@ class StitchingPipeline:
         # (C1). This matches the in-memory path, which flat-fields before
         # registering. Previously the streaming path skipped flat-field entirely.
         if self.config.flat_field_correction:
-            self._progress_fn(4, "Estimating flat-field (streaming)...")
+            self._progress_fn(_PCT_FLATFIELD, "Estimating flat-field (streaming)...")
             self._flatfield_models = self._estimate_flatfield_models(
                 tiles, process_channels
             )
@@ -7262,8 +7292,11 @@ class StitchingPipeline:
                     fused = list(planes.values())[0]
                 ch_data[ch].append((fused, tile))
 
+        # Report at the flat-field step's own percent. 45 (the end of the
+        # preprocessing band) locked the ETA's monotone fraction at 40% of the
+        # run 12 s in, and the live estimate collapsed (run 32: 12:10 -> 5:09).
         return estimate_flat_fields(
-            ch_data, progress_fn=lambda m: self._progress_fn(45, m)
+            ch_data, progress_fn=lambda m: self._progress_fn(_PCT_FLATFIELD, m)
         )
 
     def _apply_flatfield_volume(self, volume: np.ndarray, model: Any) -> np.ndarray:
@@ -7415,6 +7448,7 @@ class StitchingPipeline:
                 # so this genuinely avoids an allocation.
                 in_place=True,
                 cancel_fn=self._cancelled_fn,
+                downsample_xy=self.config.downsample_xy,
             )
 
         # "Fast" deconvolution runs AFTER downsample (like destripe_fast): far

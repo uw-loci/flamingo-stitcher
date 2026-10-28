@@ -84,6 +84,33 @@ This is the whole reason both variants exist:
   introduced at full resolution and the downsample has already mixed it.
 
 Choosing "fast" is a deliberate speed/quality trade. It is not a different implementation.
+Fast destripe converts the filter settings for the smaller frame (sigma divided by the XY
+downsample, wavelet level lowered by log2 of it), because they are defined on the
+full-resolution frame the destripe preview shows. Unconverted, the same sigma filters twice
+as wide a band per 2x of downsampling.
+
+**What the destripe settings do to the data.** The filter (pystripe dual band) splits each
+plane at 'Threshold', filters the two parts with their own sigma, and blends them:
+`out = f * sample_filtered + (1 - f) * background_filtered`, with
+`f = sigmoid((value - threshold) / crossover)`. The background part is the image capped at
+'Threshold', so it is flat wherever there is tissue.
+- 'Crossover' (counts): a pixel 1x 'Crossover' above 'Threshold' keeps 73% of its own value,
+  3x above keeps 95%. Large values dim the tissue toward 'Threshold' and cut its contrast.
+  Threshold 110 with Crossover 900 (Ket_Trial1 run 32, 2026-10-27): tissue at 400 counts
+  comes out at about 280; on a synthetic test tissue fell 30% and contrast above background
+  41%. The default, 10, leaves tissue unchanged.
+- 'Sigma' (camera px): a horizontal feature that runs straight for more than
+  (frame size / sigma) times its own thickness is mostly removed (about 60% at that length,
+  about 90% at twice it). On a 2048 px frame, 128 means 16x, 256 means 8x. Larger sigma also
+  removes real horizontal edges.
+- 'Wavelet level': level L reaches stripes up to about 2^L px thick; deeper levels also
+  flatten broad horizontal brightness bands.
+- 'Threshold' (counts): below it a pixel is filtered with the background sigma, above it
+  with the foreground sigma. Set just above the background.
+
+The dialogs open on the settings saved for the selected acquisition's microscope, because
+those are what the run uses; before 0.13.20 they showed the last values edited in the
+window, while the run silently used the microscope's saved set.
 
 **Orientation is per tile, not per mosaic (step 10).**
 Each tile's pixels must be aligned to the stage axes *before* placement. Rotating the

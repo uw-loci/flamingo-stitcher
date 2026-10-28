@@ -7,9 +7,10 @@ QSettings so they survive between sessions.
 
 The knobs, in rough order of how often you'd touch them:
 
-* **Sigma foreground / background** — filter bandwidth in pixels; the main
-  strength lever. Larger removes wider/coarser stripes (and risks eating real
-  structure). The two bands are filtered separately and blended across
+* **Sigma foreground / background** — filter bandwidth in camera pixels; the
+  main strength lever. A horizontal feature that runs straight for more than
+  (frame size / sigma) times its own thickness is mostly removed, so larger
+  sigma also removes shorter real edges. The two bands are filtered separately and blended across
   ``threshold``, so the bright sample and the dark background can be treated
   differently. Setting one to 0 disables filtering for that band.
 * **Level** — wavelet decomposition depth. Higher reaches lower-frequency
@@ -17,7 +18,12 @@ The knobs, in rough order of how often you'd touch them:
 * **Wavelet** — mother wavelet. db2/db3 are the usual choices.
 * **Threshold** — intensity splitting foreground from background. Auto uses
   Otsu per plane, which is the right default for most data.
-* **Crossover** — intensity width of the smooth blend between the two bands.
+* **Crossover** — intensity width (counts) of the blend between the two bands.
+  The background band is clipped at ``threshold``, so every sample pixel takes
+  a share of a flat image at the threshold: weight on its own value is
+  sigmoid((value - threshold) / crossover). A crossover comparable to the
+  tissue's brightness above background dims the tissue (run 32, 2026-10-27:
+  crossover 900 took ~30% off the signal).
 """
 
 from __future__ import annotations
@@ -97,32 +103,44 @@ class DestripeParamsForm(QWidget):
         self._sigma_fg = _NoScrollDoubleSpin()
         self._sigma_fg.setRange(0.0, 4096.0)
         self._sigma_fg.setDecimals(1)
+        self._sigma_fg.setSuffix(" px")
         self._sigma_fg.setToolTip(
-            "Filter strength, in pixels, on the bright sample. Larger removes\n"
-            "wider stripes but can smear real structure. Default 128; 0 turns\n"
-            "off filtering of the sample. Raise it if stripes remain on the\n"
-            "sample; lower it if fine detail is blurred."
+            "Which horizontal features on the sample count as stripes. Anything\n"
+            "that runs straight across for more than (frame size in camera\n"
+            "pixels / sigma) times its own thickness is mostly removed: on a\n"
+            "2048 px frame, 128 removes features longer than 16x their\n"
+            "thickness, 256 those longer than 8x. Raise it if short stripes\n"
+            "remain; lower it if real horizontal edges (tissue borders, layers)\n"
+            "lose contrast. Default 128; 0 leaves the sample unfiltered.\n"
+            "Set on the full-resolution frame; with 'Fast' it is converted\n"
+            "for the downsampled frame automatically."
         )
         form.addRow("Sigma — foreground:", self._sigma_fg)
 
         self._sigma_bg = _NoScrollDoubleSpin()
         self._sigma_bg.setRange(0.0, 4096.0)
         self._sigma_bg.setDecimals(1)
+        self._sigma_bg.setSuffix(" px")
         self._sigma_bg.setToolTip(
-            "Filter strength, in pixels, on the dark background. Usually the\n"
-            "same as or larger than 'Sigma — foreground'. Default 256; 0 turns\n"
-            "off filtering of the background."
+            "The same as 'Sigma — foreground', for pixels below 'Threshold'.\n"
+            "Usually equal or larger, since the background has no detail to\n"
+            "lose. Default 256 (removes features longer than 8x their\n"
+            "thickness on a 2048 px frame); 0 leaves the background unfiltered."
         )
         form.addRow("Sigma — background:", self._sigma_bg)
 
         self._level = _NoScrollSpin()
         self._level.setRange(0, 12)
         self._level.setSpecialValueText("Auto (max)")
+        self._level.setSuffix(" levels")
         self._level.setToolTip(
-            "How many scales the filter works across. Higher reaches broader\n"
-            "stripes but takes longer and can change large-scale brightness.\n"
-            "Default 7. 'Auto (max)' uses the deepest level the image size\n"
-            "allows, and a level deeper than that is reduced automatically."
+            "How thick a stripe the filter reaches: each level doubles it, so\n"
+            "7 reaches stripes up to about 128 camera pixels (2^7) thick.\n"
+            "Higher also flattens broad horizontal bands of real brightness\n"
+            "across the tissue; lower it if that happens. Default 7. 'Auto\n"
+            "(max)' uses the deepest level the frame allows; a deeper value is\n"
+            "reduced automatically. Set on the full-resolution frame; with\n"
+            "'Fast' it is lowered by one per 2x of downsampling."
         )
         form.addRow("Wavelet level:", self._level)
 
@@ -139,24 +157,33 @@ class DestripeParamsForm(QWidget):
         self._threshold = _NoScrollDoubleSpin()
         self._threshold.setRange(-1.0, 65535.0)
         self._threshold.setDecimals(0)
+        self._threshold.setSuffix(" counts")
         self._threshold.setSpecialValueText("Auto (Otsu)")
         self._threshold.setToolTip(
-            "Brightness that separates sample from background. 'Auto (Otsu)'\n"
-            "(default) picks it separately for each plane, which suits nearly\n"
-            "all data. That is also why the filtering strength can differ\n"
-            "between a dim edge tile and a bright one. Type a value only to\n"
-            "force one level for every plane."
+            "Camera brightness that separates sample from background. Pixels\n"
+            "below it are filtered with 'Sigma — background', pixels above it\n"
+            "with 'Sigma — foreground'. Set it just above the background:\n"
+            "too high and dim tissue is filtered as background, losing more of\n"
+            "its horizontal detail. 'Auto (Otsu)' (default) picks it for each\n"
+            "plane, so a dim edge tile and a bright one can be filtered\n"
+            "differently; type a value to use one level for every plane."
         )
         form.addRow("Threshold:", self._threshold)
 
         self._crossover = _NoScrollDoubleSpin()
         self._crossover.setRange(0.0, 65535.0)
         self._crossover.setDecimals(1)
+        self._crossover.setSuffix(" counts")
         self._crossover.setToolTip(
-            "How gradually the filter switches between the background and\n"
-            "sample settings around 'Threshold', in brightness units.\n"
-            "Default 10. Raise it if a visible edge appears where sample\n"
-            "meets background."
+            "How gradually the filter hands over from background to sample\n"
+            "around 'Threshold'. The background version is capped at\n"
+            "'Threshold', so every sample pixel is partly replaced by a flat\n"
+            "value at 'Threshold': a pixel 1x 'Crossover' above it keeps 73%\n"
+            "of its own value, 3x above keeps 95%. Keep it small next to the\n"
+            "gap between background and tissue, or the tissue dims and loses\n"
+            "contrast: with 'Threshold' 110 and 'Crossover' 900, tissue at\n"
+            "400 counts comes out at about 280. Default 10. Raise it slightly\n"
+            "only if a visible edge appears where sample meets background."
         )
         form.addRow("Crossover:", self._crossover)
 
@@ -206,20 +233,29 @@ class DestripeParamsForm(QWidget):
 class DestripeSettingsDialog(PersistentDialog):
     """Small modal dialog for the destripe filter parameters."""
 
-    def __init__(self, params: Dict[str, Any] | None = None, parent=None):
+    def __init__(
+        self,
+        params: Dict[str, Any] | None = None,
+        parent=None,
+        source_note: str = "",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Destripe Settings")
         self.setModal(True)
 
         layout = QVBoxLayout(self)
         intro = QLabel(
-            "Tuning for the wavelet stripe filter. Sigma is the main strength "
-            "lever — raise it to remove broader stripes, lower it if real "
-            "structure is being smeared."
+            "Tuning for the stripe filter. Hover over a setting to see what it "
+            "does to the data. Values are for the full-resolution camera frame."
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color:#555; font-size:11px;")
         layout.addWidget(intro)
+        if source_note:
+            source = QLabel(source_note)
+            source.setWordWrap(True)
+            source.setStyleSheet("font-size:11px;")
+            layout.addWidget(source)
 
         self._form = DestripeParamsForm(params)
         layout.addWidget(self._form)

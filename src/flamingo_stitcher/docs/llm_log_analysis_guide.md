@@ -500,7 +500,24 @@ the live estimate the user saw as each phase began, and the last ETA line,
 r), preprocess ...`, compares every one of them with what the run took. A
 ratio far from 1 at `start` with a cold prior means the rough model is off
 for that configuration. A cache seed is only as good as the earlier run it
-came from.
+came from. Before 0.13.20 the flat-field step reported 45% progress, which
+locked the live estimate's progress fraction at the end of preprocessing a few
+seconds in: the estimate then fell to ~65% and ~42% of the prior within two
+updates (run 32: 12:10 prior, 7:55 and 5:09 live, 11:13 actual). The phases
+also logged out of order (`register` before `preprocess`, `preprocess` again
+at fusion), so the check line repeated labels. A ratio near 0.65 or 0.42 at
+the first two live lines of an older log is that bug, not the model.
+
+**Destripe on the downsampled frame (from 0.13.20).** With 'Fast',
+`Destripe on the 2x-downsampled frame: sigma 228/456 -> 114/228, level 7 -> 6`
+records the conversion. Sigma and level are defined on the full-resolution
+frame (where the preview shows them); before 0.13.20 fast mode used them
+unconverted, which filtered twice as wide a band per 2x of downsampling.
+In `Destripe params: ...`, a `crossover` that is not small next to the
+tissue's brightness above `threshold` dims the tissue: every sample pixel is
+blended with a flat image at the threshold, weight on its own value
+sigmoid((value - threshold) / crossover). Run 32 logged crossover 900 with
+threshold 110; the user saw a washed-out, "brightfield"-looking mosaic.
 
 **Kept seams left visibly off (from 2026-10-27).** The solve tolerance is in
 LATERAL registration pixels, so it grows with the XY downsample while Z planes
