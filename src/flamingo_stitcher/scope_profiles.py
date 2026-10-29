@@ -71,6 +71,9 @@ class Tunable:
     help: str
     decimals: int = 2
     suffix: str = ""
+    # (field, value): the control is grayed out unless that other tunable
+    # (a bool) has this value, because the setting is not used otherwise.
+    enabled_when: Optional[Tuple[str, bool]] = None
 
 
 # The whitelist. A profile may only carry these, so a stale or hand-edited file
@@ -151,6 +154,7 @@ TUNABLES: Tuple[Tunable, ...] = (
     Tunable(
         field="reg_channel",
         label="Registration channel (when not automatic)",
+        enabled_when=("registration_channel_auto", False),
         kind="int",
         minimum=0,
         maximum=15,
@@ -315,6 +319,7 @@ TUNABLES: Tuple[Tunable, ...] = (
     Tunable(
         field="intensity_adjust_offset_regularization",
         label="Intensity adjustment: pull toward offset-only",
+        enabled_when=("intensity_adjust_affine", True),
         kind="fraction",
         minimum=0.0,
         maximum=1.0,

@@ -31,7 +31,7 @@ streaming copy dropping the frame-size arguments and loading cropped tiles at th
 |---|------|----------|----------|-------|
 | 1 | Load one volume per illumination side | `load_tile_volume` → `load_raw_volume` | always | raw camera |
 | 2 | **Destripe (quality)** | `destripe_volume` | `destripe and not destripe_fast` | raw camera |
-| 3 | Fuse illumination sides | `fuse_illumination_sides` | >1 side and not `split_illumination` | raw camera |
+| 3 | Fuse illumination sides (optionally after aligning them: `side_align.measure`, applied plane by plane) | `fuse_illumination_sides` | >1 side and not `split_illumination`; alignment: `illumination_align` | raw camera |
 | 4 | Flat-field correction | `_apply_flatfield_volume` | `flat_field_correction` | raw camera |
 | 5 | Depth attenuation | `correct_depth_attenuation` | `depth_attenuation` *(no GUI — see below)* | raw camera |
 | 6 | **Deconvolution (quality)** | `_deconvolve_tile` | `deconvolution_enabled and not deconvolution_fast` | raw camera |
@@ -70,6 +70,20 @@ from the tile orientation, not detected from image content — see
 Stripe artifacts originate independently in each light-sheet path. Fusing first and
 destriping the combined tile mixes two different stripe patterns, and neither gets removed
 cleanly.
+
+**Light paths are aligned inside the fusion step (step 3), after per-side destripe.**
+The server images each tile with the left sheet as a full stack, then again with the right
+(`WorkflowBase.cpp`), so the two are one stack-time apart and a sample that moves is imaged in
+two places: Max, Mean and Content show it doubled, Split shows a step at the midline. With
+'Align light paths' (`illumination_align`) each tile's second path is measured against the
+first on the central half of the frame (where both sheets light it), over a 128-plane window
+placed on the tissue, binned 2 in XY. The shift is kept only if the band-passed cells (seam
+selection's band-pass and cells r) line up better with it than without it and clear
+`registration_min_cell_r`, and only within a quarter of the window. It is applied in whole
+planes and whole camera pixels, so nothing is interpolated; the merged tile stays in the first
+path's frame, so tile registration, Z snapping and the tile's Z range are unchanged. Voxels the
+shifted path does not cover keep the first path's values. Shifts of many planes are fine (the
+window measures up to 32). Not used with Leonardo or 'Separate'.
 
 **Flat-field runs after fusion, before downsample (step 4).**
 It corrects an illumination profile of the *fused* tile at native resolution, per plane.

@@ -143,9 +143,27 @@ class OptionsPanel(QWidget):
         reg = QGroupBox("Registration")
         reg_form = QFormLayout()
         reg_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        rows = {}
         for tunable in scope_profiles.TUNABLES:
-            reg_form.addRow(*self._control_for(tunable))
+            label, holder = self._control_for(tunable)
+            rows[tunable.field] = (label, holder)
+            reg_form.addRow(label, holder)
         reg.setLayout(reg_form)
+        # A setting another one switches off is grayed out (label, control and
+        # help), so it is clear it does nothing at the current values.
+        for tunable in scope_profiles.TUNABLES:
+            if tunable.enabled_when is None:
+                continue
+            master_field, wanted = tunable.enabled_when
+            master = self._spins[master_field]
+
+            def _sync(*_a, rows_=rows[tunable.field], m=master, w=wanted):
+                on = m.isChecked() == w
+                for wdg in rows_:
+                    wdg.setEnabled(on)
+
+            master.toggled.connect(_sync)
+            _sync()
         form.addRow(reg)
 
         scroll = QScrollArea()

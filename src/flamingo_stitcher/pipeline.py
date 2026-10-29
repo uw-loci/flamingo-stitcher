@@ -210,6 +210,7 @@ _PRIVATE_CONFIG_FIELDS = frozenset(
 _CONFIG_FIELD_ORDER = (
     "illumination_fusion",
     "illumination_verify",
+    "illumination_align",
     "split_illumination",
     "tile_overlap_fusion",
     "output_format",
@@ -1770,6 +1771,11 @@ class StitchingConfig:
     # the measurement confidently contradicts illumination_low_side. Off means
     # the typed-in value is trusted unchecked.
     illumination_verify: bool = True
+    # Measure each tile's shift between its two light paths and apply it, in
+    # whole planes and pixels, before merging them. The paths are imaged one
+    # full stack apart, so a sample that moves during the run is doubled.
+    # See side_align.py. Off by default.
+    illumination_align: bool = False
     # Illumination (sheet propagation) axis in the camera frame: "auto" derives
     # it from the same place destriping does — a per-microscope constant mapped
     # back through the tile orientation — so there is no second copy of that
@@ -4079,6 +4085,7 @@ def fuse_illumination_sides(
     pure_frac: float = 0.0,
     span: Optional[int] = None,
     offset: int = 0,
+    align: Optional[Tuple[int, int, int]] = None,
 ) -> np.ndarray:
     """Fuse the two illumination volumes of one tile.
 
@@ -4096,6 +4103,10 @@ def fuse_illumination_sides(
             rather than guess, because picking the wrong sheet everywhere is
             silent -- the result stays smooth and plausible.
         pure_frac: for "blend", the share of the axis each sheet owns outright.
+        align: whole-voxel (z, y, x) shift of the second side onto the first
+            (``side_align``: second(x + t) ~ first(x)), or None. The second
+            side is moved plane by plane, so no shifted copy of the tile is
+            made; voxels it does not cover keep the first side's values.
 
     Returns:
         Fused volume (Z, Y, X)
@@ -4104,6 +4115,26 @@ def fuse_illumination_sides(
 
     if len(sides) == 1:
         return np.asarray(volumes[sides[0]])
+
+    if align is not None and any(align) and method != "leonardo":
+        from flamingo_stitcher.side_align import shifted_plane
+
+        first = volumes[sides[0]]
+        second = volumes[sides[1]]
+        out = np.empty(np.shape(first), dtype=np.uint16)
+        for z in range(out.shape[0]):
+            a = np.asarray(first[z])
+            b = shifted_plane(second, z, align, a)
+            out[z] = fuse_illumination_sides(
+                {sides[0]: a[None], sides[1]: b[None]},
+                method=method,
+                axis=axis,
+                low_side=low_side,
+                pure_frac=pure_frac,
+                span=span,
+                offset=offset,
+            )[0]
+        return out
 
     left = np.asarray(volumes[sides[0]])
     right = np.asarray(volumes[sides[1]])
@@ -7235,6 +7266,8 @@ class StitchingPipeline:
                 volume = self._preprocess_single_tile(tile, ch_id)
                 result[ch_id].append((volume, tile))
 
+        self._log_light_path_shifts()
+        self._light_path_shifts = []
         return result
 
     def _estimate_flatfield_models(
@@ -7393,10 +7426,14 @@ class StitchingPipeline:
                 f"sides ({self.config.illumination_fusion})"
             )
             _first = next(iter(illum_volumes.values()))
+            _fuse_kw = self._illumination_fuse_kwargs(_first, tile)
+            _shift = self._light_path_shift(illum_volumes, tile, ch_id)
+            if _shift is not None:
+                _fuse_kw["align"] = _shift
             volume = fuse_illumination_sides(
                 illum_volumes,
                 method=self.config.illumination_fusion,
-                **self._illumination_fuse_kwargs(_first, tile),
+                **_fuse_kw,
             )
         else:
             volume = np.asarray(list(illum_volumes.values())[0])
@@ -7754,6 +7791,8 @@ class StitchingPipeline:
                 f"  Preprocessed {completed} tiles in {total:.1f}s "
                 f"({total / completed:.1f}s/tile avg; {rates})"
             )
+        self._log_light_path_shifts()
+        self._light_path_shifts = []
 
         # Return in original tile order so fusion sees tiles in the same
         # spatial sequence regardless of completion order from the pool.
@@ -8135,6 +8174,89 @@ class StitchingPipeline:
             f"down every tile column and hand half of every edge tile to the "
             f"sheet that just crossed the entire sample."
         )
+
+    def _light_path_shift(self, illum_volumes, tile, ch_id):
+        """Whole-voxel shift of the second light path onto the first, or None.
+
+        Only with 'Align light paths' on and two sides. Measured per tile and
+        channel, because every laser takes its own pair of stacks. Logged per
+        tile; ``_log_light_path_shifts`` sums them up in acquisition order.
+        """
+        if not getattr(self.config, "illumination_align", False):
+            return None
+        if len(illum_volumes) != 2:
+            return None
+        if self.config.illumination_fusion == "leonardo":
+            if not getattr(self, "_warned_align_leonardo", False):
+                self._warned_align_leonardo = True
+                self.logger.warning(
+                    "Align light paths: not applied with Leonardo illumination "
+                    "fusion, which takes whole volumes."
+                )
+            return None
+        from flamingo_stitcher import side_align
+
+        sides = sorted(illum_volumes)
+        z_step = self.config.z_step_um
+        if z_step is None:
+            z_step = tile.z_step_mm * 1000.0 if tile.z_step_mm else None
+        px = float(self.config.pixel_size_um)
+        if not z_step or px <= 0:
+            return None
+        try:
+            res = side_align.measure(
+                illum_volumes[sides[0]],
+                illum_volumes[sides[1]],
+                (float(z_step), px, px),
+                float(getattr(self.config, "registration_min_cell_r", 0.1) or 0.1),
+            )
+        except Exception as exc:  # a failed measurement must not fail the tile
+            self.logger.warning(f"    Align light paths: measurement failed ({exc!r}); not applied")
+            return None
+        label = center_out.tile_label(tile, 0)
+        dz, dy, dx = res.shift
+        what = (
+            f"dz {dz:+d} planes ({dz * z_step:+.1f} µm), dy {dy:+d} px, dx {dx:+d} px "
+            f"({dy * px:+.1f}, {dx * px:+.1f} µm)"
+        )
+        verdict = "applied" if res.applied else f"not applied: {res.reason}"
+        self.logger.info(
+            f"    Ch{ch_id}: light path {sides[1]} vs {sides[0]}: {what}; "
+            f"cells r {res.r_without:.2f} without, {res.r_with:.2f} with; {verdict} "
+            f"(planes {res.window[0]}-{res.window[1]})"
+        )
+        if not hasattr(self, "_light_path_shifts"):
+            self._light_path_shifts = []
+        self._light_path_shifts.append(
+            (getattr(tile, "tile_index", None), label, ch_id, res, float(z_step), px)
+        )
+        return res.as_applied()
+
+    def _log_light_path_shifts(self) -> None:
+        """One table of the light-path shifts, in acquisition order.
+
+        The server images row by row from the highest stage X and Y (X000 Y000)
+        down, so index order is time order. A sample settling under the laser
+        shows as shifts that shrink down this table.
+        """
+        rows = getattr(self, "_light_path_shifts", None)
+        if not rows:
+            return
+        def _order(r):
+            idx = r[0]
+            return (idx[1], idx[0]) if idx is not None else (1e9, 1e9)
+        applied = sum(1 for r in rows if r[3].applied)
+        self.logger.info(
+            f"  Align light paths: {applied} of {len(rows)} tile-channels shifted "
+            "(in acquisition order; shift of the second path onto the first):"
+        )
+        for idx, label, ch, res, z_step, px in sorted(rows, key=_order):
+            dz, dy, dx = res.shift
+            self.logger.info(
+                f"    {label:<10} ch{ch}  dz {dz * z_step:+7.1f} µm  dy {dy * px:+6.1f} µm  "
+                f"dx {dx * px:+6.1f} µm  r {res.r_without:5.2f} -> {res.r_with:5.2f}  "
+                f"{'applied' if res.applied else res.reason}"
+            )
 
     def _illumination_fuse_kwargs(self, volume, tile=None) -> Dict[str, Any]:
         """Extra arguments for `fuse_illumination_sides` on this acquisition."""

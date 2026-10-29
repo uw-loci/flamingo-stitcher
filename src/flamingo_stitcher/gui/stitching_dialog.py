@@ -185,6 +185,10 @@ class BackgroundZeroPanel(QWidget):
         self._channels_layout.setContentsMargins(0, 0, 0, 0)
         body_layout.addWidget(self._channels_container)
         self._render_no_channels_placeholder()
+        # The thresholds only act with the box checked. 'Preview…' stays live:
+        # it is how the thresholds are chosen before turning zeroing on.
+        self._enable_cb.toggled.connect(self._channels_container.setEnabled)
+        self._channels_container.setEnabled(self._enable_cb.isChecked())
 
         btn_row = QHBoxLayout()
         self._preview_btn = QPushButton("Preview…")
@@ -782,7 +786,27 @@ class StitchingDialog(PersistentDialog):
             "'Separate (keep light paths)' keeps each sheet as its own\n"
             "channel, to check which one causes an artifact."
         )
-        settings_layout.addWidget(self._fusion_combo, 1, 3)
+        # Align light paths: lives beside the combo it modifies.
+        self._illum_align_cb = QCheckBox("Align light paths")
+        self._illum_align_cb.setToolTip(
+            "Use when the lower (first-imaged) rows look doubled. Each tile is\n"
+            "imaged with one light sheet, then again with the other, so a\n"
+            "sample that moves during the run is in two places. This measures\n"
+            "each tile's shift between the two sheets and moves the second onto\n"
+            "the first before merging them, in whole planes and whole pixels,\n"
+            "so nothing is resampled and tile placement is unchanged. A shift\n"
+            "is used only if it lines the cells up better than no shift; the\n"
+            "log lists every tile's shift in imaging order. Adds a few seconds\n"
+            "per tile. Not used with 'Leonardo FUSE' or 'Separate (keep light\n"
+            "paths)'."
+        )
+        _illum_box = QHBoxLayout()
+        _illum_box.setContentsMargins(0, 0, 0, 0)
+        _illum_box.addWidget(self._fusion_combo, 1)
+        _illum_box.addWidget(self._illum_align_cb)
+        settings_layout.addLayout(_illum_box, 1, 3)
+        self._fusion_combo.currentIndexChanged.connect(self._update_illum_align_enabled)
+        self._update_illum_align_enabled()
 
         # Tile-overlap fusion (how adjacent TILES are combined — distinct from
         # the illumination-side fusion above). Placed alongside it to make the
@@ -1308,8 +1332,8 @@ class StitchingDialog(PersistentDialog):
         self._z_refine_range_spin.setSuffix(" µm")
         self._z_refine_range_spin.setValue(40.0)
         self._z_refine_range_spin.setToolTip(
-            "How far (± µm) 'Refine Z alignment' searches in Z; used only\n"
-            "when that box is checked. Default ±40 µm. It never searches\n"
+            "How far (± µm) 'Refine Z alignment' searches in Z; grayed out\n"
+            "unless that box is checked. Default ±40 µm. It never searches\n"
             "past the Z shift limit ('Maximum axial correction' on the\n"
             "'Options' tab). A tile whose correction lands at the limit\n"
             "keeps its first-pass Z (the log counts these). If many do,\n"
@@ -1317,6 +1341,8 @@ class StitchingDialog(PersistentDialog):
         )
         reg_layout.addWidget(self._z_refine_range_label, 2, 2)
         reg_layout.addWidget(self._z_refine_range_spin, 2, 3)
+        self._z_refine_cb.toggled.connect(self._update_z_refine_controls)
+        self._update_z_refine_controls()
 
         reg_layout.addWidget(QLabel("Approach:"), 4, 0)
         self._approach_combo = QComboBox()
@@ -1508,9 +1534,11 @@ class StitchingDialog(PersistentDialog):
             "'Full (area + Z-range)': also which Z planes are affected;\n"
             "slower at full resolution.\n"
             "'Pairs only': just the list of tile pairs.\n"
-            "Used only with 'Detect border artifacts (QC)' checked."
+            "Grayed out unless 'Detect border artifacts (QC)' is checked."
         )
         proc_layout.addWidget(self._border_qc_mode_combo, 8, 2)
+        self._border_qc_cb.toggled.connect(self._update_border_qc_controls)
+        self._update_border_qc_controls()
 
         self._reg_report_cb = QCheckBox("Registration report")
         self._reg_report_cb.setChecked(True)
@@ -3016,15 +3044,34 @@ class StitchingDialog(PersistentDialog):
         # never registered, which is exactly the fact that went unnoticed for
         # months.
         self._z_refine_cb.setEnabled(not checked)
-        self._z_refine_range_label.setEnabled(not checked)
-        self._z_refine_range_spin.setEnabled(not checked)
+        self._update_z_refine_controls()
         self._z_snap_cb.setEnabled(not checked)
         self._approach_combo.setEnabled(not checked)
+
+    def _update_z_refine_controls(self, *_args) -> None:
+        """'Z search' is only used by 'Refine Z alignment'."""
+        on = self._z_refine_cb.isChecked() and not self._skip_reg_cb.isChecked()
+        self._z_refine_range_label.setEnabled(on)
+        self._z_refine_range_spin.setEnabled(on)
+
+    def _update_border_qc_controls(self, *_args) -> None:
+        """'QC detail' is only used by 'Detect border artifacts (QC)'."""
+        on = self._border_qc_cb.isChecked()
+        self._border_qc_label.setEnabled(on)
+        self._border_qc_mode_combo.setEnabled(on)
 
     def _on_downsample_xy_changed(self, _index: int):
         """Grey out Z combo when XY is iso (iso overrides both factors)."""
         is_iso = self._downsample_xy_combo.currentData() == -1
         self._downsample_z_combo.setEnabled(not is_iso)
+
+    def _illum_align_applies(self) -> bool:
+        return self._fusion_combo.currentData() not in ("leonardo", "separate")
+
+    def _update_illum_align_enabled(self, *_args) -> None:
+        """'Align light paths' acts on the merge, so it is grayed out where
+        the two sheets are not merged plane by plane."""
+        self._illum_align_cb.setEnabled(self._illum_align_applies())
 
     def _has_downsample(self) -> bool:
         """True when 'Downsample' shrinks the tile (XY, Z, or 'iso')."""
@@ -3579,6 +3626,9 @@ class StitchingDialog(PersistentDialog):
         else:
             config.split_illumination = False
             config.illumination_fusion = _illum
+        config.illumination_align = (
+            self._illum_align_cb.isChecked() and self._illum_align_applies()
+        )
         config.tile_overlap_fusion = self._tile_fusion_combo.currentData()
         config.blending_width_overlap_fraction = float(
             self._blend_width_combo.currentData()
@@ -3966,6 +4016,7 @@ class StitchingDialog(PersistentDialog):
             ("flat_field_correction", self._flat_field_cb),
             ("destripe", self._destripe_cb),
             ("destripe_fast", self._destripe_fast_cb),
+            ("illumination_align", self._illum_align_cb),
             ("deconvolution_enabled", self._deconv_cb),
             ("content_based_fusion", self._content_fusion_cb),
             ("skip_registration", self._skip_reg_cb),
@@ -6392,6 +6443,7 @@ class StitchingDialog(PersistentDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("illumination_align", self._illum_align_cb.isChecked())
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("blend_width_overlap", self._blend_width_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
@@ -6518,6 +6570,9 @@ class StitchingDialog(PersistentDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+        self._illum_align_cb.setChecked(
+            s.value("illumination_align", False, type=bool)
+        )
 
         tile_fusion = s.value("tile_overlap_fusion", "", type=str)
         if tile_fusion:
@@ -6733,6 +6788,7 @@ class NativeStitchingDialog(StitchingDialog):
         s.setValue("downsample_xy", self._downsample_xy_combo.currentData())
         s.setValue("downsample_z", self._downsample_z_combo.currentData())
         s.setValue("fusion", self._fusion_combo.currentData())
+        s.setValue("illumination_align", self._illum_align_cb.isChecked())
         s.setValue("tile_overlap_fusion", self._tile_fusion_combo.currentData())
         s.setValue("blend_width_overlap", self._blend_width_combo.currentData())
         s.setValue("frame_size_idx", self._frame_size_combo.currentIndex())
@@ -6859,6 +6915,9 @@ class NativeStitchingDialog(StitchingDialog):
             idx = self._fusion_combo.findData(fusion)
             if idx >= 0:
                 self._fusion_combo.setCurrentIndex(idx)
+        self._illum_align_cb.setChecked(
+            s.value("illumination_align", False, type=bool)
+        )
 
         tile_fusion = s.value("tile_overlap_fusion", "", type=str)
         if tile_fusion:

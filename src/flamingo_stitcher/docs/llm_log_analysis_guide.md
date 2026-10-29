@@ -519,6 +519,15 @@ blended with a flat image at the threshold, weight on its own value
 sigmoid((value - threshold) / crossover). Run 32 logged crossover 900 with
 threshold 110; the user saw a washed-out, "brightfield"-looking mosaic.
 
+**Align light paths (from 0.13.22, off by default).** Per tile and channel during
+preprocessing: `Ch3: light path 1 vs 0: dz +4 planes (+10.0 µm), dy +2 px, dx -5 px (...);
+cells r 0.21 without, 0.48 with; applied (planes 1200-1328)`, then after preprocessing one
+table, `Align light paths: N of M tile-channels shifted (in acquisition order ...)`. The
+acquisition order is X000 Y000 first (the server tiles row by row from the highest stage X and
+Y), so a sample settling under the laser shows as shifts shrinking down the table. `not
+applied: ...` gives the gate that refused it: no structure, cells r below the floor, no better
+than no shift, or beyond a quarter of the measured window.
+
 **Kept seams left visibly off (from 2026-10-27).** The solve tolerance is in
 LATERAL registration pixels, so it grows with the XY downsample while Z planes
 do not (XY 4x, Z 1x: 25 px = 105 µm = 42 planes of Z). `Kept seams left visibly

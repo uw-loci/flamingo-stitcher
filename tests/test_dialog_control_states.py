@@ -91,3 +91,66 @@ def test_fast_destripe_needs_a_downsample(dialog):
     _select(dialog._downsample_z_combo, 2)  # a Z-only downsample still counts
     assert dialog._destripe_fast_cb.isEnabled()
     assert dialog._build_config().destripe_fast is True
+
+
+def test_z_search_needs_refine_z(dialog):
+    dialog._skip_reg_cb.setChecked(False)
+    dialog._z_refine_cb.setChecked(False)
+    assert not dialog._z_refine_range_spin.isEnabled()
+    dialog._z_refine_cb.setChecked(True)
+    assert dialog._z_refine_range_spin.isEnabled()
+    dialog._skip_reg_cb.setChecked(True)
+    assert not dialog._z_refine_range_spin.isEnabled()
+    dialog._skip_reg_cb.setChecked(False)
+    assert dialog._z_refine_range_spin.isEnabled()
+
+
+def test_qc_detail_needs_border_qc(dialog):
+    dialog._border_qc_cb.setChecked(False)
+    assert not dialog._border_qc_mode_combo.isEnabled()
+    dialog._border_qc_cb.setChecked(True)
+    assert dialog._border_qc_mode_combo.isEnabled()
+
+
+def test_align_light_paths_follows_the_merge(dialog):
+    for fusion, ok in (("max", True), ("split", True), ("content", True),
+                       ("separate", False), ("leonardo", False)):
+        i = dialog._fusion_combo.findData(fusion)
+        dialog._fusion_combo.model().item(i).setEnabled(True)
+        dialog._fusion_combo.setCurrentIndex(i)
+        assert dialog._illum_align_cb.isEnabled() is ok, fusion
+    _select(dialog._fusion_combo, "split")
+    dialog._illum_align_cb.setChecked(True)
+    assert dialog._build_config().illumination_align is True
+    _select(dialog._fusion_combo, "separate")
+    assert dialog._build_config().illumination_align is False
+
+
+def test_options_tab_grays_out_settings_switched_off(qapp):
+    from flamingo_stitcher.gui.options_panel import OptionsPanel
+
+    panel = OptionsPanel()
+    auto = panel._spins["registration_channel_auto"]
+    channel = panel._spins["reg_channel"]
+    auto.setChecked(True)
+    assert not channel.isEnabled()
+    auto.setChecked(False)
+    assert channel.isEnabled()
+    affine = panel._spins["intensity_adjust_affine"]
+    pull = panel._spins["intensity_adjust_offset_regularization"]
+    affine.setChecked(False)
+    assert not pull.isEnabled()
+    affine.setChecked(True)
+    assert pull.isEnabled()
+    panel.deleteLater()
+
+
+def test_zeroing_thresholds_need_the_box(qapp):
+    from flamingo_stitcher.gui.stitching_dialog import BackgroundZeroPanel
+
+    p = BackgroundZeroPanel()
+    assert not p._channels_container.isEnabled()
+    p._enable_cb.setChecked(True)
+    assert p._channels_container.isEnabled()
+    assert p._preview_btn.isEnabled()
+    p.deleteLater()
