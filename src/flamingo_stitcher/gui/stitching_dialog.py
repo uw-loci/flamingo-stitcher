@@ -1045,7 +1045,8 @@ class StitchingDialog(PersistentDialog):
         self._destripe_fast_cb = QCheckBox("Fast")
         self._destripe_fast_cb.setToolTip(
             "Destripes the downsampled tile instead of every full-resolution\n"
-            "plane: much faster when 'Downsample' is above 1x. The destripe\n"
+            "plane: much faster, and grayed out when 'Downsample' is 1x in\n"
+            "both XY and Z, where there is nothing to skip. The destripe\n"
             "settings are converted for the smaller frame, so it removes the\n"
             "same stripes the preview shows, but both illumination sides are\n"
             "filtered together after they are merged. Good for test runs;\n"
@@ -1057,6 +1058,8 @@ class StitchingDialog(PersistentDialog):
         # the UI state matches what the pipeline will actually run. The
         # plain toggled→setEnabled link only handled the enabled state.
         self._destripe_cb.toggled.connect(self._on_destripe_toggled)
+        for _combo in (self._downsample_xy_combo, self._downsample_z_combo):
+            _combo.currentIndexChanged.connect(self._update_destripe_fast_enabled)
 
         # Stripe orientation. The filter is axis-fixed AND destriping runs in the
         # raw camera frame (before the per-tile rot/flip), so the wrong axis
@@ -3023,6 +3026,29 @@ class StitchingDialog(PersistentDialog):
         is_iso = self._downsample_xy_combo.currentData() == -1
         self._downsample_z_combo.setEnabled(not is_iso)
 
+    def _has_downsample(self) -> bool:
+        """True when 'Downsample' shrinks the tile (XY, Z, or 'iso')."""
+        return (self._downsample_xy_combo.currentData() != 1
+                or self._downsample_z_combo.currentData() != 1)
+
+    def _destripe_fast_applies(self) -> bool:
+        """'Fast' only means something when there is a downsample to run after.
+
+        With XY and Z at 1x it would still move destriping after the two
+        illumination sides are merged, losing the per-side filtering for no
+        speed gain, so a checked but grayed-out 'Fast' is not sent.
+        """
+        return self._destripe_fast_cb.isChecked() and self._has_downsample()
+
+    def _update_destripe_fast_enabled(self, *_args) -> None:
+        """Gray out 'Fast' unless Destripe is on and something is downsampled.
+        The check mark is kept so it comes back with a downsample."""
+        self._destripe_fast_cb.setEnabled(
+            self._destripe_cb.isChecked()
+            and self._destripe_cb.isEnabled()
+            and self._has_downsample()
+        )
+
     def _on_destripe_toggled(self, checked: bool):
         """Keep the Fast sub-option in sync with the Destripe master.
 
@@ -3032,7 +3058,7 @@ class StitchingDialog(PersistentDialog):
         which let a persisted Fast=True survive Destripe=False and get
         submitted to the pipeline.
         """
-        self._destripe_fast_cb.setEnabled(checked)
+        self._update_destripe_fast_enabled()
         self._destripe_dir_combo.setEnabled(checked)
         self._destripe_settings_btn.setEnabled(checked)
         self._destripe_preview_btn.setEnabled(checked)
@@ -3560,7 +3586,7 @@ class StitchingDialog(PersistentDialog):
         config.output_format = self._format_combo.currentData()
         config.flat_field_correction = self._flat_field_cb.isChecked()
         config.destripe = self._destripe_cb.isChecked()
-        config.destripe_fast = self._destripe_fast_cb.isChecked()
+        config.destripe_fast = self._destripe_fast_applies()
         config.destripe_direction = self._destripe_dir_combo.currentData()
         config.destripe_params = dict(self._destripe_params)
         config.downsample_xy = self._downsample_xy_combo.currentData()

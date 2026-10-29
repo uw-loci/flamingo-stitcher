@@ -71,3 +71,23 @@ def test_the_main_window_no_longer_sets_shift_limits(dialog):
 def test_a_loaded_shift_limit_is_carried_and_named_in_the_log(dialog):
     dialog._apply_stitching_config({"max_registration_shift_z_um": 40.0})
     assert dialog._loaded_config_overrides.get("max_registration_shift_z_um") == 40.0
+
+
+def test_fast_destripe_needs_a_downsample(dialog):
+    """2026-10-29: 'Fast' does nothing useful at 1x XY and Z, so it is grayed
+    out and not sent; the check mark returns with a downsample."""
+    dialog._destripe_cb.setChecked(True)
+    _select(dialog._downsample_xy_combo, 2)
+    _select(dialog._downsample_z_combo, 1)
+    assert dialog._destripe_fast_cb.isEnabled()
+    dialog._destripe_fast_cb.setChecked(True)
+    assert dialog._build_config().destripe_fast is True
+
+    _select(dialog._downsample_xy_combo, 1)
+    assert not dialog._destripe_fast_cb.isEnabled()
+    assert dialog._destripe_fast_cb.isChecked()
+    assert dialog._build_config().destripe_fast is False
+
+    _select(dialog._downsample_z_combo, 2)  # a Z-only downsample still counts
+    assert dialog._destripe_fast_cb.isEnabled()
+    assert dialog._build_config().destripe_fast is True
