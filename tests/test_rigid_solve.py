@@ -105,6 +105,124 @@ class TestCentreShift:
 
 
 # --------------------------------------------------------------------------
+# Judging a seam where the tiles meet, not at their centres
+# --------------------------------------------------------------------------
+
+
+def _tilt_zx(deg):
+    """3x3 in (z, y, x) order: Z changes along X (a tilt out of the XY plane)."""
+    a = np.radians(deg)
+    m = np.eye(3)
+    m[0, 0], m[0, 2] = np.cos(a), -np.sin(a)
+    m[2, 0], m[2, 2] = np.sin(a), np.cos(a)
+    return m
+
+
+def _disagree(measured, a, b, Ra, Rb, ca, cb):
+    """What the registration map computes: measured minus placed, at the seam."""
+    pipe = StitchingPipeline(StitchingConfig())
+    da = Ra @ ca - ca   # centre shifts of a rigid mosaic motion (t = 0)
+    db = Rb @ cb - cb
+    term = pipe._rotation_at_seam_um((Ra, ca), (Rb, cb))
+    return measured - (da - db) - term, measured - (da - db)
+
+
+@pytest.mark.parametrize("R", [_rot_zyx(1.25)[:3, :3], _tilt_zx(0.64)])
+def test_a_mosaic_rotated_as_one_body_leaves_no_seam_off(R):
+    """Every seam honoured: the measured pairwise shift is 0 and both tiles
+    share one rotation about the world origin. The centre shifts still differ
+    by (R - I)(c_a - c_b), about angle x pitch: run 35 listed seams 39-49 µm
+    off from exactly this (1.17-1.32° tiles, 1931 µm pitch)."""
+    ca = np.array([18000.0, 19207.0, 5596.0])
+    cb = np.array([18000.0, 19207.0, 7527.0])      # x neighbour, 1931 µm on
+    fixed, old = _disagree(np.zeros(3), 0, 1, R, R, ca, cb)
+    np.testing.assert_allclose(fixed, 0.0, atol=1e-9)
+    assert np.linalg.norm(old) > 20.0               # what the old check reported
+
+
+def test_no_rotation_adds_nothing():
+    pipe = StitchingPipeline(StitchingConfig())
+    c = np.array([0.0, 1000.0, 2000.0])
+    np.testing.assert_allclose(
+        pipe._rotation_at_seam_um((np.eye(3), c), (np.eye(3), c + 1931.0)), 0.0
+    )
+    np.testing.assert_allclose(pipe._rotation_at_seam_um(None, None), 0.0)
+
+
+def test_a_real_misplacement_is_still_reported():
+    """The term removes the rotation's share, not a genuine error: shift tile
+    b by 15 µm in Z beyond the rigid motion and the check sees -15 µm."""
+    R = _rot_zyx(1.0)[:3, :3]
+    ca = np.array([18000.0, 19207.0, 5596.0])
+    cb = np.array([18000.0, 19207.0, 7527.0])
+    pipe = StitchingPipeline(StitchingConfig())
+    da = R @ ca - ca
+    db = R @ cb - cb + np.array([15.0, 0.0, 0.0])
+    off = np.zeros(3) - (da - db) - pipe._rotation_at_seam_um((R, ca), (R, cb))
+    np.testing.assert_allclose(off, [15.0, 0.0, 0.0], atol=1e-9)
+
+
+@pytest.mark.parametrize("extra_um", [0.0, 15.0])
+@pytest.mark.parametrize("R", [_rot_zyx(1.25)[:3, :3], _tilt_zx(0.64)])
+def test_the_check_agrees_with_multiview_stitchers_own_residual(R, extra_um):
+    """Sign and size checked against the library, not against this file.
+
+    multiview-stitcher scores a seam by placing the overlap's corners with
+    both tiles' final affines (``compute_edge_residuals``). The map's number,
+    with the rotation term, must match it; without the term it did not.
+    """
+    pytest.importorskip("multiview_stitcher")
+    import networkx as nx
+    import xarray as xr
+    from multiview_stitcher.param_resolution.utils import compute_edge_residuals
+
+    ca = np.array([3750.0, 19207.0, 5596.0])
+    cb = np.array([3750.0, 19207.0, 7527.0])
+    mid = 0.5 * (ca + cb)
+    half = np.array([3750.0, 1070.0, 107.0])          # the shared strip
+    s = np.array([11.25, 0.0, -16.0])                 # measured pairwise shift
+    T = np.eye(4)
+    T[:3, 3] = s
+
+    def affine(R_, c, d):                              # rotate about c, centre moves d
+        m = np.eye(4)
+        m[:3, :3] = R_
+        m[:3, 3] = c + d - R_ @ c
+        return m
+
+    da = np.array([5.0, -3.0, 2.0])
+    db = da - s + np.array([extra_um, 0.0, 0.0])      # honour s, then add an error
+    # Rigid body: b's centre also follows the rotation about a's centre.
+    db = db + (R - np.eye(3)) @ (cb - ca)
+    Aa, Ab = affine(R, ca, da), affine(R, cb, db)
+
+    g = nx.Graph()
+    g.add_edge(0, 1, bbox=xr.DataArray(np.stack([mid - half, mid + half])),
+               transform=xr.DataArray(T))
+    mvs = compute_edge_residuals(g, {0: Aa, 1: Ab}, ndim=3)[(0, 1)]
+
+    pipe = StitchingPipeline(StitchingConfig())
+    ours = s - (da - db) - pipe._rotation_at_seam_um((R, ca), (R, cb))
+    old = s - (da - db)
+    assert abs(np.linalg.norm(ours) - mvs) < 1.0, (ours, mvs)
+    if extra_um == 0.0:
+        assert np.linalg.norm(old) > 20.0             # the false alarm it replaces
+
+
+def test_rotations_by_tile_keeps_every_tile_with_a_centre():
+    pipe = StitchingPipeline(StitchingConfig())
+    rot = np.eye(4)
+    rot[:3, :3] = _rot_zyx(0.5)[:3, :3]
+    out = pipe._rotations_by_tile(
+        [np.eye(4), rot, np.eye(4)],
+        [np.zeros(3), np.ones(3), None],
+    )
+    assert sorted(out) == [0, 1]
+    np.testing.assert_allclose(out[0][0], np.eye(3))
+    np.testing.assert_allclose(out[1][0], rot[:3, :3])
+
+
+# --------------------------------------------------------------------------
 # End to end
 # --------------------------------------------------------------------------
 

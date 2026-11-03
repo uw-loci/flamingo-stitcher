@@ -36,8 +36,10 @@ illumination:
   #            scattering sample: out-of-focus blur is bright and smooth, so max
   #            prefers the blur to the in-focus signal underneath it.
   #   mean     simple average.
-  #   split    each sheet owns its own half of the frame; the far half of each
-  #            is discarded. Needs `low_side`.
+  #   split    each sheet owns its half of the ACQUISITION: on a mosaic every
+  #            tile takes one sheet whole (the one whose half holds the tile's
+  #            centre), so the handover is a tile seam; a single FOV is cut at
+  #            its midline. Needs `low_side`.
   #   blend    as split, with a smoothstep handover band (`pure_frac`).
   #   content  weight each sheet by local high-frequency energy — the measure
   #            that tells IN FOCUS from BRIGHT. Needs no geometry at all.

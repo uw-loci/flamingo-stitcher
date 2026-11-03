@@ -643,6 +643,23 @@ _ROUGH_S_PER_OUT_UNIT = 0.325
 _ROUGH_INTENSITY_FACTOR = {"measure": 1.09, "apply": 1.43}
 _ROUGH_S_PER_DESTRIPE_MPX = 0.035
 _ROUGH_SEPARATE_ILLUM_FACTOR = 2.0
+# Write, split out of the fuse + write term above (2026-11-03) so the live ETA
+# can extrapolate fusion from its own regions and still know what follows.
+# MB per second of TILE data (planes x frame x 2 bytes per output channel,
+# divided by the XY^2 and Z downsample) written as OME-TIFF, Ket_Trial1 on n7:
+#   XY 2x, 264 GB: 51:13, 1:05:08, 56:29, 52:55, 1:09:17 (runs 23/25/29/30/32)
+#     = 86, 68, 78, 83, 64 MB/s
+#   XY 1x, 1056 GB: 4:23:31 (run 35) = 67 MB/s
+# Geometric mean 74. The fuse + write calibration is unchanged in total; the
+# fuse term is what remains after this one. Other formats are not measured.
+_ROUGH_WRITE_MBPS = 74.0
+# Content-based blending (multiview-stitcher weights.content_based) on the fuse
+# term alone. Run 35 (Ket_Trial1, XY 1x, Apply, 2026-10-30 to 11-03): fuse
+# 354635 s against a cosine prior of 44267 s = 8.0x. ONE run, and confounded:
+# it was also the first full-resolution fuse (a 913 GB fused memmap on a
+# 191 GB machine), with Split and a blended tile overlap. The pipeline's own
+# warning says 5-10x. Replace with a cosine-vs-content pair at one setting.
+_ROUGH_CONTENT_BASED_FUSE_FACTOR = 8.0
 #   _ROUGH_S_PER_REG_MVOXEL: registration, seconds per MILLION voxels actually
 #                          compared. Pairwise registrations run SERIALLY for
 #                          3-D data (multiview-stitcher sets
@@ -834,10 +851,27 @@ def rough_phase_seconds(tiles, config) -> Dict[str, float]:
     fuse_write = (
         _ROUGH_S_PER_OUT_UNIT * out_units * _ROUGH_INTENSITY_FACTOR.get(mode, 1.0)
     )
+    # Bytes of tile data per output unit (one plane of one tile, one channel,
+    # after the downsample). The largest frame stands for all, as `planes` does.
+    frame_px = max(
+        (
+            int(getattr(t, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+            * int(getattr(t, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
+            for t in tiles
+        ),
+        default=FRAME_WIDTH * FRAME_HEIGHT,
+    )
+    write = out_units * frame_px * 2.0 / (_ROUGH_WRITE_MBPS * 1e6)
+    # Never let the split leave fusion with less than a fifth of the old term.
+    write = min(write, 0.8 * fuse_write)
+    fuse = fuse_write - write
+    if bool(getattr(config, "content_based_fusion", False)):
+        fuse *= _ROUGH_CONTENT_BASED_FUSE_FACTOR
     return {
         "preprocess": load_register,
         "register": _rough_register_seconds(tiles, config),
-        "fuse": fuse_write,
+        "fuse": fuse,
+        "write": write,
     }
 
 
@@ -3926,6 +3960,17 @@ def side_weight_profile(
 
     Defaults (``span=None, offset=0``) give the single-FOV behaviour unchanged:
     a mosaic of one tile is the special case.
+
+    A hard split inside a MOSAIC hands each tile ONE sheet whole: the sheet
+    whose half of the acquisition holds the tile's centre (the low-end sheet
+    when the centre sits exactly on the middle). The handover is then a tile
+    seam, which registration measures and fusion blends, never a cut inside a
+    frame. A cut inside a frame sits at the same stage-relative place in both
+    tiles of the seam it falls in, and with each sheet's own frame-fixed stripe
+    pattern either side of it phase correlation locked onto it: Ket_Trial1
+    run 35 measured exactly 0 µm on the three handover seams of the dim top
+    rows, where Max had measured -11 to -14 µm on the same data, and the Z of
+    those seams came out arbitrary.
     """
     n = max(1, int(n))
     span = max(1, int(span)) if span else n
@@ -3935,6 +3980,9 @@ def side_weight_profile(
     frac = min(0.5, max(0.0, float(pure_frac)))
     pure = int(round(frac * span))
     if pure * 2 >= span:  # hard split — no band left to ramp across
+        if span > n:  # a tile of a mosaic: one sheet, whole
+            low_owns = 2 * offset + n <= span  # centre at or before the middle
+            return np.full(n, 1.0 if low_owns else 0.0, dtype=np.float32)
         w = np.zeros(span, dtype=np.float32)
         w[: span // 2] = 1.0
         return w[offset: offset + n]
@@ -4958,6 +5006,7 @@ class StitchingPipeline:
         self._memory_warning_fn = memory_warning_fn
         self._memory_monitor = None
         self._estimator = None  # built once tile count is known
+        self._fuse_regions_t0 = None  # fusion's region clock, per run
         # Per-run registration evidence. Stashed on self, like _estimator,
         # because _register_tiles is called from three places (in-memory,
         # preview, streaming) while the report is written at the metadata step,
@@ -5037,6 +5086,35 @@ class StitchingPipeline:
             if needle in s:
                 return phase
         return None
+
+    def _log_region_done(
+        self, ch_id, done, total, region_s, fuse_frac, fuse_clock_s,
+        regions_done_all=None,
+    ):
+        """One log line per fused region: when it finished, how long it took,
+        and the ETA at fusion's own pace.
+
+        Run 35 fused for 98 hours with nothing in the log but freeze-watchdog
+        stacks, so "is it stuck?" could not be answered from the log.
+        """
+        from flamingo_stitcher.multi_phase_estimator import _format_duration
+
+        left = (
+            fuse_clock_s * (1.0 - fuse_frac) / fuse_frac if fuse_frac > 0 else None
+        )
+        tail = ""
+        if left is not None:
+            tail = f"; fusion ~{_format_duration(left)} left at this pace"
+        if self._estimator is not None:
+            label = self._estimator.format_label()
+            if label and label != "estimating...":
+                tail += f"; whole run {label}"
+        self.logger.info(
+            f"  {describe_channel(ch_id).capitalize()}: region {done}/{total} fused "
+            f"in {_format_duration(region_s)} (average "
+            f"{_format_duration(fuse_clock_s / max(regions_done_all or done, 1))} per "
+            f"region){tail}"
+        )
 
     def _writer_progress(self, pct, msg):
         """A writer's own 0-100 progress, kept inside the write band.
@@ -5290,7 +5368,7 @@ class StitchingPipeline:
             f"Stitching ETA phase shares ({source}): preprocess {a:.0%}, "
             f"registration {b - a:.0%}, fusion and writing {1 - b:.0%}"
         )
-        return MultiPhaseEstimator(cache, key, prior_total_s=prior)
+        return MultiPhaseEstimator(cache, key, prior_total_s=prior, prior_phase_s=phases)
 
     # ------------------------------------------------------------------
     # Tile-border artifact QC (diagnostic)
@@ -5518,10 +5596,15 @@ class StitchingPipeline:
                     report.ran and ta is not None and tb is not None
                     and None not in (s.dz_um, s.dy_um, s.dx_um)
                 ):
+                    # Under a rigid solve the rotations move the overlap too.
+                    rots = getattr(self, "_placed_rotations", None) or {}
+                    rz, ry, rx = self._rotation_at_seam_um(
+                        rots.get(ta.index), rots.get(tb.index)
+                    )
                     disagree = (
-                        float(s.dz_um) - (ta.dz_um - tb.dz_um),
-                        float(s.dy_um) - (ta.dy_um - tb.dy_um),
-                        float(s.dx_um) - (ta.dx_um - tb.dx_um),
+                        float(s.dz_um) - (ta.dz_um - tb.dz_um) - rz,
+                        float(s.dy_um) - (ta.dy_um - tb.dy_um) - ry,
+                        float(s.dx_um) - (ta.dx_um - tb.dx_um) - rx,
                     )
                 seams.append(rmap.MapSeam(
                     a, b, s.status if report.ran else "not_run",
@@ -5962,6 +6045,9 @@ class StitchingPipeline:
         self._illum_tiles = list(tiles)
         self._illum_span_logged = False
         self._verify_illumination_geometry(tiles)
+
+        self._fuse_regions_t0 = None
+        self._noted_align_split = False
 
         # --- Build the multi-phase ETA estimator ---
         # Built after discover so we know tile count + planes. The
@@ -6974,7 +7060,13 @@ class StitchingPipeline:
                     )
                     from multiview_stitcher import fusion as _fusion
 
+                    # Fusion's own clock starts at the first region of the first
+                    # channel, so set-up before it (intensity fit, thresholds)
+                    # does not count as region pace.
+                    if getattr(self, "_fuse_regions_t0", None) is None:
+                        self._fuse_regions_t0 = time.monotonic()
                     for ridx, (rprops, (z0, z1, y0, y1, x0, x1)) in enumerate(regions):
+                        _region_t0 = time.monotonic()
                         if self._cancelled_fn():
                             self.logger.info("Pipeline cancelled by user")
                             break
@@ -7015,10 +7107,21 @@ class StitchingPipeline:
                         region_pct = _PCT_FUSE + int(
                             (_PCT_WRITE - _PCT_FUSE) * (ch_idx + ch_frac) / n_out
                         )
+                        fuse_frac = (ch_idx + ch_frac) / n_out
+                        fuse_clock = time.monotonic() - self._fuse_regions_t0
+                        if self._estimator is not None:
+                            self._estimator.set_phase_progress(
+                                "fuse", fuse_frac, fuse_clock
+                            )
                         self._progress_fn(
                             region_pct,
                             f"Channel {ch_id}: fused region "
                             f"{ridx + 1}/{len(regions)}",
+                        )
+                        self._log_region_done(
+                            ch_id, ridx + 1, len(regions),
+                            time.monotonic() - _region_t0, fuse_frac, fuse_clock,
+                            regions_done_all=ch_idx * len(regions) + ridx + 1,
                         )
                     del sims
                 else:
@@ -7427,7 +7530,9 @@ class StitchingPipeline:
             )
             _first = next(iter(illum_volumes.values()))
             _fuse_kw = self._illumination_fuse_kwargs(_first, tile)
-            _shift = self._light_path_shift(illum_volumes, tile, ch_id)
+            _shift = self._light_path_shift(
+                illum_volumes, tile, ch_id, span=_fuse_kw.get("span")
+            )
             if _shift is not None:
                 _fuse_kw["align"] = _shift
             volume = fuse_illumination_sides(
@@ -8170,21 +8275,40 @@ class StitchingPipeline:
             f"{', reversed order' if reverse else ''}"
             f"{', frame axis flipped by orientation' if flipped else ''}). "
             f"Side {self.config.illumination_low_side} owns the low end. "
-            f"Splitting each tile at its own midline instead would draw a seam "
-            f"down every tile column and hand half of every edge tile to the "
-            f"sheet that just crossed the entire sample."
+            + (
+                "Under split each tile takes ONE sheet whole, the one whose half "
+                "holds the tile's centre, so the handover is a tile seam that "
+                "registration measures and fusion blends, not a cut inside a frame."
+                if self.config.illumination_fusion == "split" else
+                "Splitting each tile at its own midline instead would draw a seam "
+                "down every tile column and hand half of every edge tile to the "
+                "sheet that just crossed the entire sample."
+            )
         )
 
-    def _light_path_shift(self, illum_volumes, tile, ch_id):
+    def _light_path_shift(self, illum_volumes, tile, ch_id, span=None):
         """Whole-voxel shift of the second light path onto the first, or None.
 
         Only with 'Align light paths' on and two sides. Measured per tile and
         channel, because every laser takes its own pair of stacks. Logged per
         tile; ``_log_light_path_shifts`` sums them up in acquisition order.
+
+        Not measured under split on a mosaic (``span`` set): each tile takes one
+        path whole there, so a shift would move the whole tile, which
+        registration measures anyway. Run 35 spent 100-300 s per tile on it.
         """
         if not getattr(self.config, "illumination_align", False):
             return None
         if len(illum_volumes) != 2:
+            return None
+        if self.config.illumination_fusion == "split" and span:
+            if not getattr(self, "_noted_align_split", False):
+                self._noted_align_split = True
+                self.logger.info(
+                    "    Align light paths: not measured under split on a mosaic. "
+                    "Each tile takes one light path whole, so there is nothing to "
+                    "line up inside a tile; registration places the tiles."
+                )
             return None
         if self.config.illumination_fusion == "leonardo":
             if not getattr(self, "_warned_align_leonardo", False):
@@ -8690,6 +8814,7 @@ class StitchingPipeline:
             f"(quality threshold={self.config.quality_threshold})..."
         )
         started = time.time()
+        self._placed_rotations = {}
         # Assigned before the try so the finally block cannot raise NameError
         # over the top of the real failure if an import inside it blows up.
         reg_logger = logging.getLogger("multiview_stitcher.registration")
@@ -8891,9 +9016,14 @@ class StitchingPipeline:
                 elapsed_s=time.time() - started,
             )
             self._log_z_coverage(params, tile_data, voxel_size_um)
+            placed = _placed(params)
+            self._placed_rotations = (
+                self._rotations_by_tile(placed, rigid_centres)
+                if rigid_full is not None else {}
+            )
             self.logger.info("  Registration complete")
             self._log_verbose_alignment()
-            return _placed(params), "registered"
+            return placed, "registered"
 
         except Exception as e:
             self.logger.error(f"  Registration failed: {e}")
@@ -10206,6 +10336,43 @@ class StitchingPipeline:
             or getattr(r, "whole_matrix", False)
         }
         return drop
+
+    def _rotations_by_tile(self, placed_params, centres):
+        """``{tile index: (R, centre)}`` for every tile of a rigid solve.
+
+        Kept so a seam can be judged where the two tiles actually meet: the
+        report's per-tile shifts are CENTRE shifts, and a rotation moves the
+        overlap by (R - I)(p - c) on top of that. Unrotated tiles are kept too
+        (R = I), because their centre still locates the seam."""
+        out = {}
+        for i, (param, c) in enumerate(zip(placed_params, centres or [])):
+            if c is None:
+                continue
+            try:
+                R = np.asarray(self._param_matrix(param)[:3, :3], dtype=float)
+            except Exception:
+                continue
+            out[i] = (R, np.asarray(c, dtype=float))
+        return out
+
+    @staticmethod
+    def _rotation_at_seam_um(rot_a, rot_b):
+        """(z, y, x) µm the rotations add to (tile a's correction - tile b's)
+        where the two tiles meet, taken as the midpoint of their centres.
+
+        ``rot_a``/``rot_b``: ``(R, centre)`` from ``_rotations_by_tile``, or
+        None for a translation solve (no term). A tile's correction at world
+        point p is (R - I)(p - c) + d, d being the centre shift the report
+        lists. Without this term a mosaic that rotated as one rigid body, every
+        seam honoured, reads as off by about angle x tile pitch on every seam:
+        run 35 listed 52 of 54 kept seams as off, X002 Y006 | X002 Y005 by
+        39 µm where multiview-stitcher's own residual was 0.42 µm."""
+        if rot_a is None or rot_b is None:
+            return np.zeros(3)
+        (Ra, ca), (Rb, cb) = rot_a, rot_b
+        p = 0.5 * (ca + cb)
+        eye = np.eye(3)
+        return (Ra - eye) @ (p - ca) - (Rb - eye) @ (p - cb)
 
     def _with_rotations(self, full_params, rotations):
         """Copies of `full_params` with the rotation block of the given tiles

@@ -48,8 +48,13 @@ The header echoes the settings and provenance. Lines worth checking first:
   illumination falloff across the mosaic.
   `max` takes the brighter sample of the two, which on a scattering sample
   prefers out-of-focus blur (bright and smooth) over the in-focus signal
-  beneath it. `split` gives each sheet its own half of the frame and discards
-  the far half; `blend` is the same with a smoothstep handover band
+  beneath it. `split` gives each sheet its own half of the ACQUISITION: on a
+  mosaic (from 0.13.23) every tile takes one sheet whole, the one whose half
+  holds the tile's centre, so the handover is an ordinary tile seam; a single
+  FOV is cut at its midline. Up to 0.13.22 the one cut fell inside the
+  overlap of the two middle columns, and on dim tissue registration locked
+  onto it: run 35 measured exactly `0.00` dy and dx on those seams and placed
+  their Z arbitrarily. `blend` hands over with a smoothstep band
   (`illumination_pure_frac`, default 0.35); `content` weights each sheet by
   local high-frequency energy, which rejects blur however bright it is.
   `split` and `blend` need `illumination_low_side` (which side lights the low
@@ -508,6 +513,17 @@ also logged out of order (`register` before `preprocess`, `preprocess` again
 at fusion), so the check line repeated labels. A ratio near 0.65 or 0.42 at
 the first two live lines of an older log is that bug, not the model.
 
+**ETA during fusion (from 0.13.23).** Each fused region logs one line,
+`Channel 3 (640 nm): region 72/90 fused in 58:12 (average 59:03 per region);
+fusion ~17:42:00 left at this pace; whole run ...`. From the first region on,
+the whole-run ETA is fusion's own pace (its clock starts at the first region)
+plus the modelled write, instead of the whole-run fraction. Before 0.13.23
+the log said nothing during fusion but watchdog stacks, and the displayed
+finish slid later for the whole phase whenever fusion ran longer than its
+modelled share (run 35: 98 h of fusion against a 16 h prior). The cold prior
+now carries content-based blending (8x on the fuse term, from run 35 alone)
+and writing as its own term (~74 MB/s of tile data as OME-TIFF).
+
 **Destripe on the downsampled frame (from 0.13.20).** With 'Fast',
 `Destripe on the 2x-downsampled frame: sigma 228/456 -> 114/228, level 7 -> 6`
 records the conversion. Sigma and level are defined on the full-resolution
@@ -526,7 +542,9 @@ table, `Align light paths: N of M tile-channels shifted (in acquisition order ..
 acquisition order is X000 Y000 first (the server tiles row by row from the highest stage X and
 Y), so a sample settling under the laser shows as shifts shrinking down the table. `not
 applied: ...` gives the gate that refused it: no structure, cells r below the floor, no better
-than no shift, or beyond a quarter of the measured window.
+than no shift, or beyond a quarter of the measured window. From 0.13.23 it is not measured
+under `split` on a mosaic (each tile is one light path whole): `Align light paths: not
+measured under split on a mosaic`.
 
 **Kept seams left visibly off (from 2026-10-27).** The solve tolerance is in
 LATERAL registration pixels, so it grows with the XY downsample while Z planes
@@ -534,7 +552,12 @@ do not (XY 4x, Z 1x: 25 px = 105 µm = 42 planes of Z). `Kept seams left visibly
 off: N of M (Z more than ... µm = 2 output planes, or XY more than ... µm)`
 lists each kept seam the placement leaves off, with its Z and XY offsets
 separately; the map draws them yellow ("Registered, but left visibly off").
-A "registered" status alone does not mean the seam lines up.
+A "registered" status alone does not mean the seam lines up. Under a rigid
+solve before 0.13.23 this list is NOT reliable: it compared tile CENTRE
+shifts and left out what the rotation does where the tiles meet, so a mosaic
+that turned as one body read as off by about angle x tile pitch on every
+seam, all Z offsets one sign (run 35: 52 of 54, 35-49 µm XY on the 1.2-1.3°
+tiles). Read the solve's `resid µm` in the seam table instead for those logs.
 
 **`Window not responding for N s`** (ERROR, from 2026-10-27) is the GUI's
 freeze watchdog: the stack of every thread follows, the window's thread marked.

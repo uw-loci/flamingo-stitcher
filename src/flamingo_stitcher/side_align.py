@@ -5,8 +5,9 @@ the same stack again with the right path (``WorkflowBase.cpp``: per stack, per
 laser, per path). The same plane in the two paths is therefore one stack-time
 apart, and a sample that moves during the run (Ket_Trial1, 2026-10-27: up to
 ~110 um Z per row early on, attributed to laser heating) is imaged in two
-places. Max, mean and content fusion then show it doubled; split shows a step
-at the midline.
+places. Max, mean and content fusion then show it doubled. Split on a mosaic
+gives each tile one path whole, so it has nothing to align and is skipped; a
+single-FOV split still cuts the frame and shows the shift as a step there.
 
 This module measures the shift of the second path against the first on the
 middle of the frame, where both sheets light the sample, and applies it in

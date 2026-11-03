@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from flamingo_stitcher.multi_phase_estimator import MultiPhaseEstimator
 from flamingo_stitcher.timing_cache import StitchingTimingCache, StitchingTimingKey
 
@@ -122,3 +124,78 @@ def test_a_phase_started_too_early_to_extrapolate_is_not_logged(tmp_path):
     est = _make(tmp_path, prior=1000.0)
     est.start_phase("discover")  # elapsed ~0
     assert [label for label, _ in est._predictions] == ["start"]
+
+
+# --------------------------------------------------------------------------
+# A phase that reports its own progress is extrapolated on its own clock
+# --------------------------------------------------------------------------
+
+
+def _make_phased(tmp_path, prior_phase_s):
+    cache = StitchingTimingCache(path=tmp_path / "t.json")
+    key = StitchingTimingKey(
+        n_tiles=42, n_channels=1, n_pyramid_levels=1, n_timepoints=1,
+        output_format="ome-tiff", fusion_method="content_based",
+        skip_registration=False, planes_per_tile=2999,
+    )
+    return MultiPhaseEstimator(
+        cache, key, prior_total_s=sum(prior_phase_s.values()),
+        prior_phase_s=prior_phase_s,
+    )
+
+
+RUN35_PRIOR = {"preprocess": 11000.0, "register": 11000.0, "fuse": 44000.0, "write": 15000.0}
+
+
+def test_fusion_is_extrapolated_from_its_regions_not_the_whole_run(tmp_path):
+    """Run 35: 72 of 90 regions after 70 h of fusion, 6 h of earlier phases.
+
+    The whole-run extrapolation, with bands from a prior that put fusion at
+    a quarter of its real length, kept projecting the earlier phases' pace.
+    Fusion's own pace says 17.5 h of fusion left, then the write."""
+    est = _make_phased(tmp_path, RUN35_PRIOR)
+    est.start()
+    est._start_t = time.monotonic() - (6 + 70) * 3600.0
+    est.start_phase("fuse")
+    est.set_phase_progress("fuse", 72 / 90, 70 * 3600.0)
+    est.update_fraction(0.80)
+    rem = est.remaining_seconds()
+    assert rem == pytest.approx(17.5 * 3600 + 15000.0, rel=0.01)
+
+
+def test_the_phase_estimate_counts_down_between_reports(tmp_path):
+    est = _make_phased(tmp_path, RUN35_PRIOR)
+    est.start()
+    est.start_phase("fuse")
+    est.set_phase_progress("fuse", 0.5, 1000.0)
+    est._phase_progress = (*est._phase_progress[:3], time.monotonic() - 300.0)
+    assert est.phase_remaining_seconds("fuse") == pytest.approx(700.0, abs=1.0)
+
+
+def test_the_first_phase_report_replaces_the_smoothed_estimate(tmp_path):
+    """EMA smoothing must not drag the old, wrong number along for hours."""
+    est = _make_phased(tmp_path, RUN35_PRIOR)
+    est.start()
+    est._start_t = time.monotonic() - 40000.0
+    est.start_phase("fuse")
+    est.update_fraction(0.5)                      # whole-run: ~40000 s left
+    est.set_phase_progress("fuse", 0.1, 3600.0)  # fusion's pace: 32400 s + write
+    est.update_fraction(0.51)
+    assert est.remaining_seconds() == pytest.approx(32400.0 + 15000.0, rel=0.01)
+
+
+def test_another_phase_falls_back_to_the_whole_run_fraction(tmp_path):
+    est = _make_phased(tmp_path, RUN35_PRIOR)
+    est.start()
+    est._start_t = time.monotonic() - 100.0
+    est.start_phase("fuse")
+    est.set_phase_progress("fuse", 0.5, 50.0)
+    est.start_phase("write")
+    est.update_fraction(0.5)
+    assert est.remaining_seconds() == pytest.approx(100.0, rel=0.05)
+
+
+def test_later_phases_come_from_the_prior(tmp_path):
+    est = _make_phased(tmp_path, RUN35_PRIOR)
+    assert est._later_phases_s("fuse") == pytest.approx(15000.0)
+    assert est._later_phases_s("write") == 0.0

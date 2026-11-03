@@ -74,7 +74,9 @@ cleanly.
 **Light paths are aligned inside the fusion step (step 3), after per-side destripe.**
 The server images each tile with the left sheet as a full stack, then again with the right
 (`WorkflowBase.cpp`), so the two are one stack-time apart and a sample that moves is imaged in
-two places: Max, Mean and Content show it doubled, Split shows a step at the midline. With
+two places: Max, Mean and Content show it doubled. (Split on a mosaic gives each tile one path
+whole, so there is nothing to align and the measurement is skipped; a single-FOV Split still shows
+a step at the midline.) With
 'Align light paths' (`illumination_align`) each tile's second path is measured against the
 first on the central half of the frame (where both sheets light it), over a 128-plane window
 placed on the tissue, binned 2 in XY. The shift is kept only if the band-passed cells (seam

@@ -26,8 +26,16 @@ Two refinements keep the early estimate sane:
   small step at a phase boundary don't jump the clock around.
 
 Per-phase wall clocks are still tracked (``start_phase`` / ``end_phase``) — the
-memory watchdog and the end-of-run time breakdown depend on them — they just no
-longer drive the ETA.
+memory watchdog and the end-of-run time breakdown depend on them.
+
+**A phase that reports its own progress is extrapolated on its own clock.**
+Fusion reports regions done (``set_phase_progress``); while it does, the
+remaining time is that phase's own ``elapsed * (1 - g) / g`` plus the prior for
+the phases still to come. The whole-run fraction cannot do this: its bands come
+from the prior's phase shares, so when one phase runs 4x its prior the
+extrapolation keeps using the earlier phases' pace. Run 35 (2026-10-30):
+fusion was 90% of a 109 h run against a prior share of 75%, and the displayed
+finish slid later through all 98 hours of it.
 """
 
 from __future__ import annotations
@@ -79,6 +87,7 @@ class MultiPhaseEstimator:
         cache: StitchingTimingCache,
         key: StitchingTimingKey,
         prior_total_s: Optional[float] = None,
+        prior_phase_s: Optional[Dict[str, float]] = None,
     ):
         self._cache = cache
         self._key = key
@@ -96,6 +105,12 @@ class MultiPhaseEstimator:
         # local 0..100 can't drag the whole-run fraction backwards.
         self._frac: float = 0.0
         self._smoothed_remaining: Optional[float] = None
+        # (phase, fraction of that phase done, seconds that phase had taken at
+        # the report, monotonic time of the report), from set_phase_progress.
+        self._phase_progress: Optional[Tuple[str, float, float, float]] = None
+        self._prior_phase_s: Dict[str, float] = {
+            k: float(v) for k, v in (prior_phase_s or {}).items() if v and v > 0
+        }
 
         # Pass the ACTUAL tile count so a bucketed cache entry is scaled to
         # this run's size instead of inherited whole (see get_total_s).
@@ -237,12 +252,63 @@ class MultiPhaseEstimator:
                 _SMOOTH_ALPHA * raw + (1.0 - _SMOOTH_ALPHA) * self._smoothed_remaining
             )
 
+    def set_phase_progress(self, phase: str, frac: float, phase_elapsed_s: float) -> None:
+        """Progress WITHIN a phase, timed on that phase's own clock.
+
+        ``frac``: share of the phase done (0..1). ``phase_elapsed_s``: seconds
+        the phase's measurable work has taken so far (fusion passes its region
+        clock, which leaves out the set-up before the first region). Call it
+        before the progress emit that carries the same step, so the EMA commit
+        there uses it. The first report for a phase resets the smoothing: the
+        phase's own pace replaces an estimate built on other phases' pace.
+        """
+        try:
+            f = min(1.0, max(0.0, float(frac)))
+            t = max(0.0, float(phase_elapsed_s))
+        except (TypeError, ValueError):
+            return
+        if f <= 0.0:
+            return
+        if self._phase_progress is None or self._phase_progress[0] != phase:
+            self._smoothed_remaining = None
+        self._phase_progress = (phase, f, t, time.monotonic())
+
+    def phase_remaining_seconds(self, phase: str) -> Optional[float]:
+        """Seconds left in ``phase`` at its own pace, or None without a report."""
+        pp = self._phase_progress
+        if pp is None or pp[0] != phase:
+            return None
+        _, f, t, at = pp
+        return max(0.0, t * (1.0 - f) / f - (time.monotonic() - at))
+
+    def _later_phases_s(self, phase: str) -> float:
+        """Prior seconds for the phases after ``phase`` (cached shares of a
+        measured total when this config has run, else the rough model)."""
+        try:
+            later = PHASE_ORDER[PHASE_ORDER.index(phase) + 1:]
+        except ValueError:
+            return 0.0
+        if self._cached_total_s and self._cached_shares:
+            return sum(
+                float(self._cached_total_s) * float(self._cached_shares.get(p, 0.0))
+                for p in later
+            )
+        return sum(self._prior_phase_s.get(p, 0.0) for p in later)
+
     def _raw_remaining(self) -> Optional[float]:
         """Unsmoothed remaining-seconds estimate from current elapsed + fraction.
         Pure (no state mutation)."""
         elapsed = self.elapsed_seconds()
         if elapsed is None:
             return None
+
+        # The current phase is reporting its own progress: its own pace, then
+        # the prior for what follows it.
+        pp = self._phase_progress
+        if pp is not None and pp[0] == self._current_phase:
+            in_phase = self.phase_remaining_seconds(pp[0])
+            if in_phase is not None:
+                return in_phase + self._later_phases_s(pp[0])
 
         f = self._frac
         # Live linear extrapolation from actual progress: reaching fraction f in

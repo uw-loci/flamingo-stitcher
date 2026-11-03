@@ -24,51 +24,59 @@ from flamingo_stitcher.pipeline import (
 FRAME, PITCH = 256, 200
 
 
-def _lines(span, frame, pitch, ncol, pure_frac=0.5):
-    """X positions in the mosaic where the winning sheet changes."""
-    out = []
-    for c in range(ncol):
-        off = c * pitch
-        w = side_weight_profile(frame, pure_frac, span=span, offset=off)
-        for i in np.flatnonzero(np.diff(w) != 0):
-            out.append(off + int(i) + 1)
-    return sorted(set(out))
-
-
 def _span(ncol, frame=FRAME, pitch=PITCH):
     return pitch * (ncol - 1) + frame
 
 
 # --------------------------------------------------------------------------
-# The requirement: one line
+# The requirement: one handover, and it is a tile seam
 # --------------------------------------------------------------------------
 
 
+def _owners(ncol, frame=FRAME, pitch=PITCH):
+    """Per column: 1.0 (low-end sheet), 0.0 (high-end sheet) or None (cut)."""
+    span = _span(ncol, frame, pitch)
+    out = []
+    for c in range(ncol):
+        w = side_weight_profile(frame, 0.5, span=span, offset=c * pitch)
+        out.append(float(w[0]) if np.all(w == w[0]) else None)
+    return out
+
+
 @pytest.mark.parametrize("ncol", [2, 3, 4, 5, 6, 7, 12])
-def test_a_hard_split_draws_exactly_one_line_in_the_whole_mosaic(ncol):
-    span = _span(ncol)
-    assert len(_lines(span, FRAME, PITCH, ncol)) == 1
+def test_a_hard_split_cuts_no_tile(ncol):
+    """Each tile is one sheet whole.
+
+    A cut inside a frame sits at the same stage-relative place in both tiles
+    of the seam it falls in. Ket_Trial1 run 35 (2026-11-03): phase correlation
+    locked onto it and measured exactly 0 µm on the dim handover seams, where
+    Max had measured -11 to -14 µm on the same data.
+    """
+    assert None not in _owners(ncol)
 
 
-def test_the_line_sits_at_the_middle_of_the_acquisition():
-    for ncol in (3, 4, 7):
+@pytest.mark.parametrize("ncol", [2, 3, 4, 5, 6, 7, 12])
+def test_there_is_exactly_one_handover_between_two_columns(ncol):
+    owners = _owners(ncol)
+    changes = [c for c in range(ncol - 1) if owners[c] != owners[c + 1]]
+    assert len(changes) == 1
+    assert owners[0] == 1.0 and owners[-1] == 0.0
+
+
+def test_the_handover_follows_the_tile_centres():
+    """The tile whose centre is past the middle of the acquisition takes the
+    high-end sheet; a centre exactly on the middle (odd column count) stays
+    with the low end."""
+    for ncol in (2, 3, 4, 5, 6, 7):
         span = _span(ncol)
-        (line,) = _lines(span, FRAME, PITCH, ncol)
-        assert abs(line - span // 2) <= 1
+        owners = _owners(ncol)
+        for c, owner in enumerate(owners):
+            centre2 = 2 * c * PITCH + FRAME
+            assert owner == (1.0 if centre2 <= span else 0.0), (ncol, c)
 
 
-def test_an_odd_column_count_splits_a_tile_and_an_even_one_lands_on_a_seam():
-    """Exactly what a single handover means geometrically."""
-    # Odd: the centre column carries the handover inside its own frame.
-    span = _span(5)
-    (line,) = _lines(span, FRAME, PITCH, 5)
-    centre_start, centre_end = 2 * PITCH, 2 * PITCH + FRAME
-    assert centre_start < line < centre_end
-
-    # Even: the handover falls where two columns meet, not mid-frame.
-    span = _span(4)
-    (line,) = _lines(span, FRAME, PITCH, 4)
-    assert abs(line - span // 2) <= 1
+def test_the_middle_column_of_an_odd_mosaic_goes_whole_to_the_low_end():
+    assert _owners(5) == [1.0, 1.0, 1.0, 0.0, 0.0]
 
 
 def test_tiles_away_from_the_centre_are_pure_and_carry_no_seam():
@@ -76,6 +84,17 @@ def test_tiles_away_from_the_centre_are_pure_and_carry_no_seam():
     for c, expect in ((0, 1.0), (1, 1.0), (5, 0.0), (6, 0.0)):
         w = side_weight_profile(FRAME, 0.5, span=span, offset=c * PITCH)
         assert np.all(w == expect), f"column {c} should be one sheet outright"
+
+
+def test_fusing_a_mosaic_tile_under_split_copies_one_side():
+    lo = np.full((2, 4, FRAME), 100, np.uint16)
+    hi = np.full((2, 4, FRAME), 900, np.uint16)
+    span = _span(4)
+    first = fuse_illumination_sides({0: hi, 1: lo}, "split", axis=-1, low_side=1,
+                                    span=span, offset=0)
+    last = fuse_illumination_sides({0: hi, 1: lo}, "split", axis=-1, low_side=1,
+                                   span=span, offset=3 * PITCH)
+    assert np.all(first == 100) and np.all(last == 900)
 
 
 # --------------------------------------------------------------------------

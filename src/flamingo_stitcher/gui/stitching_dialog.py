@@ -780,8 +780,11 @@ class StitchingDialog(PersistentDialog):
             "'Max' (default) keeps the brighter value; on scattering samples\n"
             "it can keep blur, so try 'Content (weight by local detail)' or\n"
             "'Split (each sheet owns its half)'.\n"
-            "'Split (each sheet owns its half)' and 'Blend (split with a soft\n"
-            "handover)' give each sheet half the frame and need 'Illumination\n"
+            "'Split (each sheet owns its half)' gives each sheet half of the\n"
+            "sample: on a tiled acquisition every tile takes one sheet whole,\n"
+            "so the change-over is a tile seam that is registered and blended.\n"
+            "'Blend (split with a soft handover)' fades from one sheet to the\n"
+            "other across the middle of the sample. Both need 'Illumination\n"
             "side lighting the LOW end of the frame' set on the 'Options' tab.\n"
             "'Separate (keep light paths)' keeps each sheet as its own\n"
             "channel, to check which one causes an artifact."
@@ -796,9 +799,11 @@ class StitchingDialog(PersistentDialog):
             "the first before merging them, in whole planes and whole pixels,\n"
             "so nothing is resampled and tile placement is unchanged. A shift\n"
             "is used only if it lines the cells up better than no shift; the\n"
-            "log lists every tile's shift in imaging order. Adds a few seconds\n"
-            "per tile. Not used with 'Leonardo FUSE' or 'Separate (keep light\n"
-            "paths)'."
+            "log lists every tile's shift in imaging order. Slow at full\n"
+            "resolution: on a 2048 x 2048 x 3000 tile, about 30 s to measure\n"
+            "and about 100 s more when a shift is applied. Not used with\n"
+            "'Leonardo FUSE' or 'Separate (keep light paths)', and skipped by\n"
+            "'Split' on a mosaic, where each tile takes one light path whole."
         )
         _illum_box = QHBoxLayout()
         _illum_box.setContentsMargins(0, 0, 0, 0)

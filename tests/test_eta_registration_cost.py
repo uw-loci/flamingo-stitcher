@@ -369,4 +369,36 @@ def test_ket_trial1_fuse_and_load_match_the_rig():
         _config(downsample_xy=2, output_format="ome-tiff", intensity_adjustment="apply"),
     )
     assert p["preprocess"] == pytest.approx(8100, rel=0.05)
-    assert p["fuse"] == pytest.approx(14900, rel=0.05)
+    assert p["fuse"] + p["write"] == pytest.approx(14900, rel=0.05)
+
+
+def test_write_is_its_own_phase_and_matches_the_rig():
+    """OME-TIFF writes of Ket_Trial1 at XY 2x: 51-69 min (runs 23-32); fuse
+    alone 3:00-3:16 (runs 23/29/30). Split out so the live ETA can extrapolate
+    fusion from its own regions and add the write that follows."""
+    from flamingo_stitcher.pipeline import rough_phase_seconds
+
+    tiles = _grid(6, 7, pitch=1.931, planes=2999)
+    p = rough_phase_seconds(
+        tiles,
+        _config(downsample_xy=2, output_format="ome-tiff", intensity_adjustment="apply"),
+    )
+    assert 3073 <= p["write"] <= 4157
+    assert p["fuse"] == pytest.approx(11300, rel=0.08)
+
+
+def test_content_based_blending_prices_run_35():
+    """Run 35 (XY 1x, Apply, content-based): fuse 354635 s, write 15811 s.
+
+    The old prior had no content-based term and said 58537 s for both, which
+    is most of why the run took 5.0x its start-of-run estimate."""
+    from flamingo_stitcher.pipeline import rough_phase_seconds
+
+    tiles = _grid(6, 7, pitch=1.931, planes=2999)
+    cfg = dict(downsample_xy=1, output_format="ome-tiff", intensity_adjustment="apply")
+    cosine = rough_phase_seconds(tiles, _config(**cfg))
+    content = rough_phase_seconds(tiles, _config(**cfg, content_based_fusion=True))
+    assert content["fuse"] == pytest.approx(354635, rel=0.05)
+    assert content["write"] == pytest.approx(15811, rel=0.15)
+    assert content["write"] == cosine["write"]      # blending does not change writing
+    assert content["fuse"] / cosine["fuse"] == pytest.approx(8.0)
