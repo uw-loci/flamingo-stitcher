@@ -387,18 +387,34 @@ def test_write_is_its_own_phase_and_matches_the_rig():
     assert p["fuse"] == pytest.approx(11300, rel=0.08)
 
 
-def test_content_based_blending_prices_run_35():
-    """Run 35 (XY 1x, Apply, content-based): fuse 354635 s, write 15811 s.
+def test_content_based_blending_prices_runs_35_and_36():
+    """Content-based blending, from two runs that disagree by 2.6x.
 
-    The old prior had no content-based term and said 58537 s for both, which
-    is most of why the run took 5.0x its start-of-run estimate."""
+    Run 35 (Ket_Trial1, XY 1x, Apply): fuse 354635 s, write 15811 s.
+    Run 36 (Vax8_Sal, XY 4x, Apply, 2026-11-03): fuse 8073 s.
+    The factor is their geometric mean, so each is within 1.6x."""
     from flamingo_stitcher.pipeline import rough_phase_seconds
 
-    tiles = _grid(6, 7, pitch=1.931, planes=2999)
-    cfg = dict(downsample_xy=1, output_format="ome-tiff", intensity_adjustment="apply")
-    cosine = rough_phase_seconds(tiles, _config(**cfg))
-    content = rough_phase_seconds(tiles, _config(**cfg, content_based_fusion=True))
-    assert content["fuse"] == pytest.approx(354635, rel=0.05)
-    assert content["write"] == pytest.approx(15811, rel=0.15)
-    assert content["write"] == cosine["write"]      # blending does not change writing
-    assert content["fuse"] / cosine["fuse"] == pytest.approx(8.0)
+    cfg = dict(output_format="ome-tiff", intensity_adjustment="apply")
+    tiles35 = _grid(6, 7, pitch=1.931, planes=2999)
+    cosine = rough_phase_seconds(tiles35, _config(downsample_xy=1, **cfg))
+    run35 = rough_phase_seconds(tiles35, _config(downsample_xy=1, content_based_fusion=True, **cfg))
+    assert 1 / 1.7 < run35["fuse"] / 354635 < 1.7
+    assert run35["write"] == pytest.approx(15811, rel=0.15)
+    assert run35["write"] == cosine["write"]      # blending does not change writing
+    tiles36 = _grid(6, 4, pitch=1.931, planes=5000)
+    run36 = rough_phase_seconds(tiles36, _config(downsample_xy=4, content_based_fusion=True, **cfg))
+    assert 1 / 1.7 < run36["fuse"] / 8073 < 1.7
+
+
+def test_content_illumination_fusion_prices_run_36():
+    """Run 36: 'Content' illumination fusion, 24 tiles of 2048 x 2048 x 5000 on
+    two paths, preprocessing 23107 s (the old prior said 7779 s)."""
+    from flamingo_stitcher.pipeline import rough_phase_seconds
+
+    tiles = _grid(6, 4, pitch=1.931, planes=5000)
+    cfg = dict(downsample_xy=4, output_format="ome-tiff", intensity_adjustment="apply")
+    content = rough_phase_seconds(tiles, _config(illumination_fusion="content", **cfg))
+    plain = rough_phase_seconds(tiles, _config(illumination_fusion="max", **cfg))
+    assert content["preprocess"] == pytest.approx(23107, rel=0.1)
+    assert plain["preprocess"] < 0.5 * content["preprocess"]

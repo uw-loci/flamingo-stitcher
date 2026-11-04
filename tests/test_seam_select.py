@@ -85,7 +85,8 @@ def test_candidate_list_matches_multiview_stitcher_expansion():
 
 def test_coarse_voxels_fall_back_to_ssim():
     assert S.band_sigmas_px({"z": 10, "y": 2.1, "x": 2.1}) is not None
-    assert S.band_sigmas_px({"z": 10, "y": 8.0, "x": 8.0}) is None
+    assert S.band_sigmas_px({"z": 10, "y": 8.38, "x": 8.38}) is not None  # XY 8x, checked 2026-11-04
+    assert S.band_sigmas_px({"z": 10, "y": 16.8, "x": 16.8}) is None
     assert S.band_sigmas_px({"z": 10}) is None
 
 
@@ -141,8 +142,10 @@ def test_setup_falls_back_and_converts_band_to_registration_voxels():
     assert func is S.cell_matched_registration and log is kw["choice_log"]
     inner, outer = kw["band_sigmas_px"]
     assert inner[0] == pytest.approx(0.5) and outer[2] == pytest.approx(8.0 / 2.1)
-    # XY binning 4 on a 2.1 um voxel = 8.4 um: cells unresolved -> SSIM.
-    assert p._seam_choice_setup({"z": 2.5, "y": 2.1, "x": 2.1}, {"z": 4, "y": 4, "x": 4}) == (None, None, None)
+    # XY binning 4 on a 2.1 um voxel = 8.4 um: the coarsest checked (2026-11-04).
+    assert p._seam_choice_setup({"z": 2.5, "y": 2.1, "x": 2.1}, {"z": 4, "y": 4, "x": 4})[0] is S.cell_matched_registration
+    # Binning 8 = 16.8 um: never checked -> SSIM.
+    assert p._seam_choice_setup({"z": 2.5, "y": 2.1, "x": 2.1}, {"z": 4, "y": 8, "x": 8}) == (None, None, None)
     q = _pipe(registration_seam_choice="ssim")
     assert q._seam_choice_setup({"z": 2.5, "y": 2.1, "x": 2.1}, {}) == (None, None, None)
 

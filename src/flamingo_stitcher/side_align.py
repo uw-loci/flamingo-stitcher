@@ -46,10 +46,15 @@ WINDOW_PLANES = 128
 # correlate the haze instead of the cells.
 CENTRE_FRACTION = 0.5
 
-# XY binning for the measurement. Seam selection's band-pass needs its outer
-# sigma (8 um) to be at least 2 voxels (MIN_OUTER_SIGMA_PX), so voxels up to
-# 4 um work; 2 camera pixels keep ~2 um voxels, the size cells r was set on.
+# XY binning for the measurement: 2 camera pixels keep ~2 um voxels, the size
+# cells r was set on.
 MEASURE_BIN_XY = 2
+
+# How much better than no shift a shift must line the cells up to be applied.
+# Shifts applied in runs 35-36 that were noise gained at most 0.01 (X003 Y003,
+# run 36: 0.14 -> 0.14, a 75 um Z shift on a tissue tile); the smallest gain on
+# a real shift was 0.04 (dz 2 planes). Halfway between.
+MIN_R_GAIN = 0.025
 
 # Planes sampled to place the window on the tissue. Coarse is enough: the
 # window only has to land where there is structure.
@@ -121,6 +126,12 @@ def measure(first, second, voxel_um: Tuple[float, float, float],
     ys, xs = _centre(first.shape[1]), _centre(first.shape[2])
     a = _bin_xy(np.asarray(first[z0:z1, ys, xs]), MEASURE_BIN_XY)
     b = _bin_xy(np.asarray(second[z0:z1, ys, xs]), MEASURE_BIN_XY)
+    # Remove what is the same in every plane: the camera's fixed pattern, which
+    # both paths share pixel for pixel. Left in, it pins the correlation peak
+    # at dy = dx = 0 with any dz and scores the same with or without a shift
+    # (runs 35-36: false dz of 32-75 um applied, dy = dx = 0 exactly).
+    a -= a.mean(axis=0, keepdims=True)
+    b -= b.mean(axis=0, keepdims=True)
     mvox = {"z": voxel_um[0], "y": voxel_um[1] * MEASURE_BIN_XY,
             "x": voxel_um[2] * MEASURE_BIN_XY}
     sig = seam_select.band_sigmas_px(mvox)
@@ -156,9 +167,10 @@ def measure(first, second, voxel_um: Tuple[float, float, float],
     if not np.isfinite(r1) or r1 < min_cell_r:
         return SideShift(t, r0, r1, False,
                          f"cells r {r1:.2f} below {min_cell_r:g}", (z0, z1))
-    if np.isfinite(r0) and r1 <= r0:
+    if np.isfinite(r0) and r1 < r0 + MIN_R_GAIN:
         return SideShift(t, r0, r1, False,
-                         "lines the cells up no better than no shift", (z0, z1))
+                         f"lines the cells up less than {MIN_R_GAIN:g} better "
+                         "than no shift", (z0, z1))
     return SideShift(t, r0, r1, True, "", (z0, z1))
 
 

@@ -426,7 +426,11 @@ How to read them:
   stands for several shifts (either sign per axis, or one overlap-width over);
   the run keeps the candidate with the highest `cells r`. A wrong shift scores
   ~0 even at high `qual` (Ket_Trial1, 2026-10-22: right 0.32-0.68, wrong
-  0.00-0.23). Seams below `min_cell_r` (default 0.1) show as
+  0.00-0.23). It runs up to an 8.4 µm XY registration voxel (XY 8x at
+  1.05 µm pixels; checked on four Ket_Trial1 seams, 2026-11-04); before
+  0.13.24 the limit was 4 µm, so XY 4x runs (4.19 µm) fell back to SSIM with
+  `Seam choice: multiview-stitcher's (SSIM)` and could show sign-flipped
+  Y-seams (run 36). Seams below `min_cell_r` (default 0.1) show as
   `implausible_shift` with a note naming their `cells r`. Before 0.13.15 the
   choice was multiview-stitcher's SSIM, which picked a sign-flipped or
   overlap-width-wrapped shift on 3 of 4 checked Ket_Trial1 seams: a seam `dy`
@@ -541,8 +545,11 @@ cells r 0.21 without, 0.48 with; applied (planes 1200-1328)`, then after preproc
 table, `Align light paths: N of M tile-channels shifted (in acquisition order ...)`. The
 acquisition order is X000 Y000 first (the server tiles row by row from the highest stage X and
 Y), so a sample settling under the laser shows as shifts shrinking down the table. `not
-applied: ...` gives the gate that refused it: no structure, cells r below the floor, no better
-than no shift, or beyond a quarter of the measured window. From 0.13.23 it is not measured
+applied: ...` gives the gate that refused it: no structure, cells r below the floor, less
+than 0.025 better than no shift (0.13.24; before, any gain counted), or beyond a quarter of the
+measured window. Before 0.13.24 the camera's fixed pattern was not removed, so a row with
+dy = dx = 0 exactly, an arbitrary dz and r unchanged (0.14 -> 0.14) is that artifact; under
+Content or Max fusion such a tile mixes two depths. From 0.13.23 it is not measured
 under `split` on a mosaic (each tile is one light path whole): `Align light paths: not
 measured under split on a mosaic`.
 

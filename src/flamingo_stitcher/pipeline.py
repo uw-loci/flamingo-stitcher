@@ -659,7 +659,19 @@ _ROUGH_WRITE_MBPS = 74.0
 # it was also the first full-resolution fuse (a 913 GB fused memmap on a
 # 191 GB machine), with Split and a blended tile overlap. The pipeline's own
 # warning says 5-10x. Replace with a cosine-vs-content pair at one setting.
-_ROUGH_CONTENT_BASED_FUSE_FACTOR = 8.0
+# Run 36 (Vax8_Sal, XY 4x, Apply, 2026-11-03): fuse 8073 s against a cosine
+# prior of 2636 s = 3.1x. Geometric mean of the two runs, 4.9; each run is then
+# off by 1.6x in opposite directions. Run 35's fused memmap was 4.8x the RAM,
+# run 36's 0.27x, which may be most of the difference.
+_ROUGH_CONTENT_BASED_FUSE_FACTOR = 4.9
+# 'Content' ILLUMINATION fusion (fuse_illumination_sides, two gaussian filters
+# per plane per side), seconds per megapixel of frame per plane, on top of the
+# load term. Run 36 (Vax8_Sal, 2048 x 2048 x 5000, two paths): tiles without an
+# applied light-path shift took a median 931 s against 324 s modeled for
+# loading = 607 s extra per tile over 5000 planes x 4.19 MPx. It includes the
+# 'Align light paths' measurement (~20-30 s a tile); a shift that is applied
+# adds ~80 s more (run 36) and is not modeled. ONE run.
+_ROUGH_S_PER_CONTENT_ILLUM_MPX = 0.029
 #   _ROUGH_S_PER_REG_MVOXEL: registration, seconds per MILLION voxels actually
 #                          compared. Pairwise registrations run SERIALLY for
 #                          3-D data (multiview-stitcher sets
@@ -843,6 +855,15 @@ def rough_phase_seconds(tiles, config) -> Dict[str, float]:
         _ROUGH_SEPARATE_ILLUM_FACTOR if separate else 1.0
     )
     load_register += _rough_destripe_seconds(tiles, config, n_channels)
+    if not separate and str(getattr(config, "illumination_fusion", "max") or "max") == "content":
+        for t in tiles:
+            if len(getattr(t, "illumination_sides", []) or [0]) < 2:
+                continue
+            fw = int(getattr(t, "frame_width", FRAME_WIDTH) or FRAME_WIDTH)
+            fh = int(getattr(t, "frame_height", FRAME_HEIGHT) or FRAME_HEIGHT)
+            load_register += (
+                _ROUGH_S_PER_CONTENT_ILLUM_MPX * float(t.n_planes) * fw * fh / 1e6 * n_channels
+            )
 
     out_units = (n_tiles * planes * n_channels) / (ds_xy * ds_xy * ds_z)
     if separate:
@@ -1071,7 +1092,7 @@ def _rough_register_seconds(tiles, config) -> float:
     seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
     if int(getattr(config, "registration_upsample_factor", 0) or 0) > MVS_DEFAULT_3D_UPSAMPLE:
         seconds *= _ROUGH_UPSAMPLE_TIME_FACTOR
-    if _cells_seam_choice(config):
+    if _cells_seam_choice(config, geo):
         seconds *= _ROUGH_CELLS_SEAM_TIME_FACTOR
     # The Z-refinement pass is a second pairwise pass over the same seams at
     # its own binning (every plane, coarser XY), so cost it as such rather
@@ -1098,13 +1119,27 @@ def _rough_refine_seconds(tiles, config) -> float:
     if geo is None:
         return 0.0
     seconds = _ROUGH_S_PER_REG_MVOXEL * geo["seam_vox"] / 1e6 * geo["n_seams"]
-    if _cells_seam_choice(config):
+    if _cells_seam_choice(config, geo):
         seconds *= _ROUGH_CELLS_SEAM_TIME_FACTOR
     return seconds
 
 
-def _cells_seam_choice(config) -> bool:
-    return str(getattr(config, "registration_seam_choice", "cells") or "cells") == "cells"
+def _cells_seam_choice(config, geo=None) -> bool:
+    """Whether the run will choose seams by cell match, as _seam_choice_setup
+    decides it: the setting, and an XY registration voxel the match has been
+    checked at. Run 36 (XY 4x, 4.19 um) was costed as cells and ran SSIM."""
+    if str(getattr(config, "registration_seam_choice", "cells") or "cells") != "cells":
+        return False
+    if geo is None:
+        return True
+    from flamingo_stitcher import seam_select
+
+    try:
+        vox = (float(getattr(config, "pixel_size_um", 0) or 0)
+               * max(1, int(getattr(config, "downsample_xy", 1) or 1)) * geo["bin_xy"])
+    except Exception:
+        return True
+    return vox <= 0 or vox <= seam_select.MAX_CHECKED_VOXEL_UM
 
 
 def _copy_config_with(config, **changes):
@@ -9387,9 +9422,8 @@ class StitchingPipeline:
             )
             self.logger.info(
                 f"  Seam choice: multiview-stitcher's (SSIM). The registration "
-                f"voxel ({vox_txt} XY) is too coarse to resolve cells, which the "
-                f"cell match needs (XY voxel up to "
-                f"{seam_select.BAND_OUTER_UM[2] / seam_select.MIN_OUTER_SIGMA_PX:g} µm)."
+                f"voxel ({vox_txt} XY) is coarser than the cell match has been "
+                f"checked at (XY voxel up to {seam_select.MAX_CHECKED_VOXEL_UM:g} µm)."
             )
             return None, None, None
         inner, outer = sig

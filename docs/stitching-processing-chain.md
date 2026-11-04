@@ -79,8 +79,12 @@ whole, so there is nothing to align and the measurement is skipped; a single-FOV
 a step at the midline.) With
 'Align light paths' (`illumination_align`) each tile's second path is measured against the
 first on the central half of the frame (where both sheets light it), over a 128-plane window
-placed on the tissue, binned 2 in XY. The shift is kept only if the band-passed cells (seam
-selection's band-pass and cells r) line up better with it than without it and clear
+placed on the tissue, binned 2 in XY. Each path's mean over the window is subtracted first:
+it holds the camera's fixed pattern, identical in both paths, which otherwise pins the
+correlation at dy = dx = 0 with any dz (runs 35-36 applied false Z shifts of 32-75 µm, one of
+them to a tissue tile under Content). The shift is kept only if the band-passed cells (seam
+selection's band-pass and cells r) line up at least 0.025 better with it than without it
+(`side_align.MIN_R_GAIN`: false shifts gained at most 0.01, real ones at least 0.04) and clear
 `registration_min_cell_r`, and only within a quarter of the window. It is applied in whole
 planes and whole camera pixels, so nothing is interpolated; the merged tile stays in the first
 path's frame, so tile registration, Z snapping and the tile's Z range are unchanged. Voxels the
@@ -232,7 +236,7 @@ throughput line, never the per-tile rate.
 | Lateral shift bound | `max_registration_shift_um` | Shipped. 0 = Auto: the narrowest measured tile overlap width, or 10% of the frame when no overlap is measurable. Never below 2 registration pixels |
 | Axial shift bound | `max_registration_shift_z_um` | Shipped. Separate from the lateral bound — an XY mosaic has no Z overlap to derive one from. 0 = Auto: the largest of 8 Z steps, 25 µm and 2.5% of the stack depth, capped at 25% of the depth, and never below 2 binned registration Z steps |
 | Shift bound reference | — | Shipped. Bounds are applied to a tile's disagreement with the mosaic's median correction, not to its displacement from the stage position: a shared offset opens no seam |
-| Seam shift choice | `registration_seam_choice`, `registration_min_cell_r` | Shipped 0.13.15, default `cells`: of the shifts one correlation peak stands for (sign flips, overlap-width wraps), keep the one whose band-passed (2-8 µm XY, 5-15 µm Z) overlaps correlate best, instead of multiview-stitcher's SSIM. Seams whose best `cells r` is under 0.1 are dropped before the solve. Falls back to SSIM when the registration voxel is coarser than 4 µm XY. Measured ~10x faster per seam, 100 vs 107 B per compared voxel. YAML `registration.seam_choice` / `min_cell_r`; no GUI control yet |
+| Seam shift choice | `registration_seam_choice`, `registration_min_cell_r` | Shipped 0.13.15, default `cells`: of the shifts one correlation peak stands for (sign flips, overlap-width wraps), keep the one whose band-passed (2-8 µm XY, 5-15 µm Z) overlaps correlate best, instead of multiview-stitcher's SSIM. Seams whose best `cells r` is under 0.1 are dropped before the solve. Falls back to SSIM when the registration voxel is coarser than 8.4 µm XY (checked on four Ket_Trial1 seams at 2.1, 4.19, 6.29 and 8.38 µm, 2026-11-04; was 4 µm until 0.13.24, which sent XY 4x runs to SSIM). Measured ~10x faster per seam, 100 vs 107 B per compared voxel. YAML `registration.seam_choice` / `min_cell_r`; no GUI control yet |
 | Phase-correlation upsampling | `registration_upsample_factor` | Shipped; GUI **Peak refinement**. 0 = leave multiview-stitcher's default, which is **2 for 3-D** (~half a binned voxel): at a 10 µm Z spacing every seam's Z moved in 5 µm steps. 10 resolves 1 µm; measured 1.07-1.18x registration time and no extra memory |
 | Global-solve tolerance | `global_opt_abs_tol` | Shipped; GUI **Solve tolerance** (registration px; the log and the dialog give µm). Seams disagreeing with the placement by more are pruned. Higher keeps more seams and averages their disagreement. Too low can leave a row held by one seam: on one 2026-10-18 run the bottom row kept 1 of 4 Y-seams, all of which had passed the quality threshold |
 | Global-solve model | `registration_solve_transform` | Shipped, **experimental**, off: GUI **Solve model** = Shift + rotation (rigid). Rotations are inferred from where neighbours' overlaps sit; clamp, carry, Z snap and the report work on each tile's CENTRE shift and the rotation goes back on afterwards. Clamped tiles stay shift-only. From 0.13.16 carried tiles follow their neighbours' rotation (each neighbour's whole transform applied to the tile's stage position, averaged); before, they were shift-only at the neighbours' mean shift, 20-40 µm out on Ket_Trial1's rotated rows. Not yet validated across datasets |

@@ -123,3 +123,41 @@ def test_pipeline_measures_logs_and_returns_the_shift(tile, caplog):
     # the summary lists X000 Y000 (imaged first) before X001 Y000
     summary = text[text.index("Align light paths: 2 of 2"):]
     assert summary.index("X000 Y000") < summary.index("X001 Y000")
+
+
+def _fixed_pattern(shape, seed=11, sd=6.0):
+    """A camera's per-pixel pattern: identical in every plane and both paths."""
+    fp = ndimage.gaussian_filter(np.random.default_rng(seed).normal(0, 1, shape[1:]), 1.2)
+    return fp / fp.std() * sd
+
+
+def _with_pattern(tissue, fp, seed):
+    noise = np.random.default_rng(seed).normal(0, 3, tissue.shape)
+    return np.clip(100 + tissue + fp[None] + noise, 0, 65535).astype(np.uint16)
+
+
+def test_camera_pattern_alone_is_not_applied():
+    """Runs 35-36: near-empty tiles read dy = dx = 0 with an arbitrary dz and
+    the shift was applied at a rounding-level gain (0.14 -> 0.14)."""
+    shape = (160, 192, 192)
+    fp = _fixed_pattern(shape)
+    zero = np.zeros(shape, np.float32)
+    res = side_align.measure(_with_pattern(zero, fp, 1), _with_pattern(zero, fp, 2), VOXEL, 0.1)
+    assert not res.applied, res
+
+
+def test_dim_tissue_under_the_camera_pattern_is_measured():
+    shape = (160, 192, 192)
+    fp = _fixed_pattern(shape)
+    t = (4, 0, -12)
+    cells = _cells(shape, seed=4).astype(np.float32) - 100.0
+    cells *= 300.0 / cells.max()
+    res = side_align.measure(_with_pattern(cells, fp, 5),
+                             _with_pattern(_move(cells, t), fp, 6), VOXEL, 0.1)
+    assert res.applied, res.reason
+    assert res.shift == t
+
+
+def test_a_rounding_level_gain_is_not_enough():
+    assert side_align.MIN_R_GAIN > 0.01  # largest gain seen on a false shift
+    assert side_align.MIN_R_GAIN < 0.04  # smallest gain seen on a real one

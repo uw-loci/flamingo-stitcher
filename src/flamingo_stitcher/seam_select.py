@@ -50,10 +50,15 @@ import numpy as np
 BAND_INNER_UM: Tuple[float, float, float] = (5.0, 2.0, 2.0)
 BAND_OUTER_UM: Tuple[float, float, float] = (15.0, 8.0, 8.0)
 
-# Below this, the outer sigma is under 2 voxels in XY: cells are not resolved at
-# the registration resolution and the band-pass measures noise, so selection
-# falls back to multiview-stitcher's SSIM. 8 um / 2 voxels = 4 um voxels.
-MIN_OUTER_SIGMA_PX = 2.0
+# Coarsest XY registration voxel the cell match has been checked at. On the four
+# Ket_Trial1 seam strips (2026-11-04, rig-runs-files/cells_at_4x.py) it chose
+# within a few um of its 2.1 um answer at 4.19, 6.29 and 8.38 um voxels, while
+# multiview-stitcher's SSIM choice was wrong at every one of those sizes (a sign
+# flip, a 20 um miss, a one-overlap wrap). The old limit, 2 voxels of outer sigma
+# (4 um), was a guess and sent run 36 (4.19 um) to SSIM. Coarser than this is
+# untested, so selection falls back to SSIM there.
+MAX_CHECKED_VOXEL_UM = 8.4
+MIN_OUTER_SIGMA_PX = BAND_OUTER_UM[1] / MAX_CHECKED_VOXEL_UM
 
 # multiview-stitcher skips a candidate whose shifted image overlaps less than
 # 10% of the moving image (registration.py, phase_correlation_registration).
