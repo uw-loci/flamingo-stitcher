@@ -20,6 +20,8 @@ from typing import Any, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import numpy as np
 
+from flamingo_stitcher.memmap_flush import flush as flush_memmap
+
 from flamingo_stitcher import (
     center_out,
     registration_report,
@@ -7129,10 +7131,11 @@ class StitchingPipeline:
                         # fuse allocation (the on-disk fused output is meant to be
                         # off-RAM) — which on Windows (USS counts modified
                         # file-mapped pages) tripped the memory watchdog with a
-                        # figure that is write-back lag, not real allocation. The
-                        # msync only writes the ~region-sized dirty set, so it's
-                        # cheap next to the region's fuse compute.
-                        stacked.flush()
+                        # figure that is write-back lag, not real allocation.
+                        # Only the region's bytes, and without holding the GIL:
+                        # numpy's stacked.flush() froze the window 84-95 s per
+                        # region on run 35 (see memmap_flush).
+                        flush_memmap(stacked[dest_idx][z0:z1, y0:y1, x0:x1])
                         # Advance the global percent across regions so the
                         # (often long) fuse phase drives a live, moving ETA
                         # instead of sitting at a flat per-channel value. Fuse
@@ -7845,7 +7848,7 @@ class StitchingPipeline:
             mm_path = tmp_dir / f"tile_{i:04d}.dat"
             mm = np.memmap(mm_path, dtype=np.uint16, mode="w+", shape=tile_shape)
             mm[:] = vol
-            mm.flush()
+            flush_memmap(mm)
             del mm, vol
             # _dask_array_from_memmap builds the task graph by hand so
             # dask.from_array's unconditional x.copy() cannot materialize

@@ -16,6 +16,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
+from flamingo_stitcher.memmap_flush import flush as flush_memmap
+
 logger = logging.getLogger(__name__)
 
 # Default settings — loaded from stitching_config.yaml
@@ -441,7 +443,7 @@ def _downsample_yx_to_memmap(volume: np.ndarray, factor: int, mm_path) -> np.nda
     else:
         for zi in range(z):
             mm[zi] = _downsample_yx_plane(volume[zi], factor)
-    mm.flush()
+    flush_memmap(mm)
     return mm
 
 

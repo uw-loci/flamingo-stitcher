@@ -569,7 +569,12 @@ tiles). Read the solve's `resid µm` in the seam table instead for those logs.
 **`Window not responding for N s`** (ERROR, from 2026-10-27) is the GUI's
 freeze watchdog: the stack of every thread follows, the window's thread marked.
 It means the window froze, not the stitch; check the lines before it for
-whether the pipeline had finished.
+whether the pipeline had finished. Before 0.13.25, the usual cause during
+streaming fusion was the flush of `fused.dat` after each region (run 35: 84-95 s
+per region, stack in `stacked.flush()`): numpy's memmap flush held Python's GIL
+for the whole write. From 0.13.25 the flush goes through `memmap_flush`, which
+releases the GIL, so a freeze with `memmap_flush` or `stacked.flush()` in the
+stack on 0.13.25 or later is a new problem, not this one.
 
 ## 7i. The registration map
 

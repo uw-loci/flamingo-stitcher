@@ -36,6 +36,8 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 import numpy as np
 
+from flamingo_stitcher.memmap_flush import flush as flush_memmap
+
 logger = logging.getLogger(__name__)
 
 # Default chunk/shard configuration — loaded from stitching_config.yaml
@@ -780,7 +782,7 @@ def _downsample_2x_to_memmap(src: np.ndarray, mm_path) -> np.ndarray:
     else:
         for zo in range(oz):
             mm[zo] = _oplane(src[2 * zo : 2 * zo + 2])
-    mm.flush()
+    flush_memmap(mm)
     return mm
 
 

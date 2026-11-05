@@ -124,3 +124,25 @@ jobs:
           name: junit
           path: junit.xml
           if-no-files-found: ignore
+
+  windows-flush:
+    # memmap_flush calls FlushViewOfFile on Windows (the rig) and msync on Linux.
+    # The job above runs only on Linux, so the Windows path of that one module
+    # is tested here on a real Windows runner.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install the package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Run the memmap flush tests
+        run: python -m pytest tests/test_memmap_flush.py -v
