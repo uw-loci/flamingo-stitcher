@@ -58,6 +58,8 @@ from flamingo_stitcher.gui._wheel_guard import install_wheel_guard
 
 
 # QSettings keys
+from flamingo_stitcher.gui.layout_rework import ReworkedLayoutMixin  # noqa: E402
+
 _SETTINGS_GROUP = "StitchingDialog"
 # Shared (cross-dialog) key for the last folder browsed to via "Add…", so the
 # file picker reopens there even when the queue is empty.
@@ -290,7 +292,16 @@ class BackgroundZeroPanel(QWidget):
         return self._toggle.isChecked()
 
     def set_expanded(self, expanded: bool) -> None:
+        if getattr(self, "_always_open", False):
+            return
         self._toggle.setChecked(bool(expanded))
+
+    def set_always_open(self) -> None:
+        """Show the body permanently, without its fold toggle (it sits in its
+        own 'Background (lossy)' group on the 'Image quality' tab)."""
+        self._toggle.setChecked(True)
+        self._toggle.hide()
+        self._always_open = True
 
 
 class _FlatFieldSetupThread(QThread):
@@ -314,7 +325,7 @@ class _FlatFieldSetupThread(QThread):
             self.done.emit(False, str(e))
 
 
-class StitchingDialog(PersistentDialog):
+class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
     """Dialog for stitching raw acquisition tile data.
 
     Provides UI for configuring and running the stitching pipeline:
@@ -453,6 +464,7 @@ class StitchingDialog(PersistentDialog):
         # Subclass hook: inject extra controls at the top of the scroll area
         # (e.g. the Multi-View tab's rotation controls + warning banner).
         self._add_dialog_extras(content_layout)
+        n_extras = content_layout.count()
 
         # --- Batch queue ---
         queue_group = QGroupBox("Acquisition Queue")
@@ -925,7 +937,7 @@ class StitchingDialog(PersistentDialog):
         settings_layout.addWidget(self._format_combo, 2, 1)
 
         # Format help label
-        format_help = QLabel("?")
+        format_help = self._format_help = QLabel("?")
         format_help.setStyleSheet(
             "QLabel { color: #1976D2; font-weight: bold; font-size: 11px; "
             "border: 1px solid #1976D2; border-radius: 8px; "
@@ -1000,7 +1012,7 @@ class StitchingDialog(PersistentDialog):
         scratch_row = QHBoxLayout()
         scratch_row.setContentsMargins(0, 0, 0, 0)
         scratch_row.addWidget(self._scratch_dir_edit)
-        scratch_browse = QPushButton("Browse...")
+        scratch_browse = self._scratch_browse_btn = QPushButton("Browse...")
         scratch_browse.clicked.connect(self._browse_scratch_dir)
         scratch_row.addWidget(scratch_browse)
         scratch_wrap = QWidget()
@@ -1521,6 +1533,7 @@ class StitchingDialog(PersistentDialog):
             "more RAM than the memory estimate shows. Outputs under twice\n"
             "the region size are always fused in one piece."
         )
+        self._fusion_region_tip = self._fusion_region_combo.toolTip()
         proc_layout.addWidget(self._fusion_region_combo, 6, 1, 1, 3)
 
         # Proc Row 7: Tile-border artifact QC (diagnostic)
@@ -1770,8 +1783,8 @@ class StitchingDialog(PersistentDialog):
         self._step_labels: Dict[str, QLabel] = {}
         self._step_order = [
             ("discover", "Discover"),
-            ("register", "Register"),
             ("preprocess", "Preprocess"),
+            ("register", "Register"),
             ("fuse", "Fuse"),
             ("write", "Write output"),
             ("metadata", "Metadata"),
@@ -1796,6 +1809,12 @@ class StitchingDialog(PersistentDialog):
         layout.addWidget(progress_group)
 
         self._reset_step_progress()
+
+        # Move the controls built above into the 0.14.0 layout (layout_rework).
+        self._arrange_reworked_layout(
+            layout, content_layout, n_extras, [settings_container, self._proc_widget]
+        )
+        self._proc_toggle.setChecked(True)
 
         # Sync .ozx checkbox enabled state with initial format
         self._on_format_changed()
@@ -2767,8 +2786,9 @@ class StitchingDialog(PersistentDialog):
         """
         self._config_container.setEnabled(enabled)
         self._output_dir_edit.setEnabled(enabled)
-        self._proc_toggle.setEnabled(enabled)
-        self._proc_widget.setEnabled(enabled)
+        # The tab pages, not the tab bar: the tabs still switch during a run
+        # so the settings in use can be read.
+        self._set_tab_pages_enabled(enabled)
         self._bg_zero_panel.setEnabled(enabled)
         self._verbose_log_cb.setEnabled(enabled)
 
@@ -2780,17 +2800,7 @@ class StitchingDialog(PersistentDialog):
         preferred height and resize to it, preserving the user's current
         width.
         """
-        self._proc_widget.setVisible(checked)
-        self._proc_toggle.setText(
-            ("\u25bc " if checked else "\u25b6 ") + "Processing Options"
-        )
-        # Let Qt recompute size hints for the new visibility state, then
-        # resize height to match. Width is preserved so the user's
-        # horizontal layout isn't disturbed.
-        self.updateGeometry()
-        if self.layout() is not None:
-            self.layout().activate()
-        self.resize(self.width(), self.sizeHint().height())
+        self._set_settings_folded(not checked)
 
     def _restore_reg_z_spacing(self, s) -> None:
         """Saved Z spacing, or an older saved "reg_binning_z" read as what it
@@ -3070,6 +3080,8 @@ class StitchingDialog(PersistentDialog):
         self._update_z_refine_controls()
         self._z_snap_cb.setEnabled(not checked)
         self._approach_combo.setEnabled(not checked)
+        if hasattr(self, "_approach_label"):
+            self._approach_label.setEnabled(not checked)
 
     def _update_z_refine_controls(self, *_args) -> None:
         """'Z search' is only used by 'Refine Z alignment'."""
@@ -6749,8 +6761,9 @@ class StitchingDialog(PersistentDialog):
             s.value("registration_report", True, type=bool)
         )
 
-        proc_expanded = s.value("proc_options_expanded", False, type=bool)
-        self._proc_toggle.setChecked(proc_expanded)
+        # Settings always show until a run starts (the saved value was the old
+        # Processing Options pane's, which started closed).
+        self._proc_toggle.setChecked(True)
         # Always closed for a new run: the settings get the window until
         # there is output worth reading. _focus_log_for_run opens it.
         self._log_toggle.setChecked(False)
@@ -7098,8 +7111,9 @@ class NativeStitchingDialog(StitchingDialog):
             s.value("registration_report", True, type=bool)
         )
 
-        proc_expanded = s.value("proc_options_expanded", False, type=bool)
-        self._proc_toggle.setChecked(proc_expanded)
+        # Settings always show until a run starts (the saved value was the old
+        # Processing Options pane's, which started closed).
+        self._proc_toggle.setChecked(True)
         # Always closed for a new run: the settings get the window until
         # there is output worth reading. _focus_log_for_run opens it.
         self._log_toggle.setChecked(False)

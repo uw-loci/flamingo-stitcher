@@ -271,9 +271,16 @@ class TestEveryWidgetReferenceIsAssigned:
 
     _CLASSES = ("StitchingDialog", "NativeStitchingDialog", "MultiViewStitchingDialog")
 
-    @staticmethod
-    def _tree():
-        return ast.parse(DIALOG.read_text(encoding="utf-8"))
+    # The dialog's layout mixin (0.14.0) assigns and defines some of the
+    # attributes the dialog reads, so it is scanned as part of the class.
+    _SOURCES = (DIALOG, DIALOG.parent / "layout_rework.py")
+
+    @classmethod
+    def _tree(cls):
+        mod = ast.Module(body=[], type_ignores=[])
+        for path in cls._SOURCES:
+            mod.body.extend(ast.parse(path.read_text(encoding="utf-8")).body)
+        return mod
 
     def _class_nodes(self):
         by_name = {
