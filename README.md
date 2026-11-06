@@ -108,49 +108,77 @@ when you want to set which illumination side lights the left of the frame.
 
 ## Understanding the settings
 
-The basic controls are organized into three plainly-named boxes. **For a first run you
-can leave all of them alone.** Everything more specialized lives in the collapsed
-**Processing Options** panel below them.
+Each stitching tab has four parts. **For a first run you can leave the settings
+alone.**
 
-- **Tell me about your image** — facts about your data: pixel size, Z step, frame
-  (camera ROI), and which channels. These are filled in automatically by *Discover
-  Tiles*; change one only if you know a detected value is wrong. Unless you set the
-  XY pixel size by hand, **each queued acquisition uses the pixel size implied by its
-  own objective** (from its `ScopeSettings.txt`), so a batch mixing objectives
-  stitches every item at the right scale. Type a value to override it for all.
-  - **The pixel size is always shown in the log.** Discovery prints
-    `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
-    tiles come out **spaced apart like dice**, this value is almost always wrong —
-    check that line first.
-  - **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
-    you select a parent folder whose acquisitions live in a dated subfolder, the
-    app now searches down into it — but if it still can't find the objective it
-    logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
-  - **Per-microscope fallback.** For systems that don't record the objective in
-    `ScopeSettings.txt`, a per-microscope `objective_magnification` in
-    `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
-    (25.48×, measured on a calibration standard) → ~0.255 µm/px.
-- **What kind of processing should we do?** — the choices that affect the output:
-  *Downsample* (make the result smaller/faster), how the two light-sheet sides are
-  combined, and how overlapping tiles are blended. The defaults are a good start.
-- **How should we save it?** — output format, compression, and memory mode. **OME-Zarr
-  (Fiji compatible)** is a safe default. The size / time / memory estimates underneath
-  update live as you change settings.
-  - **Formats.** OME-Zarr (Fiji compatible) is Zarr v2 + OME-NGFF v0.4; OME-Zarr
-    Sharded is Zarr v3 + OME-NGFF v0.5, which only napari and zarr-python 3.x read.
-    OME-TIFF writes all channels into one `<name>.ome.tif`. Imaris (.ims) uses
-    PyImarisWriter (Apache 2.0; `pip install "flamingo-stitcher[imaris]"`, Windows
-    only), writes block by block so it scales to TB-sized output, and builds its own
-    pyramids. It exists because ImarisFileConverter misreads OME-TIFF pyramid
-    SubIFDs as extra Z planes and collapses the data into Z = 0; to use the
-    converter anyway, write OME-TIFF with **TIFF pyramids** unchecked. Fiji and
-    Imaris do not need TIFF pyramids; napari and QuPath zoom faster with them.
-  - **Compression.** None skips encoding and decoding, so it is fastest from a fast
-    local SSD, at the cost of much larger files. Over network shares, USB or
-    spinning disks, compressed files often load faster than uncompressed ones
-    because the disk, not decoding, is the bottleneck. zstd and lz4 decode
-    quickly; zlib and lzw are the TIFF codecs older software reads. zstd for TIFF
-    is only offered when the `imagecodecs` package is installed.
+- **Acquisitions**: the queue. Each acquisition keeps its own settings: select a
+  row, or several from one microscope and objective, to see and change them. The
+  **Microscope** column shows the microscope and objective each was taken with. The
+  **Settings** column gives each group of acquisitions that share settings a letter:
+  the first ones queued are Set A, an acquisition from another microscope or
+  objective starts Set B, and changing only some rows of a set moves them to a new
+  letter. Rows from different microscopes or objectives cannot be changed together.
+  During a run the queue stays open: add acquisitions, or change a pending one's
+  settings; only the running acquisition's settings are locked. Only one stitch runs
+  at a time across the tabs. **Run All** stitches every Pending acquisition; **Run
+  Selected** only the selected ones. During a run the progress line gives the
+  running acquisition's time left, then the queue's (every acquisition still
+  waiting in this run, each priced with its own settings). **Cancel** stops the
+  running acquisition within a few seconds and cancels the rest of that run.
+- **Basics**: what every run needs.
+  - **Downsample**, with the output voxel size, memory, size and time it implies
+    shown right under it.
+  - **About the image**: pixel size, Z step, frame (camera ROI) and channels. These
+    are filled in by *Discover Tiles*; change one only if you know a detected value
+    is wrong. Unless you set the XY pixel size by hand, **each queued acquisition
+    uses the pixel size implied by its own objective** (from its
+    `ScopeSettings.txt`), so a queue mixing objectives stitches every item at the
+    right scale. A typed value applies to the selected acquisitions.
+    - **The pixel size is always shown in the log.** Discovery prints
+      `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
+      tiles come out **spaced apart like dice**, this value is almost always wrong —
+      check that line first.
+    - **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
+      you select a parent folder whose acquisitions live in a dated subfolder, the
+      app now searches down into it — but if it still can't find the objective it
+      logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
+    - **Per-microscope fallback.** For systems that don't record the objective in
+      `ScopeSettings.txt`, a per-microscope `objective_magnification` in
+      `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
+      (25.48×, measured on a calibration standard) → ~0.255 µm/px.
+  - **Saving**: output format, compression, **TIFF pyramids** and **Package as
+    .ozx**. **OME-Zarr (Fiji compatible)** is a safe default.
+    - **Formats.** OME-Zarr (Fiji compatible) is Zarr v2 + OME-NGFF v0.4; OME-Zarr
+      Sharded is Zarr v3 + OME-NGFF v0.5, which only napari and zarr-python 3.x read.
+      OME-TIFF writes all channels into one `<name>.ome.tif`. Imaris (.ims) uses
+      PyImarisWriter (Apache 2.0; `pip install "flamingo-stitcher[imaris]"`, Windows
+      only), writes block by block so it scales to TB-sized output, and builds its own
+      pyramids. It exists because ImarisFileConverter misreads OME-TIFF pyramid
+      SubIFDs as extra Z planes and collapses the data into Z = 0; to use the
+      converter anyway, write OME-TIFF with **TIFF pyramids** unchecked. Fiji and
+      Imaris do not need TIFF pyramids; napari and QuPath zoom faster with them.
+    - **Compression.** None skips encoding and decoding, so it is fastest from a fast
+      local SSD, at the cost of much larger files. Over network shares, USB or
+      spinning disks, compressed files often load faster than uncompressed ones
+      because the disk, not decoding, is the bottleneck. zstd and lz4 decode
+      quickly; zlib and lzw are the TIFF codecs older software reads. zstd for TIFF
+      is only offered when the `imagecodecs` package is installed.
+  - **Memory management**: memory mode, fusion chunk and region size, and the
+    scratch folder for temporary files. Every run uses these.
+- **Image quality** tab: how the two light sheets are combined (and aligned),
+  brightness (flat-field correction, intensity adjustment), stripes (destripe),
+  sharpness (deconvolution) and background zeroing.
+- **Registration and overlap** tab: where each tile goes (registration), how
+  neighboring tiles are joined (tile overlap, content-based blending), and the
+  checks and reports. **Hide settings** folds both tabs to give the log room; a run
+  does this for the running acquisition.
+
+Under the tabs, **This run** lists what the selected acquisition's run will do, as
+tags: orange for slow options, red for lossy ones, yellow for skipped or unused.
+
+Parts installed once per computer (flat-field correction, deconvolution, and the
+live background-zeroing preview) are on the **Options** tab under **Optional
+components**. A control that waits on one of them says so and links there.
 
 > Tip: hover over any control to get a tooltip explaining it. Open the **Log** panel
 > (collapsed at the bottom) to see full detail of what was detected and done.

@@ -29,6 +29,9 @@ def qapp():
 def store(tmp_path, monkeypatch):
     path = tmp_path / "scope_profiles.json"
     monkeypatch.setattr(sp, "profiles_path", lambda: path)
+    # The panel pre-selects microscopes a real run remembered; a leftover
+    # user file made 'Save' write under that name instead of the typed one.
+    monkeypatch.setattr(sp, "seen_path", lambda: tmp_path / "seen_microscopes.json")
     return path
 
 

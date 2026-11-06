@@ -114,12 +114,28 @@ def _version_is_newer(candidate: str, installed: str) -> bool:
     """
     if not candidate or not installed:
         return False
-    try:
-        cand_parts = [int(x) for x in candidate.split(".")]
-        inst_parts = [int(x) for x in installed.split(".")]
-    except (ValueError, AttributeError):
+    cand_parts = _version_key(candidate)
+    inst_parts = _version_key(installed)
+    if cand_parts is None or inst_parts is None:
         return False
     return cand_parts > inst_parts
+
+
+def _version_key(version: str):
+    """``"0.14.0"`` -> ``(0, 14, 0, 3, 0)``; ``"0.14.0b1"`` -> ``(0, 14, 0, 1, 1)``.
+
+    A pre-release (a, b, rc) sorts before the release it leads to, so someone
+    who installed the 0.14.0b1 pre-release is offered 0.14.0 when it comes out.
+    None when the string is not a version.
+    """
+    import re
+
+    m = re.fullmatch(r"(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?", str(version).strip())
+    if not m:
+        return None
+    nums = tuple(int(x) for x in m.group(1).split("."))
+    stage = {"a": 0, "b": 1, "rc": 2, None: 3}[m.group(2)]
+    return nums + (stage, int(m.group(3) or 0))
 
 
 def fetch_latest_release_info(api_url: str) -> dict:

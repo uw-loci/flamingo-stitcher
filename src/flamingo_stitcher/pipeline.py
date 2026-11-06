@@ -1591,6 +1591,13 @@ def _remove_run_scratch(run_dir) -> None:
         pass
 
 
+def _is_empty_dir(path) -> bool:
+    try:
+        return Path(path).is_dir() and not any(Path(path).iterdir())
+    except OSError:
+        return False
+
+
 def _other_scratch_folders(run_dir) -> List[Tuple[Path, float]]:
     """(folder, GB) for every other folder in this run's ``.stitch_tmp``.
 
@@ -4227,8 +4234,14 @@ def fuse_illumination_sides(
     span: Optional[int] = None,
     offset: int = 0,
     align: Optional[Tuple[int, int, int]] = None,
+    cancel_fn: Optional[Any] = None,
 ) -> np.ndarray:
     """Fuse the two illumination volumes of one tile.
+
+    ``cancel_fn``: checked every 16 planes; when it returns True the merge
+    stops with :class:`PipelineCancelled`. A full-size tile's merge takes
+    minutes (run 37: about 15 of a tile's 17), and until 0.14.0 Cancel waited
+    for the whole tile to finish.
 
     Args:
         volumes: {illumination_side: volume_array}
@@ -4254,6 +4267,10 @@ def fuse_illumination_sides(
     """
     sides = sorted(volumes.keys())
 
+    def _stop(z: int) -> None:
+        if cancel_fn is not None and z % 16 == 0 and cancel_fn():
+            raise PipelineCancelled()
+
     if len(sides) == 1:
         return np.asarray(volumes[sides[0]])
 
@@ -4264,6 +4281,7 @@ def fuse_illumination_sides(
         second = volumes[sides[1]]
         out = np.empty(np.shape(first), dtype=np.uint16)
         for z in range(out.shape[0]):
+            _stop(z)
             a = np.asarray(first[z])
             b = shifted_plane(second, z, align, a)
             out[z] = fuse_illumination_sides(
@@ -4327,6 +4345,7 @@ def fuse_illumination_sides(
             shape[axis] = n - pure_low - pure_high
             wb = w[pure_low: n - pure_high].reshape(shape)
             for z in range(low.shape[0]):
+                _stop(z)
                 a = low[z][band[1:]].astype(np.float32)
                 b = high[z][band[1:]].astype(np.float32)
                 np.clip(wb * a + (1.0 - wb) * b, 0, 65535, out=a)
@@ -4336,6 +4355,7 @@ def fuse_illumination_sides(
     if method == "content":
         out = np.empty(left.shape, dtype=np.uint16)
         for z in range(left.shape[0]):
+            _stop(z)
             wa = _detail_weights(left[z], right[z])
             a = left[z].astype(np.float32)
             b = right[z].astype(np.float32)
@@ -4344,7 +4364,14 @@ def fuse_illumination_sides(
         return out
 
     if method == "max":
-        return np.maximum(left, right)
+        if cancel_fn is None:
+            return np.maximum(left, right)
+        # Plane by plane so Cancel is noticed; the same values.
+        out = np.empty(left.shape, dtype=np.result_type(left, right))
+        for z in range(left.shape[0]):
+            _stop(z)
+            np.maximum(left[z], right[z], out=out[z])
+        return out
     elif method == "mean":
         # Per-plane so the float32 working set is one plane, not two whole-volume
         # float32 copies (~2x the native tile) plus their sum. Bit-identical to
@@ -4352,6 +4379,7 @@ def fuse_illumination_sides(
         # only one plane of each is paged in at a time.
         out = np.empty(left.shape, dtype=np.uint16)
         for z in range(left.shape[0]):
+            _stop(z)
             out[z] = (
                 (left[z].astype(np.float32) + right[z].astype(np.float32)) / 2
             ).astype(np.uint16)
@@ -5086,8 +5114,12 @@ class StitchingPipeline:
         cancelled_fn=None,
         progress_fn=None,
         memory_warning_fn=None,
+        eta_fn=None,
     ):
         self.config = config or StitchingConfig()
+        # Called with this run's remaining seconds whenever the whole-run ETA
+        # updates, so a queue can add the acquisitions still waiting (0.14.0).
+        self._eta_fn = eta_fn
         self.logger = logging.getLogger(__name__)
         self._cancelled_fn = cancelled_fn or (lambda: False)
         self._raw_progress_fn = progress_fn or (lambda pct, msg: None)
@@ -5252,6 +5284,13 @@ class StitchingPipeline:
                 # (Done at ~...)"). The GUI splits on OVERALL_ETA_SEP to colour
                 # the two segments differently; plain-text/CLI/logs stay legible.
                 msg = f"{msg}{OVERALL_ETA_SEP}overall: {tail}"
+            if self._eta_fn is not None:
+                try:
+                    rem = self._estimator.remaining_seconds()
+                    if rem is not None:
+                        self._eta_fn(float(rem))
+                except Exception:  # an ETA must never break a run
+                    pass
         self._raw_progress_fn(pct, msg)
 
     # ------------------------------------------------------------------
@@ -6049,6 +6088,15 @@ class StitchingPipeline:
             cancelled = bool(self._cancelled_fn())
             if self._estimator is not None:
                 self._estimator.finalize(success=not cancelled)
+            run_dir = getattr(self, "_scratch_run_dir", None)
+            if run_dir is not None and (cancelled or _is_empty_dir(run_dir)):
+                # The cancel branches remove their own subfolders; this takes the
+                # run's folder too, so no empty folder is left to be reported as
+                # another run's on the next one.
+                import gc as _gc
+
+                _gc.collect()
+                _remove_run_scratch(run_dir)
             return result
         except PipelineCancelled:
             # A dask compute was torn down by the user cancel. Treat as a clean
@@ -6056,6 +6104,14 @@ class StitchingPipeline:
             self.logger.info("Pipeline cancelled by user (compute aborted)")
             if self._estimator is not None:
                 self._estimator.finalize(success=False)
+            # A cancel inside a tile (0.14.0) can leave this run's spill behind;
+            # the folder is this run's own, so it can go. Memmaps first (Windows).
+            run_dir = getattr(self, "_scratch_run_dir", None)
+            if run_dir is not None:
+                import gc as _gc
+
+                _gc.collect()
+                _remove_run_scratch(run_dir)
             return output_path
         except BaseException:
             if self._estimator is not None:
@@ -7097,8 +7153,8 @@ class StitchingPipeline:
                         f"×{superblock}-chunk regions to bound streaming fuse "
                         f"memory (target ~"
                         f"{float(self.config.fusion_superblock_target_gb):g} "
-                        f"GB/region). Change with 'Fusion region size' in Processing "
-                        f"Options, --fusion-region-gb, or memory.fusion_region_gb."
+                        f"GB/region). Change with 'Fusion region size' (Basics, Memory management), "
+                        f"--fusion-region-gb, or memory.fusion_region_gb."
                     )
 
                 # Both names always exist so the shared cleanup below can `del`
@@ -7479,7 +7535,8 @@ class StitchingPipeline:
             self.logger.warning(
                 "Flat-field correction requested but basicpy is unavailable "
                 "(direct or isolated env) — output will NOT be flat-fielded. "
-                "Use the 'Set up flat-field…' button in the dialog to install it."
+                "Install it once with 'Set up flat-field…' (Options tab, "
+                "'Optional components')."
             )
             return {}
 
@@ -7531,6 +7588,8 @@ class StitchingPipeline:
         dark = model.darkfield.astype(np.float32)
         out = np.empty(volume.shape, dtype=np.uint16)
         for z in range(volume.shape[0]):
+            if z % 16 == 0 and self._cancelled_fn():
+                raise PipelineCancelled()
             plane = (volume[z].astype(np.float32) - dark) / ff
             out[z] = np.clip(plane, 0, 65535).astype(np.uint16)
         return out
@@ -7625,10 +7684,13 @@ class StitchingPipeline:
             volume = fuse_illumination_sides(
                 illum_volumes,
                 method=self.config.illumination_fusion,
+                cancel_fn=self._cancelled_fn,
                 **_fuse_kw,
             )
         else:
             volume = np.asarray(list(illum_volumes.values())[0])
+        if self._cancelled_fn():
+            raise PipelineCancelled()
 
         # Flat-field correction (streaming path). In-memory mode applies its own
         # flat-field step and leaves _flatfield_models empty, so this is a no-op
@@ -11524,7 +11586,7 @@ class StitchingPipeline:
             )
             self.logger.warning(
                 "  Falling back to default cosine blending "
-                "(turn off 'Content-based blending' under 'Processing Options' "
+                "(turn off 'Content-based blending' on the 'Registration and overlap' tab "
                 "to silence this warning)."
             )
             retry_kwargs = dict(fuse_kwargs)
@@ -13066,8 +13128,8 @@ class StitchingPipeline:
             self.logger.warning(
                 "  [info] Content-based fusion is enabled. Expect "
                 "the fuse-store step to be significantly slower (often "
-                "5-10× the default cosine blending). Disable under "
-                "Processing Options → 'Content-based blending' if "
+                "5-10× the default cosine blending). Turn off "
+                "'Content-based blending' ('Registration and overlap' tab) if "
                 "wall-clock matters more than per-overlap blending polish."
             )
 

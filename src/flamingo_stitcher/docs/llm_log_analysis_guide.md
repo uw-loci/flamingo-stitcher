@@ -37,7 +37,14 @@ selects streaming when the in-memory estimate exceeds ~60% of system RAM.
 
 ## 3. Reading the configuration echo (top of every run)
 
-The header echoes the settings and provenance. Lines worth checking first:
+The header echoes the settings and provenance. From 0.14.0 every queued
+acquisition carries its own settings (the queue's 'Settings' column groups
+them as Set A, B, ...), so in a multi-acquisition log read the echo of EACH
+`Processing i/N` block; before 0.14.0 one set applied to the whole queue.
+Also from 0.14.0, `Scratch: N other folder(s) in ...` lists scratch folders of
+another stitch, running or crashed, on the same drive (each run now has its
+own `.stitch_tmp/<run>` folder; only one run at a time is allowed per app).
+Lines worth checking first:
 
 - `Downsample: XY=?x Z=?x` — 1×/1× is full resolution (biggest, slowest).
 - `Illumination fusion: max|mean|split|blend|content|leonardo` — combines the

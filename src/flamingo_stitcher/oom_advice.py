@@ -93,8 +93,8 @@ def _write_step_advice(settings: Dict[str, Any]) -> List[str]:
         lines.append(
             "The pyramid builder is the memory peak. Update to the latest "
             "version (v0.5.0+ spills each pyramid level to disk instead of "
-            "holding it in RAM), or reduce the number of pyramid levels in "
-            "Processing Options."
+            "holding it in RAM), or uncheck 'TIFF pyramids' (Basics, Saving) "
+            "if the output is OME-TIFF."
         )
     return lines
 
@@ -107,8 +107,8 @@ def _preprocess_fuse_advice(settings: Dict[str, Any]) -> List[str]:
     eff = max(pp, fw) or 4  # 0 => auto => 4
     if eff > 1:
         lines.append(
-            f"Lower the preprocess/fuse worker count (currently ~{eff}) to 1-2 "
-            "in Processing Options. Each worker holds one whole tile in RAM, so "
+            f"Lower the preprocess/fuse worker count (preprocess_workers / "
+            f"fuse_workers, currently ~{eff}) to 1-2. Each worker holds one whole tile in RAM, so "
             "workers x tile-size is most of the streaming working set."
         )
 
@@ -202,8 +202,8 @@ def oom_advice(
         "write",
     ):
         lines.append(
-            "Enable Streaming mode (Processing Options -> Memory mode = "
-            "Streaming). In-memory mode holds the whole fused volume plus all "
+            "Switch to streaming mode: set 'Memory mode' to 'Streaming (low "
+            "memory)' (Basics, Memory management). In-memory mode holds the whole fused volume plus all "
             "tiles in RAM; streaming bounds RAM to a small working set and "
             "spills to disk — same resolution."
         )

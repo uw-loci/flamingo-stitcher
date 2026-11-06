@@ -88,7 +88,12 @@ slower drive since it's written once. Added in v0.4.x (supersedes the old
 "no temp redirect" limitation). A scratch dir on the same physical drive as the
 output gives no speed-up (the run log warns). The fused data crosses from scratch
 to the output drive once, in the normal fuse-then-write pass, which is not an
-extra copy of the result; `.stitch_tmp` is deleted when the run ends.
+extra copy of the result; the run's folder is deleted when the run ends.
+From 0.14.0 each run uses its own folder, `.stitch_tmp/<date-time-pid-id>`, so two
+runs on one scratch drive never share or delete each other's files. A run lists
+any other folders it finds there (`Scratch: N other folder(s) ...`): they belong to
+a stitch still running or one that crashed, and can be deleted by hand once no
+other stitch is running.
 
 ### CPU
 
@@ -283,8 +288,8 @@ effect.
 
 Flat-field correction (`basicpy`) is different: it needs an isolated
 environment, because it pins scipy versions that conflict with the rest
-of the stack. Build it with the **Set up flat-field…** button at the
-bottom of the stitching dialog. Leonardo dual-illumination fusion needs a
+of the stack. Build it with the **Set up flat-field…** button on the
+**Options** tab (**Optional components**). Leonardo dual-illumination fusion needs a
 separate GPU environment that this button does **not** install; for a
 scattering sample the `content` illumination-fusion mode is the
 no-GPU alternative.
@@ -303,7 +308,7 @@ missing rather than that the format is unsupported.
 
 ### Symptom: visible seams — a sharp step in brightness along tile borders
 
-Turn on **Detect border artifacts (QC)** in Processing Options (or
+Turn on **Detect border artifacts (QC)** on the **Registration and overlap** tab (or
 `--border-qc` on the CLI) and re-run. It scans neighboring-tile seams
 for sharp ~1-pixel intensity steps and writes a plain-text report **next
 to the run log** listing the offending tile pairs (X↔Y, affected border
@@ -400,7 +405,7 @@ is gc'd. `shutil.rmtree('.stitch_tmp')` can fail with "file in use"
 if any memmap object lives in a local variable or a traceback frame.
 All the cleanup paths in `_run_streaming` now do `del stacked;
 stacked = None; gc.collect()` before `rmtree`. If you see lingering
-`.stitch_tmp/fused.dat` files after a completed run, report it —
+`.stitch_tmp/<run>/fused.dat` files after a completed run, report it —
 it's a leaked reference somewhere.
 
 ### Python 3.11 vs 3.12 f-string syntax

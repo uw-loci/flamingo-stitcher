@@ -174,15 +174,6 @@ class ReworkedLayoutMixin:
         ``extras_count`` items at the top of ``content_layout`` came from
         ``_add_dialog_extras`` (Multi-View) and stay first.
         """
-        # ---- Output row: folder, then size and free space on the same line ----
-        out_row = self._output_dir_edit.parentWidget().layout()
-        take(self._output_info_label)
-        for i in range(out_row.count()):
-            item = out_row.itemAt(i)
-            if item.layout() is not None and _contains(item.layout(), self._output_dir_edit):
-                item.layout().addWidget(self._output_info_label)
-                break
-
         # ---- Acquisitions ----
         queue_group = self._queue_table.parentWidget()
         if isinstance(queue_group, QGroupBox):
@@ -228,8 +219,6 @@ class ReworkedLayoutMixin:
             w.deleteLater()
 
         # ---- Buttons: Run, Cancel, legend, Help ----
-        take(self._setup_env_btn)
-        self._setup_env_btn.hide()  # lives on the Options tab now
         btn_row = self._run_btn.parentWidget().layout()
         for i in range(btn_row.count()):
             item = btn_row.itemAt(i)
@@ -242,6 +231,7 @@ class ReworkedLayoutMixin:
                 break
 
         self._wire_run_summary()
+        self._update_install_notes()
 
     # ---- Basics -------------------------------------------------------------
 
@@ -413,8 +403,10 @@ class ReworkedLayoutMixin:
 
         br = QGroupBox("Brightness")
         bv = QVBoxLayout(br)
-        bv.addLayout(row(take(self._flat_field_cb)))
+        bv.addLayout(row(take(self._flat_field_cb), take(self._setup_env_btn)))
+        self._setup_env_btn.hide()  # see _update_install_notes
         self._flat_field_install_note = _install_note()
+        self._flat_field_install_note.linkActivated.connect(lambda _l: self._open_options_tab())
         bv.addWidget(self._flat_field_install_note)
         fit_to_contents(self._intensity_adjust_combo)
         bv.addLayout(row("Intensity adjustment:", take(self._intensity_adjust_combo)))
@@ -432,6 +424,7 @@ class ReworkedLayoutMixin:
         shv = QVBoxLayout(sh)
         shv.addLayout(row(take(self._deconv_cb)))
         self._deconv_install_note = _install_note()
+        self._deconv_install_note.linkActivated.connect(lambda _l: self._open_options_tab())
         shv.addWidget(self._deconv_install_note)
         g.addWidget(sh, 1, 1)
 
@@ -554,6 +547,10 @@ class ReworkedLayoutMixin:
 
         panel = getattr(self, "_run_summary", None)
         if panel is None:
+            return
+        message = getattr(self, "_run_summary_message", "")
+        if message:
+            panel.show_groups("", [], message)
             return
         panel.show_groups(*chips_from_dialog(self))
 

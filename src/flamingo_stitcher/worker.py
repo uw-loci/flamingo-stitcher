@@ -53,6 +53,8 @@ class StitchingWorker(QThread):
     # the info dict from the pipeline: used_gb, projected_gb, margin, phase,
     # mode. The dialog raises a non-blocking popup; the run keeps going.
     memory_warning = pyqtSignal(dict)
+    # This acquisition's remaining seconds (whole-run ETA), for the queue total.
+    eta_seconds = pyqtSignal(float)
 
     def __init__(
         self,
@@ -162,6 +164,7 @@ class StitchingWorker(QThread):
                 cancelled_fn=lambda: self._cancelled,
                 progress_fn=self.progress.emit,
                 memory_warning_fn=self.memory_warning.emit,
+                eta_fn=self.eta_seconds.emit,
             )
 
             output_path = pipeline.run(
@@ -179,6 +182,13 @@ class StitchingWorker(QThread):
                 self.completed.emit(str(output_path))
 
         except Exception as e:
+            from flamingo_stitcher.pipeline import PipelineCancelled
+
+            if self._cancelled or isinstance(e, PipelineCancelled):
+                # Cancel stopped the work part-way through a tile: not an error.
+                self.log_message.emit("Pipeline cancelled by user.")
+                self.progress.emit(0, "Cancelled")
+                return
             logger.exception("Stitching pipeline error")
             msg = str(e)
             if not msg:

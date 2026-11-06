@@ -171,6 +171,12 @@ class IsolatedPreprocessingService:
     - Cleanup of all shared memory blocks
     """
 
+    # Import checks, keyed by (worker Python, module), shared by all instances
+    # so the stitching tabs can re-check availability on every queue click
+    # without starting a Python process each time. clear_cache() empties it.
+    _IMPORT_CACHE: Dict[Tuple[str, str], bool] = {}
+
+
     # Default venv locations
     _WINDOWS_ENV = (
         Path.home() / "AppData" / "Roaming" / "Flamingo" / "preprocessing_env"
@@ -180,7 +186,9 @@ class IsolatedPreprocessingService:
     def __init__(self):
         self._worker_python = self._find_worker_python()
         # Cache import check results (cleared on env setup)
-        self._import_cache: Dict[str, bool] = {}
+        # Shared by every instance (see _IMPORT_CACHE): each check starts the
+        # env's Python, and callers make a new service per check.
+        self._import_cache = IsolatedPreprocessingService._IMPORT_CACHE
 
     @classmethod
     def env_path(cls) -> Path:
@@ -247,8 +255,9 @@ class IsolatedPreprocessingService:
         """Test whether *module* is importable in the isolated env."""
         if not self.is_available():
             return False
-        if module in self._import_cache:
-            return self._import_cache[module]
+        cache_key = (str(self._worker_python), module)
+        if cache_key in self._import_cache:
+            return self._import_cache[cache_key]
         try:
             result = subprocess.run(
                 [str(self._worker_python), "-c", f"import {module}"],
@@ -259,7 +268,7 @@ class IsolatedPreprocessingService:
             available = result.returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             available = False
-        self._import_cache[module] = available
+        self._import_cache[cache_key] = available
         return available
 
     def clear_cache(self):

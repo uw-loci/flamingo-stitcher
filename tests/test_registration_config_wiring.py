@@ -273,7 +273,7 @@ class TestEveryWidgetReferenceIsAssigned:
 
     # The dialog's layout mixin (0.14.0) assigns and defines some of the
     # attributes the dialog reads, so it is scanned as part of the class.
-    _SOURCES = (DIALOG, DIALOG.parent / "layout_rework.py")
+    _SOURCES = (DIALOG, DIALOG.parent / "layout_rework.py", DIALOG.parent / "queue_sets.py")
 
     @classmethod
     def _tree(cls):

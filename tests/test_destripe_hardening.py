@@ -83,7 +83,7 @@ def _install_spies(monkeypatch):
         calls.append(("destripe", tuple(volume.shape), in_place, cancel_fn))
         return volume
 
-    def fake_fuse(volumes, method="max"):
+    def fake_fuse(volumes, method="max", cancel_fn=None):
         calls.append(("fuse", len(volumes)))
         return np.asarray(list(volumes.values())[0])
 

@@ -134,3 +134,7 @@ jobs:
           body_path: RELEASE_NOTES.md
           generate_release_notes: true
           fail_on_unmatched_files: true
+          # A tag like v0.14.0b1 or v0.14.0rc1 is a pre-release: the in-app
+          # updater reads releases/latest, which never returns one, so people
+          # are not offered it until a full release is tagged.
+          prerelease: ${{ contains(github.ref_name, 'a') || contains(github.ref_name, 'b') || contains(github.ref_name, 'rc') }}

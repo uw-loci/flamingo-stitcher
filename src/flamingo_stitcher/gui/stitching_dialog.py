@@ -59,6 +59,7 @@ from flamingo_stitcher.gui._wheel_guard import install_wheel_guard
 
 # QSettings keys
 from flamingo_stitcher.gui.layout_rework import ReworkedLayoutMixin  # noqa: E402
+from flamingo_stitcher.gui.queue_sets import QueueSetsMixin  # noqa: E402
 
 _SETTINGS_GROUP = "StitchingDialog"
 # Shared (cross-dialog) key for the last folder browsed to via "Add…", so the
@@ -304,28 +305,13 @@ class BackgroundZeroPanel(QWidget):
         self._always_open = True
 
 
-class _FlatFieldSetupThread(QThread):
-    """Builds the pixi flat-field environment off the UI thread.
-
-    Emits ``progress`` lines as pixi downloads Python + basicpy, then ``done``
-    with (success, message). All the heavy lifting lives in
-    ``preprocessing_env.build_env`` — this just bridges it to Qt signals.
-    """
-
-    progress = pyqtSignal(str)
-    done = pyqtSignal(bool, str)
-
-    def run(self):
-        try:
-            from flamingo_stitcher import preprocessing_env
-
-            preprocessing_env.build_env(self.progress.emit)
-            self.done.emit(True, "")
-        except Exception as e:  # surfaced to the user in _on_setup_finished
-            self.done.emit(False, str(e))
+# The flat-field set-up thread moved with the button to the Options tab.
+from flamingo_stitcher.gui.optional_components import (  # noqa: E402
+    FlatFieldSetupThread as _FlatFieldSetupThread,
+)
 
 
-class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
+class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
     """Dialog for stitching raw acquisition tile data.
 
     Provides UI for configuring and running the stitching pipeline:
@@ -386,11 +372,20 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         # viewer — so the "Load … into Sample View" completion button is hidden.
         self._sample_view_available = True
 
+        # True in the standalone app, whose Options tab has 'Optional
+        # components': controls waiting on an install point there. Inside
+        # Py2Flamingo there is no such tab, so 'Set up flat-field…' shows next
+        # to 'Flat-field correction' instead.
+        self._options_tab_available = False
+
         # Batch queue state
         self._queue = []  # List of dicts: {path, status, tiles, error, output_path}
         self._queue_index = -1  # Index of currently processing item
         self._batch_running = False
         self._batch_config = None
+        # 'Run Selected': the acquisitions this run may take (None = all
+        # Pending, including ones added while it runs).
+        self._batch_only = None
         # Gray out 'Run All' here while another tab runs.
         from flamingo_stitcher import run_lock
 
@@ -658,7 +653,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             "'Discover Tiles', and each queued acquisition uses its own\n"
             "value. Type a value only if the objective is not recorded or\n"
             "the scale is known to be wrong: a typed value applies to\n"
-            "every queued acquisition."
+            "the selected acquisitions."
         )
         settings_layout.addWidget(self._pixel_size_spin, 0, 1)
 
@@ -672,7 +667,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         self._z_step_spin.setToolTip(
             "Each queued acquisition uses its own Z step from its data;\n"
             "'Discover Tiles' shows it here. Type a value only to correct\n"
-            "a wrong Z step: it then applies to every queued acquisition.\n"
+            "a wrong Z step: it then applies to the selected acquisitions.\n"
             "Set it to 0 (shows Auto) to go back to per-acquisition values."
         )
         settings_layout.addWidget(self._z_step_spin, 0, 3)
@@ -1067,7 +1062,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         content_layout.addWidget(settings_container)
 
         # --- Collapsible processing options ---
-        self._proc_toggle = QPushButton("\u25b6 Processing Options")
+        self._proc_toggle = QPushButton("\u25b2 Hide settings")
         self._proc_toggle.setCheckable(True)
         self._proc_toggle.setChecked(False)
         self._proc_toggle.setStyleSheet(
@@ -1639,8 +1634,20 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         self._run_tip = "Stitch every Pending item in the queue, one after another."
         self._run_btn.setToolTip(self._run_tip)
         self._run_btn.setEnabled(False)
-        self._run_btn.clicked.connect(self._on_run)
+        self._run_btn.clicked.connect(lambda _checked=False: self._on_run())
         btn_layout.addWidget(self._run_btn)
+
+        self._run_selected_btn = QPushButton("Run Selected")
+        self._run_selected_tip = (
+            "Stitch only the selected Pending acquisitions, one after another;\n"
+            "the other Pending ones wait. 'Run All' runs every Pending one."
+        )
+        self._run_selected_btn.setToolTip(self._run_selected_tip)
+        self._run_selected_btn.setEnabled(False)
+        self._run_selected_btn.clicked.connect(
+            lambda _checked=False: self._on_run(selected_only=True)
+        )
+        btn_layout.addWidget(self._run_selected_btn)
 
         self._cancel_btn = QPushButton("Cancel")
         self._cancel_btn.setToolTip(
@@ -1815,6 +1822,8 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             layout, content_layout, n_extras, [settings_container, self._proc_widget]
         )
         self._proc_toggle.setChecked(True)
+        # Each queued acquisition keeps its own settings (queue_sets).
+        self._init_queue_sets()
 
         # Sync .ozx checkbox enabled state with initial format
         self._on_format_changed()
@@ -1916,6 +1925,13 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
                 "output_path": None,
             }
         )
+        self._place_new_row(self._queue[-1])
+        if self._batch_running:
+            # Discover would clear the run's log, so read just this one now.
+            try:
+                self._queue[-1]["tiles"] = self._discover_tiles_for_path(path) or None
+            except Exception as e:  # noqa: BLE001 - it is read again at its turn
+                self._log(f"  Could not read {path.name} yet: {e}")
         # A directory was added, so a Discover is now due — flag it so the
         # Discover Tiles button flashes until the user runs it.
         self._discover_needed = True
@@ -2117,10 +2133,26 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             if item.get("error"):
                 path_item.setToolTip(f"Error: {item['error']}")
             self._queue_table.setItem(i, 1, path_item)
+            self._fill_queue_row(i, item)
+
+        if hasattr(self, "_queue_summary_label"):
+            text = self._queue_summary_text()
+            self._queue_summary_label.setText(text)
+            self._queue_summary_label.setVisible(bool(text))
+        # Something is always selected, so the settings shown belong to a row.
+        # While a run goes on and nothing pending is selected, follow it.
+        sel = self._selected_queue_rows()
+        if self._queue and not sel:
+            self._queue_table.selectRow(0)
+        elif (self._batch_running and 0 <= self._queue_index < len(self._queue)
+              and not any(self._queue[i].get("status") == "pending" for i in sel
+                          if i < len(self._queue))):
+            self._queue_table.selectRow(self._queue_index)
 
         # Status changes (item started/finished, re-queue) shift what's still
         # Pending, so refresh the remaining-queue time estimate.
         self._update_time_estimate()
+        self._apply_selection_state()
 
     def _update_action_buttons(self):
         """Update Discover/Run button states based on queue."""
@@ -2143,17 +2175,29 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             self._discover_btn.setEnabled(False)
             self._run_btn.setEnabled(False)
             self._set_btn_default(self._run_btn)
-        # One run at a time across tabs: gray out 'Run All' while another runs.
+        # 'Run Selected': something selected is Pending, and nothing runs here.
+        if hasattr(self, "_run_selected_btn"):
+            sel = self._selected_queue_rows() if hasattr(self, "_selected_queue_rows") else []
+            self._run_selected_btn.setEnabled(
+                not self._batch_running
+                and any(0 <= i < len(self._queue) and self._queue[i]["status"] == "pending"
+                        for i in sel)
+            )
+        # One run at a time across tabs: gray out both Run buttons while another runs.
         other = None if self._batch_running else self._other_tab_running()
         if other:
+            tip = (f"A stitch is running in the '{other}' tab. Only one stitch runs "
+                   "at a time; this comes back when it finishes.")
             self._run_btn.setEnabled(False)
             self._set_btn_default(self._run_btn)
-            self._run_btn.setToolTip(
-                f"A stitch is running in the '{other}' tab. Only one stitch runs "
-                "at a time; 'Run All' comes back when it finishes."
-            )
+            self._run_btn.setToolTip(tip)
+            if hasattr(self, "_run_selected_btn"):
+                self._run_selected_btn.setEnabled(False)
+                self._run_selected_btn.setToolTip(tip)
         else:
             self._run_btn.setToolTip(self._run_tip)
+            if hasattr(self, "_run_selected_btn"):
+                self._run_selected_btn.setToolTip(self._run_selected_tip)
         # Discover button accent/flash reflects whether a Discover is due.
         self._refresh_discover_style()
 
@@ -3299,7 +3343,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             tile_sets = [(None, tiles)]
         else:
             tile_sets = [
-                (it.get("path"), it["tiles"]) for it in self._queue if it["tiles"]
+                (it.get("path"), it["tiles"]) for it in self._estimate_items() if it["tiles"]
             ]
 
         self._sync_reg_z_choices()
@@ -3449,6 +3493,13 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         # Time estimate shares the same triggers (config + discovery changes).
         self._update_time_estimate()
 
+    def _estimate_items(self):
+        """Acquisitions the memory estimate describes: the selected ones, whose
+        settings the window shows, or the whole queue when none is selected."""
+        sel = self._selected_queue_rows() if hasattr(self, "_selected_queue_rows") else []
+        items = [self._queue[i] for i in sel if 0 <= i < len(self._queue)]
+        return items or list(self._queue)
+
     def _update_time_estimate(self):
         """Show a rough total wall-time estimate for the Pending queue items.
 
@@ -3481,9 +3532,11 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             total_s = 0.0
             measured = 0
             for it in items:
+                # Each acquisition is timed with its own settings.
+                it_config = it.get("config") or config
                 key = build_timing_key(
                     it["tiles"],
-                    config,
+                    it_config,
                     acquisition_dir=it.get("path"),
                     output_dir=output_dir,
                 )
@@ -3492,7 +3545,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
                     total_s += cached
                     measured += 1
                 else:
-                    total_s += rough_run_seconds(it["tiles"], config)
+                    total_s += rough_run_seconds(it["tiles"], it_config)
 
             n = len(items)
             if measured == n:
@@ -4162,7 +4215,12 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
 
     def _parse_channels(self) -> Optional[List[int]]:
         """Parse channels from the channels line edit. Returns None for 'all'."""
-        text = self._channels_edit.text().strip()
+        return self._channels_from_text(self._channels_edit.text())
+
+    @staticmethod
+    def _channels_from_text(text) -> Optional[List[int]]:
+        """'0,1' -> [0, 1]; empty or not a list of numbers -> None (all)."""
+        text = (text or "").strip()
         if not text:
             return None
         try:
@@ -4451,16 +4509,22 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         if hasattr(self, "_run_btn"):
             self._update_action_buttons()
 
-    def _on_run(self):
-        """Start batch stitching of all pending queue items."""
+    def _on_run(self, selected_only: bool = False):
+        """Stitch the pending queue items: all of them, or only the selected."""
         other = self._other_tab_running()
         if other:
             self._refuse_second_run(other)
             return
         pending = [item for item in self._queue if item["status"] == "pending"]
+        if selected_only:
+            sel = set(self._selected_queue_rows())
+            pending = [it for i, it in enumerate(self._queue)
+                       if i in sel and it["status"] == "pending"]
         if not pending:
             QMessageBox.warning(
-                self, "Nothing to Run", "No pending directories in the queue."
+                self, "Nothing to Run",
+                "None of the selected acquisitions is Pending." if selected_only
+                else "No pending directories in the queue."
             )
             return
 
@@ -4479,40 +4543,45 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         if not self._confirm_orientation_known(pending):
             return
 
-        # Pre-flight: Split/Blend cannot run without knowing which sheet
-        # lights the left of the frame, and silently becoming Max is the one
-        # outcome the operator cannot see in the output.
-        if not self._confirm_illumination_low_side(pending, config):
-            return
+        # Flat-field requested by any set but not installed: ask once.
+        from flamingo_stitcher.flat_field import is_available as _ff_ok
 
-        # Pre-flight: block if the XY pixel size clashes with the objective
-        # recorded in ScopeSettings.txt (the #1 cause of gappy/overlapping
-        # stitches). A log warning alone was too easy to run past.
-        if not self._confirm_pixel_size(pending, config):
-            return
+        wants_ff = [it for it in pending if (it.get("config") or config).flat_field_correction]
+        if wants_ff and not _ff_ok():
+            reply = QMessageBox.question(
+                self,
+                "Flat-field correction is not installed",
+                "Flat-field correction is not installed on this computer. Install "
+                "it once with 'Set up flat-field…' (Options tab, 'Optional "
+                "components').\n\nContinue without flat-field correction?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply == QMessageBox.No:
+                return
+            config.flat_field_correction = False
+            for it in wants_ff:
+                if it.get("config") is not None:
+                    it["config"].flat_field_correction = False
 
-        # Pre-flight: warn if flat-field is requested but basicpy missing
-        if config.flat_field_correction:
-            from flamingo_stitcher.flat_field import is_available
-
-            if not is_available():
-                reply = QMessageBox.question(
-                    self,
-                    "basicpy Not Installed",
-                    "Flat-field correction requires basicpy which is not installed.\n\n"
-                    "Install with:  pip install basicpy\n\n"
-                    "Continue without flat-field correction?",
-                    QMessageBox.Yes | QMessageBox.No,
-                    QMessageBox.No,
-                )
-                if reply == QMessageBox.No:
-                    return
-                config.flat_field_correction = False
-
-        # Pre-flight: warn (popup) if projected peak RAM or disk free looks
-        # risky for any queue item. User must accept to proceed.
-        if not self._confirm_resource_headroom(pending, config):
-            return
+        # The other pre-flights read the settings, so run them per settings set.
+        groups = {}
+        for it in pending:
+            groups.setdefault(it.get("set", ""), []).append(it)
+        for group in groups.values():
+            gconfig = group[0].get("config") or config
+            # Split/Blend cannot run without knowing which sheet lights the
+            # left of the frame, and silently becoming Max is the one outcome
+            # the operator cannot see in the output.
+            if not self._confirm_illumination_low_side(group, gconfig):
+                return
+            # The XY pixel size must not clash with the objective recorded in
+            # ScopeSettings.txt (the #1 cause of gappy/overlapping stitches).
+            if not self._confirm_pixel_size(group, gconfig):
+                return
+            # Projected peak RAM or disk free looks risky for an item.
+            if not self._confirm_resource_headroom(group, gconfig):
+                return
 
         # Past every pre-flight: take the one-run lock (another tab may have
         # started while the pre-flight dialogs were open).
@@ -4531,6 +4600,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         self._log(f"Starting batch stitching: {n_pending} directories\n")
 
         # Store batch state
+        self._batch_only = {id(it) for it in pending} if selected_only else None
         self._batch_running = True
         self._mem_wait_popup_shown = False
         self._set_flamingos_marching(True)
@@ -4699,7 +4769,9 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         # Find next pending
         next_idx = None
         for i, item in enumerate(self._queue):
-            if item["status"] == "pending":
+            if item["status"] == "pending" and (
+                self._batch_only is None or id(item) in self._batch_only
+            ):
                 next_idx = i
                 break
 
@@ -4794,7 +4866,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         from flamingo_stitcher.pipeline import StitchingPipeline
 
         try:
-            pipe = StitchingPipeline(self._build_config())
+            pipe = StitchingPipeline(item.get("config") or self._build_config())
             expected = pipe.expected_output_path(item["path"], output_dir)
         except Exception:  # noqa: BLE001 - can't determine → old behaviour
             return output_dir
@@ -4858,8 +4930,10 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             from flamingo_stitcher.pipeline import estimate_memory_usage
 
             all_ch = sorted({ch for t in item["tiles"] for ch in t.channels})
-            process_ch = self._batch_channels or all_ch
-            est = estimate_memory_usage(item["tiles"], process_ch, self._batch_config)
+            process_ch = self._channels_from_text(item.get("channels_text")) or all_ch
+            est = estimate_memory_usage(
+                item["tiles"], process_ch, item.get("config") or self._batch_config
+            )
             need = (
                 est["streaming_gb"]
                 if est.get("auto_streaming")
@@ -5241,7 +5315,9 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         # Give each item its OWN config copy: in auto mode the pipeline resolves
         # this acquisition's pixel size into the config, and a fresh copy keeps
         # one item's derived value from leaking into the next as a fallback.
-        item_config = replace(self._batch_config)
+        item_config = replace(item.get("config") or self._batch_config)
+        # 'Channels' belongs to the row too.
+        self._batch_channels = self._channels_from_text(item.get("channels_text"))
 
         # Destripe settings are per-MICROSCOPE, resolved here (per item) rather
         # than once for the batch, so a queue mixing instruments gets each one's
@@ -5275,6 +5351,9 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
         self._worker.completed.connect(self._on_item_completed)
         self._worker.error.connect(self._on_item_error)
         self._worker.memory_warning.connect(self._on_memory_warning)
+        self._current_remaining_s = None
+        if hasattr(self._worker, "eta_seconds"):
+            self._worker.eta_seconds.connect(self._on_eta_seconds)
         self._worker.finished.connect(self._on_item_finished)
         self._worker.start()
 
@@ -5289,9 +5368,12 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             )
             # Immediate feedback + prevent repeat clicks; re-enabled on next run.
             self._cancel_btn.setEnabled(False)
-        # Mark remaining pending items as cancelled
+        # Mark the rest of this run as cancelled (with 'Run Selected', only
+        # the selected ones: the other Pending rows were never part of it).
         for item in self._queue:
-            if item["status"] == "pending":
+            if item["status"] == "pending" and (
+                self._batch_only is None or id(item) in self._batch_only
+            ):
                 item["status"] = "cancelled"
         self._update_queue_table()
 
@@ -5398,7 +5480,14 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             n_total = sum(1 for it in self._queue if it["status"] != "cancelled")
             n_done = sum(1 for it in self._queue if it["status"] in ("done", "error"))
             status = f"[{n_done + 1}/{n_total}] {status}"
-        self._status_label.setText(self._colorize_status(status))
+        self._last_status = status
+        base = self._colorize_status(status)
+        queue = self._queue_eta_html()
+        if queue and base is status:  # plain text: escape before adding markup
+            from html import escape
+
+            base = escape(status)
+        self._status_label.setText(base + queue)
 
         key = self._classify_step(status)
         if key is None:
@@ -5438,6 +5527,55 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
                 existing = self._step_labels[k].styleSheet()
                 if "#1976D2" not in existing:
                     self._set_step_state(k, "todo")
+
+    def _on_eta_seconds(self, seconds: float) -> None:
+        self._current_remaining_s = float(seconds)
+
+    def _queued_after_current(self):
+        """Pending acquisitions this run will still take after the running one."""
+        return [
+            it for it in self._queue
+            if it.get("status") == "pending" and it.get("tiles")
+            and (self._batch_only is None or id(it) in self._batch_only)
+        ]
+
+    def _queue_eta_html(self) -> str:
+        """'queue: 2 more after this one, about 21 h left (Done at ~Sat 09:10)'.
+
+        The 'overall' time on the progress line is the running acquisition
+        only; this adds every acquisition still waiting in this run, each
+        priced with its own settings (measured from similar runs when there
+        are any, otherwise the rough model).
+        """
+        if not self._batch_running:
+            return ""
+        rest = self._queued_after_current()
+        if not rest:
+            return ""
+        try:
+            from datetime import datetime, timedelta
+
+            from flamingo_stitcher.multi_phase_estimator import _format_duration
+            from flamingo_stitcher.pipeline import build_timing_key, rough_run_seconds
+            from flamingo_stitcher.timing_cache import StitchingTimingCache
+
+            cache = StitchingTimingCache()
+            out_dir = self._output_dir_edit.text().strip() or None
+            total = float(self._current_remaining_s or 0.0)
+            for it in rest:
+                cfg = it.get("config") or self._batch_config or self._build_config()
+                key = build_timing_key(it["tiles"], cfg, acquisition_dir=it.get("path"),
+                                       output_dir=out_dir)
+                total += cache.get_total_s(key) or rough_run_seconds(it["tiles"], cfg)
+            done = (datetime.now() + timedelta(seconds=total)).strftime("%a %H:%M")
+            n = len(rest)
+            return (
+                '<span style="color:#6a1b9a;">'
+                f"   \u00b7   queue: {n} more after this one, about "
+                f"{_format_duration(total)} left (Done at ~{done})</span>"
+            )
+        except Exception:  # an estimate must never break the progress line
+            return ""
 
     def _colorize_status(self, status: str) -> str:
         """Render the status line as rich text so the per-step ETA and the
@@ -5758,6 +5896,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
                 )
 
         self._batch_running = False
+        self._batch_only = None
         self._set_flamingos_marching(False)
         from flamingo_stitcher import run_lock
 
@@ -5769,6 +5908,7 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
 
         # Re-enable UI
         self._set_config_controls_enabled(True)
+        self._apply_selection_state()
         self._cancel_btn.setEnabled(False)
         self._update_action_buttons()
 
@@ -6087,9 +6227,9 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
             self._flat_field_cb.setChecked(False)
             self._flat_field_cb.setEnabled(False)
             self._flat_field_cb.setToolTip(
-                "Flat-field correction is not installed yet.\n"
-                "Click 'Set up flat-field…' to install it\n"
-                "in an isolated environment."
+                "Flat-field correction is not installed yet. Install it once\n"
+                "with 'Set up flat-field…' ('Optional components' on the\n"
+                "Options tab)."
             )
 
         # Reflect install state in the setup button so it's clear when it's done.
@@ -6202,6 +6342,48 @@ class StitchingDialog(ReworkedLayoutMixin, PersistentDialog):
                 max_idx = self._fusion_combo.findData("max")
                 if max_idx >= 0:
                     self._fusion_combo.setCurrentIndex(max_idx)
+
+        self._update_install_notes()
+
+    def set_options_tab_available(self, available: bool) -> None:
+        """Say whether this dialog sits in the standalone app beside an Options
+        tab with 'Optional components' (see _update_install_notes)."""
+        self._options_tab_available = bool(available)
+        self._update_install_notes()
+
+    def _update_install_notes(self) -> None:
+        """Under a control grayed out for a missing install, say where to get it.
+
+        Grayed-out controls otherwise explain themselves in their tooltip only;
+        a missing install is the exception, because the fix is somewhere else.
+        """
+        if not hasattr(self, "_flat_field_install_note"):
+            return
+        from flamingo_stitcher import deconvolution as _decon
+        from flamingo_stitcher.flat_field import is_available as _ff_available
+
+        link = "<a href='options'>Options tab</a>"
+        ff_missing = not _ff_available()
+        if self._options_tab_available:
+            self._flat_field_install_note.setText(
+                f"Not installed yet. Install it once on the {link} with "
+                "'Set up flat-field…'."
+            )
+            self._setup_env_btn.setVisible(False)
+        else:
+            self._flat_field_install_note.setText(
+                "Not installed yet. Install it once with 'Set up flat-field…'."
+            )
+            self._setup_env_btn.setVisible(ff_missing)
+        self._flat_field_install_note.setVisible(ff_missing)
+
+        decon_missing = not _decon.is_available()
+        self._deconv_install_note.setText(
+            f"Not available in this build: see 'Optional components' on the {link}."
+            if self._options_tab_available else
+            "Not available in this build: it needs a GPU library (see the README)."
+        )
+        self._deconv_install_note.setVisible(decon_missing)
 
     def set_sample_view_available(self, available: bool) -> None:
         """Tell the dialog whether a 3D Sample View exists to receive output.

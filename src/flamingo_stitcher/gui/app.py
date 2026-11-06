@@ -212,7 +212,15 @@ def main() -> int:
     # instrument, not to a run, and all three dialogs consume the same store.
     from flamingo_stitcher.gui.options_panel import OptionsPanel
 
-    tabs.addTab(OptionsPanel(window), "Options")
+    options = OptionsPanel(window)
+    tabs.addTab(options, "Options")
+    # 'Set up flat-field…' lives in the Options tab's 'Optional components';
+    # the stitching tabs point there, and re-check what is installed after it.
+    for _dialog in (single, multi, multiview):
+        _dialog.set_options_tab_available(True)
+        options.components_box.components_changed.connect(
+            _dialog._update_preprocessing_availability
+        )
 
     # Updates tab — checks GitHub Releases for newer installers (standalone
     # build only; the in-app Py2Flamingo dialogs ship their own updates).

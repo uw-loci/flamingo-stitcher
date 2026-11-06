@@ -181,7 +181,8 @@ vertical Y axis baked into their placement transform, so several angles fuse int
 
 - **In-memory** — all preprocessed tiles held in RAM, then fused.
 - **Streaming** — each tile preprocessed once and spilled to a per-tile memmap under
-  `.stitch_tmp/`; fusion reads chunks from those files.
+  `.stitch_tmp/<run>/` (one folder per run from 0.14.0); fusion reads chunks from
+  those files.
 
 `split_illumination` forces streaming, because the split path is only implemented in the
 streaming fuse loop.

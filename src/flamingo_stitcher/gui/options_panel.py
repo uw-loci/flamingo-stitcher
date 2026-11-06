@@ -67,6 +67,13 @@ class OptionsPanel(QWidget):
     def _build(self) -> None:
         outer = QVBoxLayout(self)
 
+        # Parts installed once on this computer (not per microscope), so they
+        # sit above the per-microscope settings.
+        from flamingo_stitcher.gui.optional_components import OptionalComponentsBox
+
+        self.components_box = OptionalComponentsBox(self)
+        outer.addWidget(self.components_box)
+
         intro = QLabel(
             "Registration tuning is per microscope and per objective. These "
             "values are applied automatically to any acquisition whose "
