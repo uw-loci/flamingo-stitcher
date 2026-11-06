@@ -1561,6 +1561,60 @@ def _scratch_base_dir(config, output_path) -> Path:
     return Path(scratch) if scratch else Path(output_path)
 
 
+SCRATCH_FOLDER = ".stitch_tmp"
+
+
+def _new_run_scratch_dir(config, output_path) -> Path:
+    """A folder of this run's own under ``<scratch>/.stitch_tmp``.
+
+    Until 0.14.0 every run used ``.stitch_tmp`` itself, so two runs at the same
+    time on one scratch drive wrote the same ``reg_chNN`` and ``fused.dat`` files,
+    and the first to finish or be canceled deleted both runs' files. The name
+    starts with the date and time so leftovers sort by age.
+    """
+    import os
+    import uuid
+
+    run_id = time.strftime("%Y%m%d-%H%M%S") + f"-{os.getpid()}-{uuid.uuid4().hex[:6]}"
+    return _scratch_base_dir(config, output_path) / SCRATCH_FOLDER / run_id
+
+
+def _remove_run_scratch(run_dir) -> None:
+    """Delete this run's scratch folder, and ``.stitch_tmp`` if nothing else is in it."""
+    import shutil
+
+    run_dir = Path(run_dir)
+    shutil.rmtree(run_dir, ignore_errors=True)
+    try:
+        run_dir.parent.rmdir()  # only succeeds when empty: another run's folder stays
+    except OSError:
+        pass
+
+
+def _other_scratch_folders(run_dir) -> List[Tuple[Path, float]]:
+    """(folder, GB) for every other folder in this run's ``.stitch_tmp``.
+
+    These belong to a run that is still going or to one that crashed; the run
+    cannot tell which, so it reports them and leaves them alone.
+    """
+    run_dir = Path(run_dir)
+    out = []
+    try:
+        siblings = [d for d in run_dir.parent.iterdir() if d.is_dir() and d != run_dir]
+    except OSError:
+        return out
+    for d in sorted(siblings):
+        size = 0
+        for f in d.rglob("*"):
+            try:
+                if f.is_file():
+                    size += f.stat().st_size
+            except OSError:
+                pass
+        out.append((d, size / 1024**3))
+    return out
+
+
 def _same_volume(a, b) -> Optional[bool]:
     """True if ``a`` and ``b`` live on the same physical volume/drive.
 
@@ -2148,7 +2202,9 @@ class StitchingConfig:
     #   * The final output is still written from the fused memmap to output_dir,
     #     so the fused data crosses drives once (scratch -> output). That is the
     #     normal fuse->write pass, NOT an extra copy of the finished result;
-    #     the whole `.stitch_tmp` is deleted at the end.
+    #     the run's folder in `.stitch_tmp` is deleted at the end. Each run
+    #     gets its own folder (`.stitch_tmp/<date-time-pid-id>`), so two runs on
+    #     one scratch drive never share or delete each other's files.
     scratch_dir: Optional[str] = None
 
     @classmethod
@@ -5850,11 +5906,7 @@ class StitchingPipeline:
                 "first output channel — one preprocess pass instead of two). "
                 "Seam steps are therefore per-light-path, not post-fusion."
             )
-        own_tmp = (
-            _scratch_base_dir(self.config, output_path)
-            / ".stitch_tmp"
-            / f"qc_ch{ref_ch:02d}{side_tag}"
-        )
+        own_tmp = self._run_scratch(output_path) / f"qc_ch{ref_ch:02d}{side_tag}"
         # Materialize the reference channel once. A hard failure here leaves a
         # useless partial spill — drop it and re-raise (the caller swallows).
         try:
@@ -6048,6 +6100,7 @@ class StitchingPipeline:
         # have a different camera orientation.
         self._reset_destripe_axis()
         self.logger.info(f"=== Stitching Pipeline Start ===")
+        self._scratch_run_dir = None  # a new folder for every run
         for _line in environment_summary():
             self.logger.info(_line)
         self._check_illumination_fusion_is_usable()
@@ -6763,11 +6816,7 @@ class StitchingPipeline:
             # process commit limit and dies with "Unable to allocate 3.25 GiB"
             # even on a ~900 GB box. Registration only reads the tiles lazily
             # (and binned), so memmap-back them and let dask page in chunks.
-            reg_tmp_dir = (
-                _scratch_base_dir(self.config, output_path)
-                / ".stitch_tmp"
-                / f"reg_ch{ref_ch:02d}"
-            )
+            reg_tmp_dir = self._run_scratch(output_path) / f"reg_ch{ref_ch:02d}"
             probe = self._preprocess_single_tile(tiles[0], ref_ch, shape_only=True)
             ref_shape = probe.shape
             del probe
@@ -6904,7 +6953,7 @@ class StitchingPipeline:
         output_units = self._output_channel_units(tiles, process_channels)
         n_out = max(len(output_units), 1)
 
-        tmp_root = _scratch_base_dir(self.config, output_path) / ".stitch_tmp"
+        tmp_root = self._run_scratch(output_path)
         tmp_root.mkdir(parents=True, exist_ok=True)
         imaris_mode = self.config.output_format == "imaris"
         try:
@@ -6916,7 +6965,7 @@ class StitchingPipeline:
                     # ref-channel spill). Drop the memmap ref first (Windows lock).
                     stacked = None
                     gc.collect()
-                    shutil.rmtree(tmp_root, ignore_errors=True)
+                    _remove_run_scratch(tmp_root)
                     return output_path
 
                 fuse_pct = _PCT_FUSE + int((_PCT_WRITE - _PCT_FUSE) * (ch_idx + 0.5) / n_out)
@@ -7249,7 +7298,7 @@ class StitchingPipeline:
                 stacked = None
             gc.collect()
             if tmp_root.exists():
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                _remove_run_scratch(tmp_root)
             raise
 
         if not fused_channel_ids:
@@ -7259,7 +7308,7 @@ class StitchingPipeline:
                 stacked = None
             gc.collect()
             if tmp_root.exists():
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                _remove_run_scratch(tmp_root)
             return output_path
 
         # Trim the memmap view to only the channels that actually fused
@@ -7275,7 +7324,7 @@ class StitchingPipeline:
                 stacked = None
             gc.collect()
             if tmp_root.exists():
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                _remove_run_scratch(tmp_root)
             return output_path
 
         self._progress_fn(_PCT_WRITE, "Writing multi-channel output...")
@@ -7327,7 +7376,7 @@ class StitchingPipeline:
                 stacked = None
             gc.collect()
             if tmp_root.exists():
-                shutil.rmtree(tmp_root, ignore_errors=True)
+                _remove_run_scratch(tmp_root)
 
         # --- Step 7: Write metadata ---
         self._progress_fn(_PCT_METADATA, "Writing metadata...")
@@ -7745,6 +7794,12 @@ class StitchingPipeline:
             else:
                 units.append((ch, ch, None))
         return units
+
+    def _run_scratch(self, output_path) -> Path:
+        """This run's own scratch folder, made up the first time it is asked for."""
+        if getattr(self, "_scratch_run_dir", None) is None:
+            self._scratch_run_dir = _new_run_scratch_dir(self.config, output_path)
+        return self._scratch_run_dir
 
     def _materialize_tiles_to_disk(
         self,
@@ -13092,6 +13147,20 @@ class StitchingPipeline:
         separate_scratch = (
             scratch_set and _same_volume(scratch_base, output_path) is not True
         )
+
+        # Other runs' scratch folders: a run still going, or one that crashed.
+        # Never deleted here (the run cannot tell which); reported so the space
+        # can be reclaimed by hand.
+        others = _other_scratch_folders(self._run_scratch(output_path))
+        if others:
+            total = sum(gb for _d, gb in others)
+            self.logger.info(
+                f"Scratch: {len(others)} other folder(s) in "
+                f"{self._run_scratch(output_path).parent} ({total:.0f} GB), from a "
+                "stitch still running or one that crashed. Delete them by hand "
+                "when no other stitch is running: "
+                + ", ".join(f"{d.name} ({gb:.0f} GB)" for d, gb in others)
+            )
 
         try:
             out_free_gb = _shutil.disk_usage(output_path).free / (1024**3)

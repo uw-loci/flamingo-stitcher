@@ -328,6 +328,10 @@ class StitchingDialog(PersistentDialog):
     # True while a batch is running; the Updates tab grays out 'Install update'.
     run_state_changed = pyqtSignal(bool)
 
+    # The tab name other tabs show while this one runs (one run at a time
+    # across all stitching tabs; see run_lock).
+    _run_label = "Multi-Acquisition"
+
     # How many directory levels to go up when restoring the acq dir path.
     # Subfolder-per-tile layout: grandparent (2 levels up).
     _acq_dir_restore_levels_up = 2
@@ -376,6 +380,10 @@ class StitchingDialog(PersistentDialog):
         self._queue_index = -1  # Index of currently processing item
         self._batch_running = False
         self._batch_config = None
+        # Gray out 'Run All' here while another tab runs.
+        from flamingo_stitcher import run_lock
+
+        run_lock.subscribe(self._on_run_lock_changed)
 
         # Tile orientation chosen via the Orientation Preview this session (a
         # TileOrientation, or None to fall back to the saved per-microscope
@@ -1615,9 +1623,8 @@ class StitchingDialog(PersistentDialog):
         btn_layout = QHBoxLayout()
 
         self._run_btn = QPushButton("Run All")
-        self._run_btn.setToolTip(
-            "Stitch every Pending item in the queue, one after another."
-        )
+        self._run_tip = "Stitch every Pending item in the queue, one after another."
+        self._run_btn.setToolTip(self._run_tip)
         self._run_btn.setEnabled(False)
         self._run_btn.clicked.connect(self._on_run)
         btn_layout.addWidget(self._run_btn)
@@ -2117,6 +2124,17 @@ class StitchingDialog(PersistentDialog):
             self._discover_btn.setEnabled(False)
             self._run_btn.setEnabled(False)
             self._set_btn_default(self._run_btn)
+        # One run at a time across tabs: gray out 'Run All' while another runs.
+        other = None if self._batch_running else self._other_tab_running()
+        if other:
+            self._run_btn.setEnabled(False)
+            self._set_btn_default(self._run_btn)
+            self._run_btn.setToolTip(
+                f"A stitch is running in the '{other}' tab. Only one stitch runs "
+                "at a time; 'Run All' comes back when it finishes."
+            )
+        else:
+            self._run_btn.setToolTip(self._run_tip)
         # Discover button accent/flash reflects whether a Discover is due.
         self._refresh_discover_style()
 
@@ -4400,8 +4418,33 @@ class StitchingDialog(PersistentDialog):
             )
         return True
 
+    def _other_tab_running(self) -> Optional[str]:
+        """Name of the tab whose run is in progress, if not this one."""
+        from flamingo_stitcher import run_lock
+
+        return run_lock.holder_label(exclude=self)
+
+    def _refuse_second_run(self, other: str) -> None:
+        QMessageBox.information(
+            self,
+            "Another stitch is running",
+            f"A stitch is already running in the '{other}' tab.\n\n"
+            "Only one stitch runs at a time: two at once compete for the "
+            "computer's memory, processor and scratch disk, which can make "
+            "both fail. Run this one when that one has finished.",
+        )
+
+    def _on_run_lock_changed(self) -> None:
+        """A run started or ended in some tab: refresh 'Run All' here."""
+        if hasattr(self, "_run_btn"):
+            self._update_action_buttons()
+
     def _on_run(self):
         """Start batch stitching of all pending queue items."""
+        other = self._other_tab_running()
+        if other:
+            self._refuse_second_run(other)
+            return
         pending = [item for item in self._queue if item["status"] == "pending"]
         if not pending:
             QMessageBox.warning(
@@ -4459,7 +4502,15 @@ class StitchingDialog(PersistentDialog):
         if not self._confirm_resource_headroom(pending, config):
             return
 
-        # Past every pre-flight: this run is definitely starting.
+        # Past every pre-flight: take the one-run lock (another tab may have
+        # started while the pre-flight dialogs were open).
+        from flamingo_stitcher import run_lock
+
+        if not run_lock.acquire(self, self._run_label):
+            self._refuse_second_run(self._other_tab_running() or "other")
+            return
+
+        # This run is definitely starting.
         self._focus_log_for_run()
 
         self._log_text.clear()
@@ -5696,6 +5747,9 @@ class StitchingDialog(PersistentDialog):
 
         self._batch_running = False
         self._set_flamingos_marching(False)
+        from flamingo_stitcher import run_lock
+
+        run_lock.release(self)
         self.run_state_changed.emit(False)
         self._queue_index = -1
         self._batch_config = None
@@ -6733,6 +6787,9 @@ class StitchingDialog(PersistentDialog):
             self._worker.cancel()
             self._worker.wait(2000)
         self._batch_running = False
+        from flamingo_stitcher import run_lock
+
+        run_lock.release(self)
         self.run_state_changed.emit(False)
         super().closeEvent(event)
 
@@ -6753,6 +6810,8 @@ class NativeStitchingDialog(StitchingDialog):
     .raw files with integer tile indices (X000_Y000) in a flat directory,
     rather than the subfolder-per-tile layout.
     """
+
+    _run_label = "Single Workflow"
 
     # Flat layout: parent only (1 level up).
     _acq_dir_restore_levels_up = 1
@@ -7087,6 +7146,7 @@ class MultiViewStitchingDialog(StitchingDialog):
     # (A past crash came from shadowing this name with a QWidget; the widget
     # container is ``self._config_container``, kept separate.)
     _settings_group = _MULTIVIEW_SETTINGS_GROUP
+    _run_label = "Multi-View"
 
     # The one tab whose configuration is NOT portable: _build_config forces
     # multiview_fusion on and adds the rotation sign/centre, which describe a
