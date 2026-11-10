@@ -80,6 +80,7 @@ def write_ome_zarr_sharded(
     channel_names: Optional[list] = None,
     use_tensorstore: bool = False,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    channel_wavelengths_nm: Optional[list] = None,
 ) -> Path:
     """Write a volume to OME-Zarr v0.5 with sharding and multi-resolution pyramid.
 
@@ -96,6 +97,8 @@ def write_ome_zarr_sharded(
         channel_names: Optional channel name list for metadata.
         use_tensorstore: Use TensorStore writing backend for better performance.
         progress_callback: Optional (percentage, message) callback.
+        channel_wavelengths_nm: Excitation wavelength per channel (None where
+            unknown), for the display color and label in ``omero``.
 
     Returns:
         Path to the written .ome.zarr directory.
@@ -120,13 +123,14 @@ def write_ome_zarr_sharded(
             channel_names=channel_names,
             use_tensorstore=use_tensorstore,
             progress_callback=progress_callback,
+            channel_wavelengths_nm=channel_wavelengths_nm,
         )
     except ImportError:
         logger.info("ngff-zarr not available, falling back to direct zarr writer")
 
     # Fallback: write with zarr-python directly (sharding, no pyramid)
     try:
-        return _write_via_zarr_direct(
+        _write_via_zarr_direct(
             data=data,
             output_path=output_path,
             voxel_size_um=voxel_size_um,
@@ -136,6 +140,8 @@ def write_ome_zarr_sharded(
             compression_level=compression_level,
             progress_callback=progress_callback,
         )
+        _write_omero(output_path, channel_names, channel_wavelengths_nm, version="0.5")
+        return output_path
     except ImportError:
         raise ImportError(
             "Either ngff-zarr or zarr >= 3.1.4 is required for OME-Zarr output. "
@@ -156,6 +162,7 @@ def _write_via_ngff_zarr(
     channel_names,
     use_tensorstore,
     progress_callback,
+    channel_wavelengths_nm=None,
 ) -> Path:
     """Write using ngff-zarr for full multi-resolution pyramid support."""
     from ngff_zarr import Methods, to_multiscales, to_ngff_image, to_ngff_zarr
@@ -235,7 +242,7 @@ def _write_via_ngff_zarr(
         image,
         scale_factors=scale_factors,
         method=method,
-        chunks=chunks[0],  # ngff-zarr takes a single int or per-dim
+        chunks=_chunks_by_dim(dims, chunks),
         cache=False,  # Data already in memory; avoids memory_usage() ndim bug
     )
 
@@ -262,6 +269,7 @@ def _write_via_ngff_zarr(
         use_tensorstore=use_tensorstore,
         overwrite=True,
     )
+    _write_omero(output_path, channel_names, channel_wavelengths_nm, version="0.5")
 
     if progress_callback:
         progress_callback(100, "OME-Zarr write complete")
@@ -428,6 +436,108 @@ def _write_ome_zarr_metadata(
     (output_path / "zarr.json").write_text(json.dumps(metadata, indent=2))
 
 
+def _chunks_by_dim(dims, chunks) -> Dict[str, int]:
+    """Configured (z, y, x) chunks as ngff-zarr's per-dimension mapping.
+
+    Passing ``chunks[0]`` (one int) made every axis that size: the
+    configured 32 x 256 x 256 became 32 x 32 x 32, and the channel axis got
+    min(32, C), so every chunk held all channels and a viewer showing one
+    channel read all of them. One channel per chunk, always."""
+    zyx = tuple(int(c) for c in chunks)[-3:]
+    if len(zyx) < 3:
+        zyx = (zyx[0],) * 3
+    out = dict(zip(("z", "y", "x"), zyx))
+    if "c" in dims:
+        out["c"] = 1
+    return out
+
+
+# The Flamingo app's own channel colors (visualization_3d_config.yaml), so a
+# stitched store opens looking like the live 3-D view. Nearest line wins.
+_LINE_COLORS = ((405.0, "0000FF"), (488.0, "00FF00"), (561.0, "FF0000"), (640.0, "FF00FF"))
+
+
+def wavelength_color_hex(nm: Optional[float]) -> str:
+    """Display color for an excitation line, as six hex digits.
+
+    The app's colors by nearest laser line (405 blue, 488 green, 561 red,
+    640 magenta); unknown or LED, white. Only a starting color for viewers;
+    the data is unchanged."""
+    if nm is None:
+        return "FFFFFF"
+    w = float(nm)
+    line, color = min(_LINE_COLORS, key=lambda lc: abs(lc[0] - w))
+    return color if abs(line - w) <= 40 else "FFFFFF"
+
+
+def _write_omero(output_path, channel_names, wavelengths_nm, version: str) -> None:
+    """Add the ``omero`` channel block (name, color, display window).
+
+    Without it viewers show unnamed gray channels with a guessed contrast.
+    The window comes from the smallest pyramid level (0.1 / 99.9 percentiles
+    per channel), so it reads almost nothing. v0.5 keeps it inside
+    ``attributes.ome``; v0.4 at the root of ``.zattrs``. Never fails a
+    write: the pixels are already on disk."""
+    try:
+        import zarr
+
+        root = zarr.open_group(str(output_path), mode="r+")
+        attrs = dict(root.attrs)
+        ome = dict(attrs.get("ome", {})) if version == "0.5" else attrs
+        multiscales = ome.get("multiscales") or []
+        if not multiscales:
+            return
+        axes = [a.get("name") for a in multiscales[0].get("axes", [])]
+        smallest = root[multiscales[0]["datasets"][-1]["path"]]
+        data = np.asarray(smallest[...])
+        if "c" in axes:
+            data = np.moveaxis(data, axes.index("c"), 0)
+        else:
+            data = data[np.newaxis]
+        info = np.iinfo(data.dtype) if np.issubdtype(data.dtype, np.integer) else None
+        channels = []
+        for i in range(data.shape[0]):
+            values = data[i][data[i] > 0]
+            lo, hi = (
+                (float(np.percentile(values, 0.1)), float(np.percentile(values, 99.9)))
+                if values.size
+                else (0.0, float(info.max) if info else 1.0)
+            )
+            if hi <= lo:
+                hi = lo + 1.0
+            name = (
+                channel_names[i]
+                if channel_names and i < len(channel_names)
+                else f"Channel_{i}"
+            )
+            nm = wavelengths_nm[i] if wavelengths_nm and i < len(wavelengths_nm) else None
+            channels.append(
+                {
+                    "label": f"{name} ({nm:g} nm)" if nm else str(name),
+                    "color": wavelength_color_hex(nm),
+                    "active": True,
+                    "window": {
+                        "min": float(info.min) if info else lo,
+                        "max": float(info.max) if info else hi,
+                        "start": lo,
+                        "end": hi,
+                    },
+                }
+            )
+        omero = {"channels": channels, "rdefs": {"model": "color"}}
+        if version == "0.5":
+            ome["omero"] = omero
+            root.attrs["ome"] = ome
+        else:
+            root.attrs["omero"] = omero
+        logger.info(
+            "  Channel metadata (omero): "
+            + ", ".join(f"{c['label']} #{c['color']}" for c in channels)
+        )
+    except Exception as exc:  # noqa: BLE001 - metadata must not fail a written store
+        logger.warning(f"  Could not write channel names/colors (omero): {exc}")
+
+
 def _to_numpy(data) -> np.ndarray:
     """Convert various data types to a 3D (Z,Y,X) or 4D (C,Z,Y,X) numpy array.
 
@@ -496,6 +606,8 @@ def write_ome_zarr_v2(
     compression_level: int = DEFAULT_COMPRESSION_LEVEL,
     pyramid_levels: Optional[int] = None,
     progress_callback: Optional[Callable[[int, str], None]] = None,
+    channel_names: Optional[list] = None,
+    channel_wavelengths_nm: Optional[list] = None,
 ) -> Path:
     """Write OME-Zarr v0.4 (Zarr v2) with multi-resolution pyramid.
 
@@ -686,6 +798,7 @@ def write_ome_zarr_v2(
             "type": "mean",
         }
     ]
+    _write_omero(output_path, channel_names, channel_wavelengths_nm, version="0.4")
 
     if progress_callback:
         progress_callback(100, "OME-Zarr v2 write complete")

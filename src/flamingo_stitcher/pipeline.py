@@ -4623,6 +4623,19 @@ def channel_wavelength_nm(ch_id: int) -> Optional[float]:
         return None
 
 
+def _wavelengths_for_channel_names(channel_names) -> List[Optional[float]]:
+    """Excitation wavelength for each ``Channel_3`` / ``Channel_3_I0`` name,
+    None where the name or the channel is not known."""
+    out: List[Optional[float]] = []
+    for name in channel_names or []:
+        base = str(name).removeprefix("Channel_").split("_I")[0]
+        try:
+            out.append(channel_wavelength_nm(int(base)))
+        except (TypeError, ValueError):
+            out.append(None)
+    return out
+
+
 def describe_channel(ch_id) -> str:
     """A channel rendered so it cannot be misread as a count.
 
@@ -12012,6 +12025,7 @@ class StitchingPipeline:
         instead of per-channel files.
         """
         fmt = self.config.output_format
+        wavelengths = _wavelengths_for_channel_names(channel_names)
 
         if fmt == "ome-zarr-sharded" or fmt == "both":
             out_path = output_dir / f"{basename}.ome.zarr"
@@ -12034,6 +12048,7 @@ class StitchingPipeline:
                     pyramid_method=self.config.pyramid_method,
                     channel_names=channel_names,
                     use_tensorstore=self.config.zarr_use_tensorstore,
+                    channel_wavelengths_nm=wavelengths,
                 )
 
                 if self.config.package_ozx:
@@ -12062,6 +12077,8 @@ class StitchingPipeline:
                     compression=self.config.zarr_compression,
                     compression_level=self.config.zarr_compression_level,
                     pyramid_levels=self.config.pyramid_levels,
+                    channel_names=channel_names,
+                    channel_wavelengths_nm=wavelengths,
                 )
             except Exception as e:
                 self.logger.error(f"  OME-Zarr v2 write failed: {e}")
