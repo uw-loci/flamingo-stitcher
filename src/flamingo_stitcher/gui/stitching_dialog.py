@@ -1220,7 +1220,9 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
         for label, value in (
             ("Off", "off"),
             ("Measure only", "measure"),
-            ("Apply", "apply"),
+            # Shown as 'Active', not 'Apply': choosing it changes nothing
+            # until the run. The stored value stays "apply" (saved settings).
+            ("Active", "apply"),
         ):
             self._intensity_adjust_combo.addItem(label, value)
         self._intensity_adjust_combo.setToolTip(
@@ -1229,12 +1231,12 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             "step.\n"
             "'Measure only': logs each tile's correction and fuses unchanged;\n"
             "use it to see whether correction is needed.\n"
-            "'Apply': fuses the corrected tiles.\n"
+            "'Active': the run corrects each tile's brightness before fusing.\n"
             "Fine-tune it per microscope on the 'Options' tab."
         )
         _ia_box = QHBoxLayout()
         _ia_box.setContentsMargins(0, 0, 0, 0)
-        _ia_box.addWidget(QLabel("Intensity adjustment:"))
+        _ia_box.addWidget(QLabel("Tile brightness matching:"))
         _ia_box.addWidget(self._intensity_adjust_combo)
         _ia_box.addStretch()
         proc_layout.addLayout(_ia_box, 7, 0, 1, 4)
@@ -2424,6 +2426,10 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
         self._update_queue_table()
         total = sum(len(it["tiles"]) for it in self._queue if it["tiles"])
         ok = sum(1 for it in pending if it["tiles"])
+        # Something was found, so the settings tabs now matter: each glows
+        # until the user opens it.
+        if ok and getattr(self, "_tab_glow", None) is not None:
+            self._tab_glow.arm()
         self._log(f"\nDiscovered {total} tiles across {ok}/{len(pending)} directories")
 
         # A visible, can't-miss warning if any tile had corrupt/degraded data —
@@ -4592,6 +4598,8 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             return
 
         # This run is definitely starting.
+        if getattr(self, "_tab_glow", None) is not None:
+            self._tab_glow.clear()
         self._focus_log_for_run()
 
         self._log_text.clear()

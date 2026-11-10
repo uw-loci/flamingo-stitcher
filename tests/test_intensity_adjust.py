@@ -297,7 +297,7 @@ def test_the_pipeline_measures_and_applies(tmp_path, caplog):
 
     with caplog.at_level(logging.INFO):
         measured = inputs("measure")
-    assert any("Intensity adjustment (measure" in r.getMessage() for r in caplog.records)
+    assert any("Tile brightness matching (intensity_adjustment = measure" in r.getMessage() for r in caplog.records)
     assert any("fused UNCHANGED" in r.getMessage() for r in caplog.records)
     applied = inputs("apply")
     m0 = float(np.asarray(measured[0].data).mean())

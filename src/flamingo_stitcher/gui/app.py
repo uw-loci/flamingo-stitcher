@@ -125,65 +125,23 @@ def _install_exception_guard() -> None:
     sys.excepthook = _hook
 
 
-def main() -> int:
-    """Launch the standalone stitching GUI. Returns the Qt exit code."""
-    log_path = _setup_logging()
-    _log = logging.getLogger(__name__)
-    # Log the version + environment on the FIRST line of every run — before any
-    # dialog is built or a stitch starts — so a log is never version-ambiguous,
-    # even if the app crashes at launch or the user never starts a run.
-    try:
-        import platform
+def build_main_window():
+    """Build the main window: the five tabs, wired as at launch.
 
-        from flamingo_stitcher._version import __version__
+    Returns ``(window, tabs, update_panel)``. Nothing here goes online: the
+    launch update check is started by :func:`main`. Also used by
+    ``tools/doc_screenshots.py`` so the README pictures show the real window.
+    """
+    from PyQt5.QtCore import QSettings
+    from PyQt5.QtWidgets import QMainWindow, QTabWidget
 
-        frozen = " (frozen)" if getattr(sys, "frozen", False) else ""
-        _log.info(
-            "Flamingo Stitcher %s%s starting — Python %s on %s",
-            __version__,
-            frozen,
-            platform.python_version(),
-            platform.platform(),
-        )
-    except Exception:
-        pass
-    if log_path:
-        _log.info(f"Log file: {log_path}")
-    _install_exception_guard()
-
-    _splash_text("Loading the stitching engine...")
-
-    from PyQt5.QtCore import QSettings, QTimer
-    from PyQt5.QtWidgets import (
-        QApplication,
-        QMainWindow,
-        QTabWidget,
-    )
-
-    from flamingo_stitcher.gui._compat import (
-        WindowGeometryManager,
-        get_app_icon,
-        set_default_geometry_manager,
-    )
+    from flamingo_stitcher.gui._compat import get_app_icon
     from flamingo_stitcher.gui.stitching_dialog import (
         MultiViewStitchingDialog,
         NativeStitchingDialog,
         StitchingDialog,
     )
     from flamingo_stitcher.gui.updater import UpdatePanel
-
-    # QSettings location (the dialogs persist their own settings via QSettings).
-    QApplication.setOrganizationName("Flamingo")
-    QApplication.setApplicationName("FlamingoStitcher")
-
-    app = QApplication.instance() or QApplication(sys.argv)
-    app.setWindowIcon(get_app_icon())
-
-    # Window-geometry persistence for the embedded PersistentDialogs.
-    cfg_dir = _user_config_dir()
-    set_default_geometry_manager(
-        WindowGeometryManager(str(cfg_dir / "window_geometry.json"))
-    )
 
     from flamingo_stitcher import __version__
 
@@ -259,6 +217,63 @@ def main() -> int:
     window.setCentralWidget(tabs)
 
     window.resize(1100, 800)
+    return window, tabs, update_panel
+
+
+def main() -> int:
+    """Launch the standalone stitching GUI. Returns the Qt exit code."""
+    log_path = _setup_logging()
+    _log = logging.getLogger(__name__)
+    # Log the version + environment on the FIRST line of every run — before any
+    # dialog is built or a stitch starts — so a log is never version-ambiguous,
+    # even if the app crashes at launch or the user never starts a run.
+    try:
+        import platform
+
+        from flamingo_stitcher._version import __version__
+
+        frozen = " (frozen)" if getattr(sys, "frozen", False) else ""
+        _log.info(
+            "Flamingo Stitcher %s%s starting — Python %s on %s",
+            __version__,
+            frozen,
+            platform.python_version(),
+            platform.platform(),
+        )
+    except Exception:
+        pass
+    if log_path:
+        _log.info(f"Log file: {log_path}")
+    _install_exception_guard()
+
+    _splash_text("Loading the stitching engine...")
+
+    from PyQt5.QtCore import QTimer
+    from PyQt5.QtWidgets import QApplication
+
+    # Imported here, while the splash says "Loading the stitching engine...",
+    # because this is the slow import; build_main_window() then finds it loaded.
+    import flamingo_stitcher.gui.stitching_dialog  # noqa: F401
+    from flamingo_stitcher.gui._compat import (
+        WindowGeometryManager,
+        get_app_icon,
+        set_default_geometry_manager,
+    )
+
+    # QSettings location (the dialogs persist their own settings via QSettings).
+    QApplication.setOrganizationName("Flamingo")
+    QApplication.setApplicationName("FlamingoStitcher")
+
+    app = QApplication.instance() or QApplication(sys.argv)
+    app.setWindowIcon(get_app_icon())
+
+    # Window-geometry persistence for the embedded PersistentDialogs.
+    cfg_dir = _user_config_dir()
+    set_default_geometry_manager(
+        WindowGeometryManager(str(cfg_dir / "window_geometry.json"))
+    )
+
+    window, tabs, update_panel = build_main_window()
     window.show()
 
     # Window is up — tear down the bootloader splash.

@@ -629,7 +629,7 @@ Interpretation:
 So a typical mixed report reads as: the **big-step, `ds`-railed** seams are a
 **placement** problem (fix with registration / stage-pitch / camera-angle), while
 the **small-step, aligned** seams are the **per-tile intensity offset** (fix with
-flat-field / intensity equalization).
+flat-field / 'Tile brightness matching').
 
 ## 8b. Reading the registration report
 
@@ -721,7 +721,7 @@ The log rarely contains these; ask before committing to a diagnosis:
 | Many tiles `clamped_z`/`clamped_x` in `registration_report.csv` | Corrections exceeded the plausible bound and were reverted to the mosaic's consensus placement — those tiles are **NOT measured** (they are not at their stage position either; a clamped tile keeps the shift the whole mosaic agreed on, which opens no seam) | Read `*_before_clamp`: shifts scaling with distance ⇒ pixel-size error; constant ⇒ overlap error; alternating by row ⇒ tile ordering. None of those are fixed by registration. |
 | Z disagreement in `registration_seams.csv` while X/Y is clean | The main pass compares planes at the Z spacing (default 20 µm) and multiview-stitcher upsamples 3-D by only 2 | Lower the Z spacing (`--reg-z-spacing-um`, down to 0 = every plane; time and RAM scale with the planes compared, shown before Start), or turn on `registration_z_refine` (every plane, XY binned 4x, Z only). |
 | `Z refinement: N corrections came back at the ±… µm search limit` | Those are floors, not measurements; they were rejected | Widen `--z-refine-range-um`, or check tile order — a large fraction usually means a placement error, not a Z error. |
-| Border QC: small `median step` on aligned seams | Per-tile intensity offset | Flat-field (with darkfield); consider intensity equalization (not built in). |
+| Border QC: small `median step` on aligned seams | Per-tile intensity offset | Flat-field (with darkfield); then 'Tile brightness matching' set to 'Active' (`intensity_adjustment = apply`; the log line starts `Tile brightness matching (`). Older logs call it `Intensity adjustment (`. |
 | **Hard seams in signal-free background**, same at any overlap %, `blend`=dim / `max`=bright | Per-tile intensity offset (§7) | Flat-field first; no overlap mode fixes it. |
 | Blend gives a **dark dip** at seams on a **sparse** sample | Averaging signal against a neighbour's background | Use `max` (default) for sparse / sub-FOV samples. |
 

@@ -269,10 +269,10 @@ TUNABLES: Tuple[Tunable, ...] = (
         ),
     ),
     # Intensity adjustment (BigStitcher's parameters and defaults). Used only
-    # when the main dialog's "Intensity adjustment" is Measure or Apply.
+    # when the main dialog's "Tile brightness matching" is Measure only or Active.
     Tunable(
         field="intensity_adjust_downsampling",
-        label="Intensity adjustment: sample spacing",
+        label="Tile brightness matching: sample spacing",
         kind="float",
         minimum=1.0,
         maximum=64.0,
@@ -280,7 +280,7 @@ TUNABLES: Tuple[Tunable, ...] = (
         decimals=1,
         suffix=" native px",
         help=(
-            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. "
+            "Used only when 'Tile brightness matching' is 'Measure only' or 'Active'. "
             "Overlapping tiles are compared at points spaced this many native XY "
             "pixels apart, in every direction. Default 10. Larger is faster but uses "
             "fewer points. Raise it if the fit takes too long (the run log gives its "
@@ -289,13 +289,13 @@ TUNABLES: Tuple[Tunable, ...] = (
     ),
     Tunable(
         field="intensity_adjust_max_matches",
-        label="Intensity adjustment: samples kept per tile pair",
+        label="Tile brightness matching: samples kept per tile pair",
         kind="int",
         minimum=10,
         maximum=1000000,
         step=1000,
         help=(
-            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. The "
+            "Used only when 'Tile brightness matching' is 'Measure only' or 'Active'. The "
             "most comparison points kept for each pair of overlapping tiles. Extra "
             "points are dropped at random, the same way on every run, so results "
             "repeat. Default 10000. Lower it to make the fit faster."
@@ -303,13 +303,13 @@ TUNABLES: Tuple[Tunable, ...] = (
     ),
     Tunable(
         field="intensity_adjust_affine",
-        label="Intensity adjustment: fit scale as well as offset",
+        label="Tile brightness matching: fit scale as well as offset",
         kind="bool",
         minimum=0.0,
         maximum=1.0,
         step=1.0,
         help=(
-            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. On "
+            "Used only when 'Tile brightness matching' is 'Measure only' or 'Active'. On "
             "(default): each tile's brightness is both scaled and shifted to match its "
             "neighbors. Off: only shifted up or down, so each tile keeps its contrast. "
             "Turn it off if you want to remove brightness offsets between tiles "
@@ -318,7 +318,7 @@ TUNABLES: Tuple[Tunable, ...] = (
     ),
     Tunable(
         field="intensity_adjust_offset_regularization",
-        label="Intensity adjustment: pull toward offset-only",
+        label="Tile brightness matching: pull toward offset-only",
         enabled_when=("intensity_adjust_affine", True),
         kind="fraction",
         minimum=0.0,
@@ -326,7 +326,7 @@ TUNABLES: Tuple[Tunable, ...] = (
         step=0.05,
         decimals=2,
         help=(
-            "Used only when 'Intensity adjustment: fit scale as well as offset' is on. "
+            "Used only when 'Tile brightness matching: fit scale as well as offset' is on. "
             "Moves the fit between scale + offset (0) and offset only (1). Default "
             "0.1. Raise it if tiles come out with visibly different contrast after "
             "adjustment."
@@ -334,14 +334,14 @@ TUNABLES: Tuple[Tunable, ...] = (
     ),
     Tunable(
         field="intensity_adjust_identity_regularization",
-        label="Intensity adjustment: pull toward unchanged",
+        label="Tile brightness matching: pull toward unchanged",
         kind="fraction",
         minimum=0.0,
         maximum=1.0,
         step=0.05,
         decimals=2,
         help=(
-            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply'. How "
+            "Used only when 'Tile brightness matching' is 'Measure only' or 'Active'. How "
             "strongly every tile is pulled toward no change (0 = no pull, 1 = tiles "
             "left as acquired). Default 0.1. Raise it if tiles are changed more than "
             "the seams need; lower it if brightness steps remain at the seams."
@@ -349,13 +349,13 @@ TUNABLES: Tuple[Tunable, ...] = (
     ),
     Tunable(
         field="intensity_adjust_keep_range",
-        label="Intensity adjustment: keep the input brightness range",
+        label="Tile brightness matching: keep the input brightness range",
         kind="bool",
         minimum=0.0,
         maximum=1.0,
         step=1.0,
         help=(
-            "Used only when 'Intensity adjustment' is 'Measure only' or 'Apply' "
+            "Used only when 'Tile brightness matching' is 'Measure only' or 'Active' "
             "('Measure only' logs the values it would apply). On (default): only the "
             "brightness differences between tiles are corrected, and the typical tile "
             "keeps its acquired brightness. Off: the raw fit is applied unchanged, "

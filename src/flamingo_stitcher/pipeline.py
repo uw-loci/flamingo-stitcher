@@ -11833,7 +11833,7 @@ class StitchingPipeline:
                 result = ia.compute(views, params)
             except Exception as e:  # never fail a stitch over this
                 self.logger.warning(
-                    f"  Intensity adjustment skipped: {e}. Tiles fused unchanged."
+                    f"  Tile brightness matching skipped: {e}. Tiles fused unchanged."
                 )
                 cache[key] = False
                 return sims
@@ -11865,8 +11865,12 @@ class StitchingPipeline:
         n_before = sum(b for b, _ in result.pair_counts.values())
         n_after = sum(a for _, a in result.pair_counts.values())
         mode = self.config.intensity_adjustment
+        # The window's names ('Tile brightness matching', 'Active') with the
+        # stored key and value, so a log can be matched to either.
+        shown = {"measure": "Measure only", "apply": "Active"}.get(mode, mode)
         self.logger.info(
-            f"  Intensity adjustment ({mode}; BigStitcher method): "
+            f"  Tile brightness matching (intensity_adjustment = {mode}, '{shown}'; "
+            f"BigStitcher's Intensity Adjustment): "
             f"{n_pairs} overlapping tile pairs, {n_before:,} shared samples on a "
             f"{params.downsampling:g}-native-px grid "
             f"({params.downsampling * native_px:.1f} um), thinned to {n_after:,} "
@@ -11899,8 +11903,8 @@ class StitchingPipeline:
             )
         if mode == "measure":
             self.logger.info(
-                "    Measure only: tiles are fused UNCHANGED. Set Intensity "
-                "adjustment to Apply to use these."
+                "    Measure only: tiles are fused UNCHANGED. Set 'Tile brightness "
+                "matching' to 'Active' to use these."
             )
 
     def _fuse_channel(

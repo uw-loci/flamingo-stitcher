@@ -210,8 +210,10 @@ def chips_from_dialog(d) -> Tuple[str, List[Tuple[str, List[Chip]]], str]:
     else:
         iq.append(("Destripe off", "off"))
     ia = d._intensity_adjust_combo.currentData()
-    iq.append({"off": ("Intensity off", "off"), "measure": ("Intensity: measure", "on"),
-               "apply": ("Intensity: Apply", "on")}.get(ia, (f"Intensity: {ia}", "on")))
+    iq.append({"off": ("Brightness matching off", "off"),
+               "measure": ("Brightness matching: measure only", "on"),
+               "apply": ("Brightness matching: Active", "on")}.get(
+        ia, (f"Brightness matching: {ia}", "on")))
     if d._deconv_cb.isChecked() and d._deconv_cb.isEnabled():
         iq.append(("Deconvolution" + STAR, "slow"))
     bg = d._bg_zero_panel

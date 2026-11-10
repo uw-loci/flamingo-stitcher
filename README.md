@@ -32,12 +32,7 @@ You'll see five tabs: **Single Workflow**, **Multi-Acquisition**, **Multi-View**
 the tab you last used after that. For a first run you want one of the first two —
 [Which tab?](#which-tab-do-i-use) tells you which, by looking at your folder. Then:
 
-<!-- SCREENSHOT NEEDED -> docs/images/tabs.png
-     Capture: the app window, the five tabs along the top clearly readable.
-     Why: readers need to recognize the tab strip before they can choose.
-     To publish it, drop the file in and uncomment the line below.
-![The five tabs across the top of Flamingo Stitcher: Single Workflow, Multi-Acquisition, Multi-View, Options, Updates](docs/images/tabs.png)
--->
+<img src="docs/images/tabs.png" width="550" alt="The five tabs across the top of Flamingo Stitcher: Single Workflow, Multi-Acquisition, Multi-View, Options, Updates">
 
 1. **Add your data.** Click **Add…** and select your acquisition folder. (You can add
    several and stitch them back-to-back.)
@@ -96,11 +91,7 @@ value you tune once is reused by every future run from that instrument. You don'
 it for a first run. Go there when the registration report says seams were rejected, or
 when you want to set which illumination side lights the left of the frame.
 
-<!-- SCREENSHOT NEEDED -> docs/images/options-tab.png
-     Capture: the Options tab with a microscope selected, controls visible.
-     Why: nothing user-facing has ever documented this tab; people do not know it exists.
-![The Options tab, showing per-microscope registration settings](docs/images/options-tab.png)
--->
+<img src="docs/images/options-tab.png" width="700" alt="The Options tab with microscope n7 selected: registration settings saved per microscope and objective">
 
 **Updates** checks for a newer version on launch and installs it in one click.
 
@@ -118,15 +109,20 @@ alone.**
   **Saving**, and **Memory management** (memory mode, fusion chunk and region
   size, and the scratch folder for temporary files).
 - **Image quality** tab: how the two light sheets are combined (and aligned),
-  brightness (flat-field correction, intensity adjustment), stripes (destripe),
+  brightness (flat-field correction, tile brightness matching), stripes (destripe),
   sharpness (deconvolution) and background zeroing.
 - **Registration and overlap** tab: where each tile goes (registration), how
   neighboring tiles are joined (tile overlap, content-based blending), and the
   checks and reports. **Hide settings** folds both tabs to give the log room; a run
   does this for the running acquisition.
 
+After **Discover Tiles**, a tab you have not opened yet glows light blue until you
+click it: a reminder that there are settings there worth a look before **Run All**.
+
 <details>
 <summary>The queue: settings per acquisition, the Settings letters, Run Selected, Cancel and the time left</summary>
+
+<img src="docs/images/acquisitions.png" width="700" alt="The Acquisitions queue after Discover Tiles: two acquisitions from n7 share Settings set A, one from liara has set B">
 
 Select a row, or several from one microscope and objective, to see and change
 their settings. The **Microscope** column shows the microscope and objective each
@@ -147,7 +143,9 @@ running acquisition within a few seconds and cancels the rest of that run.
 </details>
 
 <details>
-<summary>About the image: pixel size, Z step, frame and channels, and where the pixel size comes from</summary>
+<summary>Basics, and About the image: pixel size, Z step, frame and channels, and where the pixel size comes from</summary>
+
+<img src="docs/images/basics.png" width="700" alt="Basics: Downsample with its impact line, About the image, Saving and Memory management">
 
 Pixel size, Z step, frame (camera ROI) and channels are filled in by *Discover
 Tiles*; change one only if you know a detected value is wrong. Unless you set the
@@ -195,12 +193,25 @@ acquisitions.
 
 </details>
 
+<details>
+<summary>What the 'Image quality' and 'Registration and overlap' tabs look like</summary>
+
+<img src="docs/images/image-quality-tab.png" width="700" alt="The Image quality tab; the Registration and overlap tab glows light blue because it has not been opened since Discover Tiles">
+
+<img src="docs/images/registration-tab.png" width="700" alt="The Registration and overlap tab">
+
+</details>
+
 Under the tabs, **This run** lists what the selected acquisition's run will do, as
 tags: orange for slow options, red for lossy ones, yellow for skipped or unused.
+
+<img src="docs/images/this-run.png" width="700" alt="This run: the selected acquisition's settings as tags, grouped as Basics, Image quality, and Registration and overlap">
 
 Parts installed once per computer (flat-field correction, deconvolution, and the
 live background-zeroing preview) are on the **Options** tab under **Optional
 components**. A control that waits on one of them says so and links there.
+
+<img src="docs/images/optional-components.png" width="700" alt="Optional components on the Options tab: flat-field correction, deconvolution and the background-zeroing preview, each with its status">
 
 > Tip: hover over any control to get a tooltip explaining it. Open the **Log** panel
 > (collapsed at the bottom) to see full detail of what was detected and done.
@@ -357,8 +368,8 @@ Two further limits:
 - **Multi-view rotation is not instrument-validated.** The rotation sign and
   center conventions are checked on synthetic data only. Verify with a two-angle
   test acquisition, and flip the sign if the views come out mirrored.
-- **Tile-to-tile brightness is evened out only when 'Intensity adjustment' is
-  set to 'Apply'** (Image quality tab). It fits a gain and offset per tile from
+- **Tile-to-tile brightness is evened out only when 'Tile brightness matching'
+  is set to 'Active'** (Image quality tab). It fits a gain and offset per tile from
   the overlaps, so a tile that really was brighter is dimmed to match its
   neighbors. Flat-field correction addresses the illumination profile within a
   tile, not tile-to-tile differences.

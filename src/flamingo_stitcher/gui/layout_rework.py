@@ -306,8 +306,12 @@ class ReworkedLayoutMixin:
         self._fusion_region_label = QLabel("Fusion region size:")
         self._fusion_region_label.setToolTip(self._fusion_region_combo.toolTip())
         g.addWidget(heading("Memory management"))
+        # Two rows: on one, these needed ~1125 px at Windows' 9 pt font, wider
+        # than the window's 1100 px default, so Basics scrolled sideways.
         g.addLayout(row(
-            "Memory mode:", take(self._streaming_combo), take(self._memory_indicator), 18,
+            "Memory mode:", take(self._streaming_combo), take(self._memory_indicator),
+        ))
+        g.addLayout(row(
             "Fusion chunk size:", take(self._chunk_size_combo), 18,
             self._fusion_region_label, take(self._fusion_region_combo),
         ))
@@ -366,6 +370,16 @@ class ReworkedLayoutMixin:
         tabs.setCornerWidget(t, Qt.TopRightCorner)
         tabs.tabBarClicked.connect(lambda _i: self._proc_toggle.setChecked(True))
         self._skip_reg_cb.toggled.connect(self._update_reg_tab_title)
+        # After 'Discover Tiles', a tab not yet opened glows light blue until
+        # clicked, so a new user finds the settings behind it. Paused while a
+        # next-step button flashes or a run is going: one hint at a time.
+        from flamingo_stitcher.gui.tab_attention import TabAttentionGlow
+
+        self._tab_glow = TabAttentionGlow(
+            tabs,
+            suppressed=lambda: bool(getattr(self, "_batch_running", False))
+            or getattr(self, "_cta_button", None) is not None,
+        )
         return tabs
 
     def _update_reg_tab_title(self, *_):
@@ -409,7 +423,7 @@ class ReworkedLayoutMixin:
         self._flat_field_install_note.linkActivated.connect(lambda _l: self._open_options_tab())
         bv.addWidget(self._flat_field_install_note)
         fit_to_contents(self._intensity_adjust_combo)
-        bv.addLayout(row("Intensity adjustment:", take(self._intensity_adjust_combo)))
+        bv.addLayout(row("Tile brightness matching:", take(self._intensity_adjust_combo)))
         g.addWidget(br, 0, 1)
 
         sp = QGroupBox("Stripes")

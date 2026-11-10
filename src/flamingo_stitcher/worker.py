@@ -154,7 +154,8 @@ class StitchingWorker(QThread):
                 # Registration and intensity settings were missing, so a log
                 # could not say whether 'Measure only' had been chosen.
                 f"Registration: {self._registration_summary()}\n"
-                f"Intensity adjustment: {getattr(self._config, 'intensity_adjustment', 'off')}\n"
+                f"Tile brightness matching (intensity_adjustment): "
+                f"{getattr(self._config, 'intensity_adjustment', 'off')}\n"
                 f"Output format: {self._config.output_format}"
                 f"{' + .ozx' if self._config.package_ozx else ''}"
             )
