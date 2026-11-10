@@ -5,7 +5,7 @@ Standalone light-sheet tile **stitching** pipeline and GUI for Flamingo T-SPIM d
 It turns a folder of raw microscope tiles into a single stitched 3D volume you can
 open in Fiji, napari, QuPath, or Imaris. You can run it **on any machine** — no
 microscope and no full control software required. The *same code* also powers the
-"Tile Stitching" menu inside [Py2Flamingo](https://github.com/MichaelSNelson/Flamingo_Control),
+"Tile Stitching" menu inside [Py2Flamingo](https://github.com/uw-loci/Flamingo_Control),
 so results match (single source of truth, no drift).
 
 ---
@@ -34,7 +34,7 @@ the tab you last used after that. For a first run you want one of the first two 
 
 <!-- SCREENSHOT NEEDED -> docs/images/tabs.png
      Capture: the app window, the five tabs along the top clearly readable.
-     Why: readers need to recognise the tab strip before they can choose.
+     Why: readers need to recognize the tab strip before they can choose.
      To publish it, drop the file in and uncomment the line below.
 ![The five tabs across the top of Flamingo Stitcher: Single Workflow, Multi-Acquisition, Multi-View, Options, Updates](docs/images/tabs.png)
 -->
@@ -68,7 +68,7 @@ Tile files may be `.raw`, `.tif`, `.tiff` or `.btf` — the extension does not d
 tab; the folder shape does.
 
 The two layouts look more alike than you'd expect: a tile **file** is `X000_Y000`
-(zero-padded counts) and a tile **folder** is `X4.00_Y12.00` (stage millimetres). If in
+(zero-padded counts) and a tile **folder** is `X4.00_Y12.00` (stage millimeters). If in
 doubt, the test that settles it is whether the images are loose in the folder you
 selected, or one level down inside per-tile subfolders.
 
@@ -111,60 +111,12 @@ when you want to set which illumination side lights the left of the frame.
 Each stitching tab has four parts. **For a first run you can leave the settings
 alone.**
 
-- **Acquisitions**: the queue. Each acquisition keeps its own settings: select a
-  row, or several from one microscope and objective, to see and change them. The
-  **Microscope** column shows the microscope and objective each was taken with. The
-  **Settings** column gives each group of acquisitions that share settings a letter:
-  the first ones queued are Set A, an acquisition from another microscope or
-  objective starts Set B, and changing only some rows of a set moves them to a new
-  letter. Rows from different microscopes or objectives cannot be changed together.
-  During a run the queue stays open: add acquisitions, or change a pending one's
-  settings; only the running acquisition's settings are locked. Only one stitch runs
-  at a time across the tabs. **Run All** stitches every Pending acquisition; **Run
-  Selected** only the selected ones. During a run the progress line gives the
-  running acquisition's time left, then the queue's (every acquisition still
-  waiting in this run, each priced with its own settings). **Cancel** stops the
-  running acquisition within a few seconds and cancels the rest of that run.
-- **Basics**: what every run needs.
-  - **Downsample**, with the output voxel size, memory, size and time it implies
-    shown right under it.
-  - **About the image**: pixel size, Z step, frame (camera ROI) and channels. These
-    are filled in by *Discover Tiles*; change one only if you know a detected value
-    is wrong. Unless you set the XY pixel size by hand, **each queued acquisition
-    uses the pixel size implied by its own objective** (from its
-    `ScopeSettings.txt`), so a queue mixing objectives stitches every item at the
-    right scale. A typed value applies to the selected acquisitions.
-    - **The pixel size is always shown in the log.** Discovery prints
-      `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
-      tiles come out **spaced apart like dice**, this value is almost always wrong —
-      check that line first.
-    - **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
-      you select a parent folder whose acquisitions live in a dated subfolder, the
-      app now searches down into it — but if it still can't find the objective it
-      logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
-    - **Per-microscope fallback.** For systems that don't record the objective in
-      `ScopeSettings.txt`, a per-microscope `objective_magnification` in
-      `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
-      (25.48×, measured on a calibration standard) → ~0.255 µm/px.
-  - **Saving**: output format, compression, **TIFF pyramids** and **Package as
-    .ozx**. **OME-Zarr (Fiji compatible)** is a safe default.
-    - **Formats.** OME-Zarr (Fiji compatible) is Zarr v2 + OME-NGFF v0.4; OME-Zarr
-      Sharded is Zarr v3 + OME-NGFF v0.5, which only napari and zarr-python 3.x read.
-      OME-TIFF writes all channels into one `<name>.ome.tif`. Imaris (.ims) uses
-      PyImarisWriter (Apache 2.0; `pip install "flamingo-stitcher[imaris]"`, Windows
-      only), writes block by block so it scales to TB-sized output, and builds its own
-      pyramids. It exists because ImarisFileConverter misreads OME-TIFF pyramid
-      SubIFDs as extra Z planes and collapses the data into Z = 0; to use the
-      converter anyway, write OME-TIFF with **TIFF pyramids** unchecked. Fiji and
-      Imaris do not need TIFF pyramids; napari and QuPath zoom faster with them.
-    - **Compression.** None skips encoding and decoding, so it is fastest from a fast
-      local SSD, at the cost of much larger files. Over network shares, USB or
-      spinning disks, compressed files often load faster than uncompressed ones
-      because the disk, not decoding, is the bottleneck. zstd and lz4 decode
-      quickly; zlib and lzw are the TIFF codecs older software reads. zstd for TIFF
-      is only offered when the `imagecodecs` package is installed.
-  - **Memory management**: memory mode, fusion chunk and region size, and the
-    scratch folder for temporary files. Every run uses these.
+- **Acquisitions**: the queue. Each acquisition keeps its own settings; **Run All**
+  stitches every Pending acquisition, **Run Selected** only the selected ones.
+- **Basics**: what every run needs: **Downsample** (with the output voxel size,
+  memory, size and time it implies shown right under it), **About the image**,
+  **Saving**, and **Memory management** (memory mode, fusion chunk and region
+  size, and the scratch folder for temporary files).
 - **Image quality** tab: how the two light sheets are combined (and aligned),
   brightness (flat-field correction, intensity adjustment), stripes (destripe),
   sharpness (deconvolution) and background zeroing.
@@ -172,6 +124,76 @@ alone.**
   neighboring tiles are joined (tile overlap, content-based blending), and the
   checks and reports. **Hide settings** folds both tabs to give the log room; a run
   does this for the running acquisition.
+
+<details>
+<summary>The queue: settings per acquisition, the Settings letters, Run Selected, Cancel and the time left</summary>
+
+Select a row, or several from one microscope and objective, to see and change
+their settings. The **Microscope** column shows the microscope and objective each
+acquisition was taken with. The **Settings** column gives each group of
+acquisitions that share settings a letter: the first ones queued are Set A, an
+acquisition from another microscope or objective starts Set B, and changing only
+some rows of a set moves them to a new letter. Rows from different microscopes or
+objectives cannot be changed together.
+
+During a run the queue stays open: add acquisitions, or change a pending one's
+settings; only the running acquisition's settings are locked. Only one stitch runs
+at a time across the tabs. **Run All** stitches every Pending acquisition; **Run
+Selected** only the selected ones. During a run the progress line gives the
+running acquisition's time left, then the queue's (every acquisition still
+waiting in this run, each priced with its own settings). **Cancel** stops the
+running acquisition within a few seconds and cancels the rest of that run.
+
+</details>
+
+<details>
+<summary>About the image: pixel size, Z step, frame and channels, and where the pixel size comes from</summary>
+
+Pixel size, Z step, frame (camera ROI) and channels are filled in by *Discover
+Tiles*; change one only if you know a detected value is wrong. Unless you set the
+XY pixel size by hand, **each queued acquisition uses the pixel size implied by its
+own objective** (from its `ScopeSettings.txt`), so a queue mixing objectives
+stitches every item at the right scale. A typed value applies to the selected
+acquisitions.
+
+- **The pixel size is always shown in the log.** Discovery prints
+  `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
+  tiles come out **spaced apart like dice**, this value is almost always wrong —
+  check that line first.
+- **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
+  you select a parent folder whose acquisitions live in a dated subfolder, the
+  app now searches down into it — but if it still can't find the objective it
+  logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
+- **Per-microscope fallback.** For systems that don't record the objective in
+  `ScopeSettings.txt`, a per-microscope `objective_magnification` in
+  `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
+  (25.48×, measured on a calibration standard) → ~0.255 µm/px.
+
+</details>
+
+<details>
+<summary>Saving: output formats, compression, TIFF pyramids</summary>
+
+**Saving** holds the output format, compression, **TIFF pyramids** and **Package as
+.ozx**. **OME-Zarr (Fiji compatible)** is a safe default.
+
+- **Formats.** OME-Zarr (Fiji compatible) is Zarr v2 + OME-NGFF v0.4; OME-Zarr
+  Sharded is Zarr v3 + OME-NGFF v0.5, which only napari and zarr-python 3.x read.
+  OME-TIFF writes all channels into one `<name>.ome.tif`. Imaris (.ims) uses
+  PyImarisWriter (Apache 2.0; `pip install "flamingo-stitcher[imaris]"`, Windows
+  only), writes block by block so it scales to TB-sized output, and builds its own
+  pyramids. It exists because ImarisFileConverter misreads OME-TIFF pyramid
+  SubIFDs as extra Z planes and collapses the data into Z = 0; to use the
+  converter anyway, write OME-TIFF with **TIFF pyramids** unchecked. Fiji and
+  Imaris do not need TIFF pyramids; napari and QuPath zoom faster with them.
+- **Compression.** None skips encoding and decoding, so it is fastest from a fast
+  local SSD, at the cost of much larger files. Over network shares, USB or
+  spinning disks, compressed files often load faster than uncompressed ones
+  because the disk, not decoding, is the bottleneck. zstd and lz4 decode
+  quickly; zlib and lzw are the TIFF codecs older software reads. zstd for TIFF
+  is only offered when the `imagecodecs` package is installed.
+
+</details>
 
 Under the tabs, **This run** lists what the selected acquisition's run will do, as
 tags: orange for slow options, red for lossy ones, yellow for skipped or unused.
@@ -200,6 +222,9 @@ dataset has no image data to preview from (no per-tile MIPs and no readable raw
 stacks), the app tells you it can't determine the orientation and that you need a
 dataset that includes MIPs for that microscope.
 
+<details>
+<summary>How to pick the orientation in 'Orientation Preview…'</summary>
+
 To pick it — fix it visually, no config editing:
 
 1. Add your acquisition and click **Discover Tiles**.
@@ -222,6 +247,11 @@ correctly (a choice made for one scope never touches another). The effective
 orientation is printed in the log at the start of every run. Command line:
 `--tile-orientation NAME [--reverse-x-tiles] [--reverse-y-tiles]`.
 
+</details>
+
+<details>
+<summary>Orientation names for the command line and config files</summary>
+
 `NAME` is the stored value (also used in config files); the preview panels show the label:
 
 | `NAME` | Panel label |
@@ -234,6 +264,8 @@ orientation is printed in the log at the start of every run. Command line:
 | `flip_v` | Mirror top–bottom |
 | `transpose` | Swap X and Y (mirror across the main diagonal) |
 | `anti_transpose` | Mirror across the other diagonal |
+
+</details>
 
 ## Re-running to the same folder
 
@@ -263,7 +295,10 @@ Each acquisition gets its own `..._stitched` folder containing:
 | `stitch_metadata.json` | the record worth keeping. Software version and git hash, voxel size, channels, tile count, every per-tile position, the world frame, and every processing setting the run used |
 | `registration_report.txt` | the human summary — read this first |
 | `registration_report.csv` | one row per tile: the correction applied, in µm |
-| `registration_seams.csv` | one row per expected neighbour pair, and what became of it |
+| `registration_seams.csv` | one row per expected neighbor pair, and what became of it |
+
+<details>
+<summary>Reports from earlier runs, and the world frame in stitch_metadata.json</summary>
 
 Stitching the same acquisition twice with different settings also writes a
 second copy of each report under a name carrying those settings
@@ -275,6 +310,8 @@ stitched coordinates back to stage coordinates — some acquisitions negate worl
 X, so an origin can legitimately be a large negative number, and treating it as
 a stage coordinate places the volume mirrored and displaced.
 
+</details>
+
 ## Reusing a setup on another machine
 
 Tune a stitch once, then apply exactly that treatment to more datasets — on the
@@ -284,6 +321,9 @@ microscope computer, or on your own laptop.
 - **Load Configuration…** reads one back, or reads the `stitch_metadata.json`
   from any finished run.
 
+<details>
+<summary>What a saved configuration carries, and what it leaves out</summary>
+
 It carries everything that shapes the output: processing options, destripe
 tuning, deconvolution parameters, registration thresholds, border QC.
 
@@ -292,12 +332,17 @@ measures those from your own data — nor the machine's memory ceiling, worker
 counts or scratch path. A PSF file is used only if that file exists on your
 machine, and the app says so plainly when it doesn't.
 
+</details>
+
 ## Limitations, and when not to trust the result
 
 Stitching can succeed on part of a mosaic and fail on the rest. Several gates
 exist to stop a half-registered result being presented as a good one. When one
 fires, tiles are placed by their recorded stage positions instead, and the
 registration report names which gate fired and for which tiles.
+
+<details>
+<summary>The registration gates and their defaults, and two further limits</summary>
 
 | Gate | Default | What it means when it fires |
 |---|---|---|
@@ -310,11 +355,13 @@ registration report names which gate fired and for which tiles.
 Two further limits:
 
 - **Multi-view rotation is not instrument-validated.** The rotation sign and
-  centre conventions are checked on synthetic data only. Verify with a two-angle
+  center conventions are checked on synthetic data only. Verify with a two-angle
   test acquisition, and flip the sign if the views come out mirrored.
-- **There is no per-tile intensity equalisation.** Tiles that were genuinely
-  brighter stay brighter; flat-field correction addresses the illumination
-  profile within a tile, not tile-to-tile differences.
+- **Tile-to-tile brightness is evened out only when 'Intensity adjustment' is
+  set to 'Apply'** (Image quality tab). It fits a gain and offset per tile from
+  the overlaps, so a tile that really was brighter is dimmed to match its
+  neighbors. Flat-field correction addresses the illumination profile within a
+  tile, not tile-to-tile differences.
 
 <!-- SCREENSHOT NEEDED -> docs/images/registration-report.png
      Capture: registration_report.txt open in a text editor, the seam summary
@@ -323,13 +370,18 @@ Two further limits:
 ![The registration report, showing how many seams registered and why others did not](docs/images/registration-report.png)
 -->
 
+</details>
+
 ## Methods and how to cite
+
+<details>
+<summary>Algorithms to name in a methods section, and how to cite the software</summary>
 
 Registration and fusion are performed by
 [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher).
 Two of its algorithms are the ones a methods section should name:
 
-- **Global optimisation with iterative edge pruning**, and **cosine-weighted
+- **Global optimization with iterative edge pruning**, and **cosine-weighted
   blending** across tile overlaps — after BigStitcher: Hörl et al., *BigStitcher:
   reconstructing high-resolution image datasets of cleared and expanded samples*,
   Nature Methods 16, 870–874 (2019).
@@ -341,7 +393,12 @@ destriping uses a vendored copy of the pystripe wavelet filter.
 
 To cite the software itself, see `CITATION.cff` in the repository root.
 
+</details>
+
 ## For developers / Python users
+
+<details>
+<summary>Installing with pip, optional backends, deconvolution, the GUI and CLI commands</summary>
 
 ```bash
 pip install "flamingo-stitcher[gui]"        # CLI + GUI (PyQt5, no napari)
@@ -386,12 +443,19 @@ It converts raw acquisition folders into stitched volumes using
 [multiview-stitcher](https://github.com/multiview-stitcher/multiview-stitcher) for
 registration and fusion, and writes OME-Zarr, OME-TIFF, or Imaris `.ims`.
 
+</details>
+
 ## Dependencies
+
+<details>
+<summary>Core dependencies and the dask version range</summary>
 
 Core (always installed): `numpy`, `scipy`, `dask[array]`, `zarr`, `numcodecs`,
 `multiview-stitcher`, `ngff-zarr`, `tifffile`, `psutil`, `PyYAML`.
 The `dask` version range excludes 2025.12.0–2026.3.0 (they break ngff-zarr's
 OME-Zarr v0.4 writes; see forum.image.sc topic 120480).
+
+</details>
 
 ## License
 
@@ -400,7 +464,7 @@ OME-Zarr v0.4 writes; see forum.image.sc topic 120480).
 The GUI uses **PyQt5** (GPL-3.0), which the Windows installer bundles, making the
 distributed binary GPL-3.0. Every other dependency is permissive (BSD-3-Clause /
 MIT / Apache-2.0) and GPL-compatible. This project is derived from
-[Py2Flamingo](https://github.com/MichaelSNelson/Flamingo_Control) (MIT); see
+[Py2Flamingo](https://github.com/uw-loci/Flamingo_Control) (MIT); see
 [`NOTICE`](NOTICE) for full third-party attribution and
 [`LICENSE_ANALYSIS_TODO.md`](LICENSE_ANALYSIS_TODO.md) for the analysis (incl. the
 PySide6/MIT alternative).
