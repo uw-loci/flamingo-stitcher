@@ -6,8 +6,8 @@ type: software
 authors:
   - family-names: "Nelson"
     given-names: "Michael S."
-version: "0.14.0"
-date-released: "2026-11-10"
+version: "0.14.1"
+date-released: "2026-11-20"
 license: "GPL-3.0-or-later"
 repository-code: "https://github.com/uw-loci/flamingo-stitcher"
 keywords:
