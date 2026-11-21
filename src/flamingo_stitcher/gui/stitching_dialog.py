@@ -2485,7 +2485,7 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
                     f"Z step stretches/squishes the volume along Z."
                 )
 
-        # Auto-fill XY pixel size from the recorded objective (ScopeSettings.txt).
+        # Auto-fill XY pixel size from the recorded objective and binning.
         self._autofill_pixel_size()
 
         # Always record the effective XY pixel size in the LOG (the GUI spinbox
@@ -2629,12 +2629,16 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
     def _autofill_pixel_size(self):
         """Auto-fill XY pixel size from the acquisition's recorded objective.
 
-        Reads `Objective lens magnification` from ScopeSettings.txt so an
+        Reads the recorded objective (ScopeSettings.txt, or SystemMetaData.txt
+        from the 2026-10-06 server build on) and the camera binning, so an
         objective swap doesn't silently keep a stale pixel size (which places
         tiles by stage spacing but renders them at the wrong scale → gaps).
         Respects a manual override; warns instead of overwriting in that case.
         """
         from flamingo_stitcher.pipeline import (
+            NonSquareBinningError,
+            describe_pixel_basis,
+            pixel_size_basis,
             read_objective_magnification,
             suggested_pixel_size_um,
         )
@@ -2654,6 +2658,9 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
         acq = Path(first_item["path"])
         try:
             suggested = suggested_pixel_size_um(acq)
+        except NonSquareBinningError as e:
+            self._log(f"⚠ '{acq.name}': {e}")
+            return
         except Exception as e:
             self._logger.debug(f"pixel-size auto-fill skipped: {e}")
             return
@@ -2666,22 +2673,21 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             mag = read_objective_magnification(acq)
             if mag:
                 self._log(
-                    f"⚠ Read objective {mag:.2f}× from ScopeSettings.txt but "
-                    f"could not derive a pixel size; using {cur:.4f} µm/px. "
-                    f"Verify the scale."
+                    f"⚠ Read objective {mag:.2f}× but could not derive a pixel "
+                    f"size; using {cur:.4f} µm/px. Verify the scale."
                 )
             else:
                 self._log(
-                    f"⚠ Could not read objective magnification from "
-                    f"ScopeSettings.txt for '{acq.name}' — using XY pixel size "
-                    f"{cur:.4f} µm/px (default/manual, NOT scope-derived). If "
-                    f"tiles render spaced apart, this is likely the cause: check "
-                    f"the acquisition has a ScopeSettings.txt containing "
-                    f"'Objective lens magnification'."
+                    f"⚠ Could not read the objective magnification for "
+                    f"'{acq.name}' — using XY pixel size {cur:.4f} µm/px "
+                    f"(default/manual, NOT scope-derived). If tiles render spaced "
+                    f"apart, this is likely the cause: check the acquisition has a "
+                    f"ScopeSettings.txt with 'Objective lens magnification', or "
+                    f"(servers from 2026-10 on) a SystemMetaData.txt with "
+                    f"'Magnification' under 'Detection lens'."
                 )
             return
-        mag = read_objective_magnification(acq)
-        mag_str = f"{mag:.2f}×" if mag else "?"
+        basis_text = describe_pixel_basis(pixel_size_basis(acq))
         detected = round(suggested, 4)
         cur = self._pixel_size_spin.value()
 
@@ -2700,8 +2706,7 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
         ):
             _apply_detected()
             self._log(
-                f"Auto-detected XY pixel size: {detected:.3f} µm "
-                f"(objective {mag_str} from ScopeSettings.txt)"
+                f"Auto-detected XY pixel size: {detected:.3f} µm ({basis_text})"
             )
             return
 
@@ -2713,8 +2718,7 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             self,
             "Overwrite XY pixel size?",
             f"The XY pixel size is set to {cur:.4f} µm, but the acquisition's "
-            f"objective ({mag_str}, from ScopeSettings.txt) gives "
-            f"{detected:.4f} µm.\n\n"
+            f"metadata ({basis_text}) gives {detected:.4f} µm.\n\n"
             f"Overwrite with the detected {detected:.4f} µm?\n\n"
             f"Choose No to keep your current value — e.g. a measured "
             f"calibration you set on purpose.",
@@ -2725,12 +2729,12 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             _apply_detected()
             self._log(
                 f"XY pixel size overwritten with detected {detected:.3f} µm "
-                f"(objective {mag_str})."
+                f"({basis_text})."
             )
         else:
             self._log(
                 f"Kept manual XY pixel size {cur:.3f} µm "
-                f"(detected {detected:.3f} µm from {mag_str} not applied)."
+                f"(detected {detected:.3f} µm from {basis_text} not applied)."
             )
 
     def _log_detected_frame_size(self):
@@ -4409,15 +4413,16 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
     def _confirm_pixel_size(self, pending, config) -> bool:
         """Block the run if the XY pixel size badly mismatches the objective.
 
-        Reads each pending item's `Objective lens magnification` from
-        ScopeSettings.txt and compares the implied pixel size to the configured
-        one. On a large divergence (>25%), forces an explicit choice — use the
+        Reads each pending item's recorded objective and camera binning
+        (ScopeSettings.txt or SystemMetaData.txt, and Workflow.txt) and compares
+        the implied pixel size to the configured one. On a large divergence (>25%), forces an explicit choice — use the
         objective-derived value (recommended), keep the current value, or
         cancel — so a stale pixel size can't silently produce a gappy stitch.
         Returns True to proceed, False to abort.
         """
         from flamingo_stitcher.pipeline import (
-            read_objective_magnification,
+            describe_pixel_basis,
+            pixel_size_basis,
             suggested_pixel_size_um,
         )
 
@@ -4432,7 +4437,7 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             return True
 
         cur = config.pixel_size_um
-        suggestions = []  # (pixel_um, magnification)
+        suggestions = []  # (pixel_um, what it was worked out from)
         for it in pending:
             if not it.get("tiles"):
                 continue
@@ -4441,25 +4446,23 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             except Exception:
                 s = None
             if s and s > 0:
-                suggestions.append((s, read_objective_magnification(Path(it["path"]))))
+                suggestions.append((s, describe_pixel_basis(pixel_size_basis(Path(it["path"])))))
         if not suggestions or cur <= 0:
             return True
 
         # Worst (largest) divergence across the queue.
-        s, mag = max(suggestions, key=lambda sm: abs(cur - sm[0]) / sm[0])
+        s, basis_text = max(suggestions, key=lambda sm: abs(cur - sm[0]) / sm[0])
         if abs(cur - s) / s <= 0.25:
             return True
 
         mixed = len({round(v[0], 3) for v in suggestions}) > 1
-        mag_str = f"{mag:.2f}×" if mag else "?"
         pct = abs(cur - s) / s * 100
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Pixel size doesn't match the objective")
         text = (
-            f"XY pixel size is set to {cur:.3f} µm, but the objective recorded in "
-            f"ScopeSettings.txt ({mag_str}) implies ~{s:.3f} µm — a {pct:.0f}% "
-            f"difference.\n\n"
+            f"XY pixel size is set to {cur:.3f} µm, but the acquisition's metadata "
+            f"({basis_text}) implies ~{s:.3f} µm — a {pct:.0f}% difference.\n\n"
             f"Stitching at {cur:.3f} µm places tiles by stage spacing but renders "
             f"them at the wrong scale, producing gaps (or excessive overlap) "
             f"between tiles."
@@ -4484,7 +4487,7 @@ class StitchingDialog(QueueSetsMixin, ReworkedLayoutMixin, PersistentDialog):
             self._pixel_size_spin.setValue(round(s, 4))
             self._setting_pixel_programmatically = False
             self._log(
-                f"Pixel size set to {s:.3f} µm from objective {mag_str} "
+                f"Pixel size set to {s:.3f} µm from {basis_text} "
                 f"(was {cur:.3f} µm)."
             )
         else:

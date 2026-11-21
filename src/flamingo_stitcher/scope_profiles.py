@@ -688,7 +688,7 @@ def describe_resolution(
             f"microscope will use them."
         )
     return False, (
-        "Could not read a microscope name for this acquisition (no "
-        "ScopeSettings.txt / FlamingoMetaData), so no per-scope stitching "
+        "Could not read a microscope name for this acquisition (none in "
+        "ScopeSettings.txt, FlamingoMetaData or SystemMetaData.txt), so no per-scope stitching "
         "options could be applied; using the defaults."
     )

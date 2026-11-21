@@ -92,15 +92,17 @@ class OptionsPanel(QWidget):
         self._scope_combo.setToolTip(
             "The microscope to edit. Lists every microscope you have stitched "
             "from or saved settings for. Choose '<add a microscope…>' to type a "
-            "new one exactly as 'Microscope name' appears in the acquisition's "
-            "ScopeSettings.txt."
+            "new one exactly as the acquisition's metadata names it: 'Microscope "
+            "name' in ScopeSettings.txt, or 'Name' under 'Microscope "
+            "characteristics' in SystemMetaData.txt (servers from 2026-10 on). "
+            "The stitch log prints it as 'Microscope name: …'."
         )
         picker_layout.addWidget(QLabel("Name:"))
         picker_layout.addWidget(self._scope_combo, 1)
 
         self._new_scope_edit = QLineEdit()
         self._new_scope_edit.setPlaceholderText(
-            'exactly as "Microscope name" appears in ScopeSettings.txt'
+            "exactly as the stitch log's 'Microscope name:' line shows it"
         )
         self._new_scope_edit.setVisible(False)
         self._new_scope_edit.editingFinished.connect(self._on_selection_changed)
@@ -495,9 +497,10 @@ class OptionsPanel(QWidget):
         self._delete_btn.setEnabled(own)
         if not scope:
             self._name_hint.setText(
-                "Type the microscope name exactly as it appears in the "
-                'acquisition\'s ScopeSettings.txt ("Microscope name = …"). '
-                "The match ignores case and surrounding spaces, but nothing "
+                "Type the microscope name exactly as the acquisition records "
+                "it (the stitch log prints it as 'Microscope name: …'; it "
+                "comes from ScopeSettings.txt, or SystemMetaData.txt on "
+                "servers from 2026-10 on). The match ignores case and surrounding spaces, but nothing "
                 "else — a name that does not match is a profile that never "
                 "applies."
             )
@@ -540,9 +543,9 @@ class OptionsPanel(QWidget):
             QMessageBox.warning(
                 self,
                 "Which microscope?",
-                "Enter the microscope name first. It has to match the "
-                '"Microscope name" in the acquisition\'s ScopeSettings.txt, '
-                "which is how a profile finds its data.",
+                "Enter the microscope name first. It has to match the name "
+                "the acquisition records (the stitch log's 'Microscope name:' "
+                "line), which is how a profile finds its data.",
             )
             return
         objective = self._current_objective()

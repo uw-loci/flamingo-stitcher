@@ -67,7 +67,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="XY pixel size in micrometers (default: derived from the "
-        "objective in ScopeSettings.txt, else 0.406)",
+        "objective in ScopeSettings.txt or SystemMetaData.txt and the camera "
+        "binning, else 0.406)",
     )
     voxel_group.add_argument(
         "--z-step-um",
@@ -861,23 +862,34 @@ def main():
         sys.exit(0 if written else 2)
 
     # Resolve XY pixel size: explicit flag wins, else derive from the
-    # acquisition's objective (ScopeSettings.txt), else the legacy default.
+    # acquisition's objective and camera binning, else the legacy default.
     pixel_size_um = args.pixel_size_um
     if pixel_size_um is None:
-        from .pipeline import suggested_pixel_size_um
+        from .pipeline import (
+            NonSquareBinningError,
+            describe_pixel_basis,
+            pixel_size_basis,
+            suggested_pixel_size_um,
+        )
 
-        suggested = suggested_pixel_size_um(acq_dir)
+        try:
+            suggested = suggested_pixel_size_um(acq_dir)
+        except NonSquareBinningError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
         if suggested:
             pixel_size_um = round(suggested, 4)
             print(
-                f"Using objective-derived XY pixel size: {pixel_size_um} µm "
-                f"(from ScopeSettings.txt). Override with --pixel-size-um."
+                f"Using XY pixel size {pixel_size_um} µm "
+                f"({describe_pixel_basis(pixel_size_basis(acq_dir))}). "
+                f"Override with --pixel-size-um."
             )
         else:
             pixel_size_um = 0.406
             print(
-                "No objective found in ScopeSettings.txt; using default XY pixel "
-                "size 0.406 µm. Set --pixel-size-um if this is wrong."
+                "No objective found in ScopeSettings.txt or SystemMetaData.txt; "
+                "using default XY pixel size 0.406 µm. Set --pixel-size-um if "
+                "this is wrong."
             )
 
     # Build config

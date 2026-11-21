@@ -2892,9 +2892,12 @@ class RawTileInfo:
 # Frame (camera AOI) size resolution
 # ---------------------------------------------------------------------------
 def _read_aoi_from_workflow(workflow_file: Path) -> Optional[Tuple[int, int]]:
-    """Read `AOI width`/`AOI height` (camera sensor crop) from a Workflow.txt.
+    """Read the saved image size from a Workflow.txt.
 
-    Returns (width, height) in pixels, or None if the file/fields are absent.
+    Servers up to 2026-10 write ``AOI width``/``AOI height``; from the 10-06
+    build on, ``ROI width``/``ROI height`` (the camera's image size in binned
+    pixels, see ``acquisition_metadata``). Returns (width, height) in pixels,
+    or None if the file/fields are absent.
     """
     try:
         if not workflow_file.exists():
@@ -2902,8 +2905,8 @@ def _read_aoi_from_workflow(workflow_file: Path) -> Optional[Tuple[int, int]]:
         content = _read_text_resilient(workflow_file)
     except OSError:
         return None
-    w = re.search(r"AOI width\s*=\s*(\d+)", content)
-    h = re.search(r"AOI height\s*=\s*(\d+)", content)
+    w = re.search(r"(?:AOI|ROI) width\s*=\s*(\d+)", content)
+    h = re.search(r"(?:AOI|ROI) height\s*=\s*(\d+)", content)
     if w and h:
         return (int(w.group(1)), int(h.group(1)))
     return None
@@ -3297,26 +3300,78 @@ def _find_acquisition_file(
 
 
 def read_objective_magnification(acquisition_dir: Path) -> Optional[float]:
-    """Read `Objective lens magnification` from the acquisition's ScopeSettings.txt.
+    """The objective magnification the microscope recorded at capture time.
 
-    This is the system magnification the microscope recorded at capture time, so
-    it tracks objective swaps that the static hardware config does not.
+    It tracks objective swaps that the static hardware config does not. See
+    :func:`read_objective_with_source` for where it is read from.
+    """
+    return read_objective_with_source(acquisition_dir)[0]
+
+
+def read_objective_with_source(
+    acquisition_dir: Path,
+) -> Tuple[Optional[float], Optional[str]]:
+    """``(magnification, file name)`` from the acquisition's metadata.
+
+    ``Objective lens magnification`` in ScopeSettings.txt (servers up to
+    2026-10), else ``Detection lens/Magnification`` in SystemMetaData.txt (the
+    10-06 build on). ``(None, None)`` when neither has it.
     """
     f = _find_acquisition_file(acquisition_dir, "ScopeSettings.txt")
-    if f is None:
-        return None
-    try:
-        content = _read_text_resilient(f)
-    except OSError:
-        return None
-    m = re.search(r"Objective lens magnification\s*=\s*([\d.]+)", content)
-    if m:
+    if f is not None:
         try:
-            mag = float(m.group(1))
-            return mag if mag > 0 else None
-        except ValueError:
-            return None
-    return None
+            content = _read_text_resilient(f)
+        except OSError:
+            content = ""
+        m = re.search(r"Objective lens magnification\s*=\s*([\d.]+)", content)
+        if m:
+            try:
+                mag = float(m.group(1))
+                if mag > 0:
+                    return mag, f.name
+            except ValueError:
+                pass
+    from flamingo_stitcher import acquisition_metadata as am
+
+    doc_file = _find_acquisition_file(acquisition_dir, am.SYSTEM_METADATA_FILE)
+    if doc_file is not None:
+        doc = am.read_document(doc_file)
+        mag = am.objective_magnification(doc) if doc else None
+        if mag:
+            return mag, doc_file.name
+    return None, None
+
+
+def read_camera_binning(
+    acquisition_dir: Path,
+) -> Tuple[Tuple[int, int], Optional[str]]:
+    """``((width, height), file name)``: the camera binning the stack used.
+
+    ``Bit binning width/height`` from Workflow.txt, else from SystemMetaData.txt.
+    Data from servers before the 10-06 build has neither and was not binned:
+    ``((1, 1), None)``.
+    """
+    from flamingo_stitcher import acquisition_metadata as am
+
+    wf = _find_acquisition_file(acquisition_dir, "Workflow.txt")
+    if wf is not None:
+        try:
+            binning = am.binning_from_text(_read_text_resilient(wf))
+        except OSError:
+            binning = None
+        if binning:
+            return binning, wf.name
+    doc_file = _find_acquisition_file(acquisition_dir, am.SYSTEM_METADATA_FILE)
+    if doc_file is not None:
+        doc = am.read_document(doc_file)
+        binning = am.binning_from_document(doc) if doc else None
+        if binning:
+            return binning, doc_file.name
+    return (1, 1), None
+
+
+class NonSquareBinningError(ValueError):
+    """The camera binned X and Y differently, so pixels are not square."""
 
 
 def read_objective_magnification_metadata(
@@ -3387,23 +3442,72 @@ def _config_objective_for_microscope(name: Optional[str]) -> Optional[float]:
         return None
 
 
-def suggested_pixel_size_um(acquisition_dir: Path) -> Optional[float]:
-    """Effective XY pixel size for an acquisition.
+def pixel_size_basis(acquisition_dir: Path) -> Dict[str, Any]:
+    """Everything the effective XY pixel size is worked out from, with sources.
 
-    pixel = sensor_pixel_size / objective_magnification. Prefers the objective
-    the microscope recorded in ScopeSettings.txt; falls back to a per-microscope
-    ``objective_magnification`` from microscope_hardware.yaml (keyed by
-    "Microscope name") for systems that don't record it. Returns None when
-    neither is available.
+    Keys: ``magnification`` and ``objective_source`` (the file, or
+    "microscope_hardware.yaml" for the per-microscope fallback), ``binning``
+    ``(w, h)`` and ``binning_source``, ``sensor_um``, and ``pixel_um`` =
+    sensor x binning / magnification (None without a magnification, or when
+    the binning differs between X and Y).
     """
-    mag = read_objective_magnification(acquisition_dir)
+    mag, source = read_objective_with_source(acquisition_dir)
     if not mag:
         from flamingo_stitcher.orientation import read_microscope_name
 
         mag = _config_objective_for_microscope(read_microscope_name(acquisition_dir))
-    if not mag:
+        source = "microscope_hardware.yaml" if mag else None
+    binning, binning_source = read_camera_binning(acquisition_dir)
+    sensor = _sensor_pixel_size_um()
+    pixel = None
+    if mag and binning[0] == binning[1]:
+        pixel = sensor * binning[0] / mag
+    return {
+        "magnification": mag,
+        "objective_source": source,
+        "binning": binning,
+        "binning_source": binning_source,
+        "sensor_um": sensor,
+        "pixel_um": pixel,
+    }
+
+
+def describe_pixel_basis(basis: Dict[str, Any]) -> str:
+    """'objective 6.20x (SystemMetaData.txt), 2x2 binning (Workflow.txt), sensor 6.50 µm'."""
+    parts = []
+    if basis.get("magnification"):
+        parts.append(f"objective {basis['magnification']:.2f}x ({basis['objective_source']})")
+    bw, bh = basis.get("binning", (1, 1))
+    if basis.get("binning_source"):
+        parts.append(f"{bw}x{bh} binning ({basis['binning_source']})")
+    parts.append(f"sensor {basis['sensor_um']:.2f} µm")
+    return ", ".join(parts)
+
+
+def suggested_pixel_size_um(acquisition_dir: Path) -> Optional[float]:
+    """Effective XY pixel size for an acquisition.
+
+    pixel = sensor_pixel_size x binning / objective_magnification. The
+    objective comes from the acquisition's metadata (ScopeSettings.txt, or
+    SystemMetaData.txt from the 2026-10-06 server build on), falling back to a
+    per-microscope ``objective_magnification`` in microscope_hardware.yaml
+    (keyed by "Microscope name") for systems that don't record it. Binning
+    comes from Workflow.txt (1 for data from older servers). Returns None when
+    no magnification is available. Raises NonSquareBinningError when the
+    camera binned X and Y differently, because one pixel size cannot describe
+    that data.
+    """
+    basis = pixel_size_basis(acquisition_dir)
+    if not basis["magnification"]:
         return None
-    return _sensor_pixel_size_um() / mag
+    bw, bh = basis["binning"]
+    if bw != bh:
+        raise NonSquareBinningError(
+            f"The camera binned {bw}x{bh} ({basis['binning_source']}), so each "
+            f"pixel is {bw} sensor pixels wide and {bh} tall. The stitcher needs "
+            f"square pixels: acquire with equal binning (1x1, 2x2 or 4x4)."
+        )
+    return basis["pixel_um"]
 
 
 def _read_capture_and_angles(workflow_file: Optional[Path]) -> Dict[str, object]:
@@ -8141,6 +8245,31 @@ class StitchingPipeline:
     # sample on any real acquisition.
     _ILLUM_VERIFY_TILES = 6
 
+    def _log_document_camera_pitch(self, acquisition_dir: Path, sensor_um: float) -> None:
+        """Say when SystemMetaData.txt's camera pitch differs from the one used.
+
+        The document's value is not used (see acquisition_metadata): converted
+        documents keep the server template's example pitch. A real, different
+        camera would show up here first.
+        """
+        try:
+            from flamingo_stitcher import acquisition_metadata as am
+
+            f = _find_acquisition_file(acquisition_dir, am.SYSTEM_METADATA_FILE)
+            doc = am.read_document(f) if f is not None else None
+            pitch = am.camera_pixel_pitch_um(doc) if doc else None
+        except Exception:  # noqa: BLE001 - a report must never break a run
+            return
+        if pitch and abs(pitch - sensor_um) / sensor_um > 0.02:
+            self.logger.info(
+                f"  SystemMetaData.txt gives the camera pixel pitch as {pitch:g} µm; "
+                f"the stitcher uses {sensor_um:g} µm (sensor_pixel_size_um in "
+                f"microscope_hardware.yaml). Converted documents keep the server "
+                f"template's example pitch, so the document's value is not used. If "
+                f"this camera really has {pitch:g} µm pixels, set the XY pixel size "
+                f"by hand."
+            )
+
     def _log_microscope_identity(self, acquisition_dir) -> None:
         """Name the microscope this run is keyed on, and say when files disagree.
 
@@ -8168,14 +8297,26 @@ class StitchingPipeline:
         distinct = sorted({name for _f, name in found})
         if len(distinct) == 1:
             self.logger.info(f"Microscope name: '{used}' (from {used_file.name})")
+            from flamingo_stitcher.acquisition_metadata import SERVER_DEFAULT_NAME
+
+            if used.strip().lower() == SERVER_DEFAULT_NAME.lower():
+                self.logger.warning(
+                    f"  '{used}' is the name a server gives its metadata before "
+                    f"anyone sets one, so every unconfigured microscope shares it, "
+                    f"and with it one tile orientation and one Options profile. Set "
+                    f"the microscope's real name on the server ('Name' under "
+                    f"'Microscope characteristics')."
+                )
             return
         listing = "; ".join(f"{f.name}: '{n}'" for f, n in found)
         self.logger.warning(
             f"  Microscope name DISAGREES between this acquisition's files "
             f"({listing}). Per-microscope settings -- tile orientation and the "
             f"Options profile -- are keyed on '{used}' (from {used_file.name}). "
-            f"If that is the wrong instrument, fix 'Microscope name' in the "
-            f"microscope's own ScopeSettings.txt so future acquisitions agree."
+            f"If that is the wrong instrument, fix the name on the microscope "
+            f"('Microscope name' in its ScopeSettings.txt, or 'Name' under "
+            f"'Microscope characteristics' in SystemMetaData.txt on servers from "
+            f"2026-10 on) so future acquisitions agree."
         )
 
     def _check_configured_z_step(self, z_step_um, tiles) -> None:
@@ -12868,13 +13009,15 @@ class StitchingPipeline:
         #    value against it. Runs before the voxel-size / fusion math below, so
         #    a batch mixing objectives renders each item at the right scale.
         try:
-            mag = read_objective_magnification(acquisition_dir)
-            suggested = suggested_pixel_size_um(acquisition_dir)
+            basis = pixel_size_basis(acquisition_dir)
+            mag = basis["magnification"] if basis["objective_source"] != "microscope_hardware.yaml" else None
+            suggested = suggested_pixel_size_um(acquisition_dir)  # raises on unequal binning
             if mag and suggested:
                 self.logger.info(
-                    f"Objective (ScopeSettings.txt): {mag:.3f}× → effective pixel "
-                    f"~{suggested:.3f} µm (sensor {_sensor_pixel_size_um():.2f} µm)"
+                    f"Pixel size basis: {describe_pixel_basis(basis)} → effective "
+                    f"pixel ~{suggested:.3f} µm"
                 )
+            self._log_document_camera_pitch(acquisition_dir, basis["sensor_um"])
             # Cross-check: ScopeSettings.txt vs FlamingoMetaData*.txt objective.
             # These are two independent records of the same objective; when they
             # disagree, one is stale and every tile is rendered at the wrong
@@ -12902,13 +13045,14 @@ class StitchingPipeline:
                     self.config.pixel_size_um = round(suggested, 4)
                     self.logger.info(
                         f"Auto XY pixel size (per-acquisition): "
-                        f"{self.config.pixel_size_um:.4f} µm from objective "
-                        f"{mag:.3f}× (fallback was {prev:.4f} µm)."
+                        f"{self.config.pixel_size_um:.4f} µm from "
+                        f"{describe_pixel_basis(basis)} (fallback was {prev:.4f} µm)."
                     )
                 else:
                     self.logger.warning(
                         f"Auto XY pixel size requested but no objective was found "
-                        f"in this acquisition's ScopeSettings.txt; falling back to "
+                        f"in this acquisition's ScopeSettings.txt or "
+                        f"SystemMetaData.txt; falling back to "
                         f"{self.config.pixel_size_um:.4f} µm. Set the pixel size "
                         f"manually if that is wrong."
                     )
@@ -12924,6 +13068,11 @@ class StitchingPipeline:
                         f"XY pixel size. [Note: a stale value may reflect the known "
                         f"nominal-vs-system magnification ambiguity.]"
                     )
+        except NonSquareBinningError as e:
+            # Not a diagnostic: no pixel size describes this data, so stitching
+            # it would place and scale tiles wrongly.
+            self.logger.error(f"Cannot stitch {acquisition_dir.name}: {e}")
+            raise
         except Exception as e:  # never let diagnostics break a run
             self.logger.debug(f"Objective/pixel-size check skipped: {e}")
 

@@ -17,7 +17,8 @@ Because beads (and many samples) make it hard to eyeball the right orientation,
 pick the correct one — the same transform then applies to the real run.
 
 Orientation is not stored in the acquisition; the only per-scope identifier on
-disk is the "Microscope name" (ScopeSettings.txt / FlamingoMetaData.txt), so a
+disk is the "Microscope name" (ScopeSettings.txt / FlamingoMetaData.txt, or
+"Name" in SystemMetaData.txt from the 2026-10-06 server build on), so a
 named preset (see the ``microscopes:`` block of ``microscope_hardware.yaml``)
 lets a user pick their system once instead of choosing every run.
 
@@ -207,34 +208,21 @@ def describe_orientation(name: Optional[str], reverse_x: bool = False,
 
 
 def read_microscope_name(acquisition_dir: Path) -> Optional[str]:
-    """Read "Microscope name" from an acquisition's metadata, or None.
+    """Read the microscope's name from an acquisition's metadata, or None.
 
-    Checks ScopeSettings.txt then FlamingoMetaData*.txt, in the acquisition
-    root and one level down (dated subfolders). Read errors are swallowed (a
-    corrupt metadata file must never break orientation lookup).
+    The first name found in the files :func:`microscope_names_found` lists:
+    ScopeSettings.txt, then FlamingoMetaData*.txt, then SystemMetaData.txt
+    (servers from the 2026-10-06 build on), in the acquisition root and one
+    level down (dated subfolders). Read errors are swallowed (a corrupt
+    metadata file must never break orientation lookup).
     """
-    acquisition_dir = Path(acquisition_dir)
-    bases = [acquisition_dir, *_child_dirs(acquisition_dir)]
-    candidates: List[Path] = []
-    for base in bases:
-        candidates.append(base / "ScopeSettings.txt")
-        try:
-            candidates.extend(sorted(base.glob("FlamingoMetaData*.txt")))
-        except OSError:
-            pass
-    for f in candidates:
-        try:
-            if not f.is_file():
-                continue
-            m = _NAME_RE.search(f.read_text(errors="replace"))
-            if m and m.group(1).strip():
-                return m.group(1).strip()
-        except OSError:
-            continue
-    return None
+    found = microscope_names_found(acquisition_dir, first_only=True)
+    return found[0][1] if found else None
 
 
-def microscope_names_found(acquisition_dir: Path) -> List[Tuple[Path, str]]:
+def microscope_names_found(
+    acquisition_dir: Path, first_only: bool = False
+) -> List[Tuple[Path, str]]:
     """Every ``Microscope name`` in an acquisition's metadata, with its file.
 
     `read_microscope_name` returns the FIRST one, and everything per-microscope
@@ -244,6 +232,8 @@ def microscope_names_found(acquisition_dir: Path) -> List[Tuple[Path, str]]:
     got depended on which file happened to be read first. This lists them all
     so the run can say when they disagree.
     """
+    from flamingo_stitcher import acquisition_metadata as am
+
     acquisition_dir = Path(acquisition_dir)
     found: List[Tuple[Path, str]] = []
     for base in [acquisition_dir, *_child_dirs(acquisition_dir)]:
@@ -252,15 +242,23 @@ def microscope_names_found(acquisition_dir: Path) -> List[Tuple[Path, str]]:
             files.extend(sorted(base.glob("FlamingoMetaData*.txt")))
         except OSError:
             pass
+        files.append(base / am.SYSTEM_METADATA_FILE)
         for f in files:
             try:
                 if not f.is_file():
                     continue
-                m = _NAME_RE.search(f.read_text(errors="replace"))
+                text = f.read_text(errors="replace")
             except OSError:
                 continue
-            if m and m.group(1).strip():
-                found.append((f, m.group(1).strip()))
+            if f.name == am.SYSTEM_METADATA_FILE:
+                name = am.microscope_name(am.parse(text))
+            else:
+                m = _NAME_RE.search(text)
+                name = m.group(1).strip() if m else None
+            if name:
+                found.append((f, name))
+                if first_only:
+                    return found
     return found
 
 

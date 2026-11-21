@@ -12,7 +12,7 @@ stored whole so a scope's tuning is reproduced exactly.
 
 This mirrors how tile orientation is already handled (``orientation.py``):
 presets live in a small JSON file keyed by the "Microscope name" read out of
-the acquisition's ``ScopeSettings.txt`` / ``FlamingoMetaData*.txt``, so the
+the acquisition's ``ScopeSettings.txt`` / ``FlamingoMetaData*.txt`` / ``SystemMetaData.txt``, so the
 right settings follow the data rather than the GUI session.
 
 An acquisition from an unrecognised scope is NOT blocked — the caller keeps
@@ -137,7 +137,7 @@ def describe_resolution(
             "transfer. Check them in Destripe → Preview…, then re-save."
         )
     return False, (
-        "Could not read a microscope name for this acquisition (no "
-        "ScopeSettings.txt / FlamingoMetaData) — continuing with the last-used "
+        "Could not read a microscope name for this acquisition (none in "
+        "ScopeSettings.txt, FlamingoMetaData or SystemMetaData.txt) — continuing with the last-used "
         "destripe settings, which may have been tuned on another scope."
     )

@@ -150,7 +150,7 @@ running acquisition within a few seconds and cancels the rest of that run.
 Pixel size, Z step, frame (camera ROI) and channels are filled in by *Discover
 Tiles*; change one only if you know a detected value is wrong. Unless you set the
 XY pixel size by hand, **each queued acquisition uses the pixel size implied by its
-own objective** (from its `ScopeSettings.txt`), so a queue mixing objectives
+own objective and camera binning**, so a queue mixing objectives or binning
 stitches every item at the right scale. A typed value applies to the selected
 acquisitions.
 
@@ -158,12 +158,20 @@ acquisitions.
   `Effective XY pixel size: … µm/px (the value stitching will use)`. If the
   tiles come out **spaced apart like dice**, this value is almost always wrong —
   check that line first.
-- **Pick the right folder.** The objective is read from `ScopeSettings.txt`. If
-  you select a parent folder whose acquisitions live in a dated subfolder, the
-  app now searches down into it — but if it still can't find the objective it
-  logs a ⚠ warning and falls back to the current (possibly wrong) pixel size.
+- **Where the values come from.** The microscope name and objective are read
+  from `ScopeSettings.txt`, or, for data from Flamingo servers updated in or
+  after October 2026, from `SystemMetaData.txt`. Binning comes from
+  `Bit binning width/height` in `Workflow.txt`; older data has no binning and
+  counts as 1×1. The pixel size is camera pixel × binning ÷ objective, and the
+  log's `Pixel size basis:` line shows each value and its file. Data binned
+  differently in X and Y (for example 2×4) is refused with a message, because
+  one pixel size cannot describe it.
+- **Pick the right folder.** If you select a parent folder whose acquisitions
+  live in a dated subfolder, the app searches down into it — but if it still
+  can't find the objective it logs a ⚠ warning and falls back to the current
+  (possibly wrong) pixel size.
 - **Per-microscope fallback.** For systems that don't record the objective in
-  `ScopeSettings.txt`, a per-microscope `objective_magnification` in
+  their metadata, a per-microscope `objective_magnification` in
   `microscope_hardware.yaml` (`microscopes:` block) supplies it — e.g. `liara`
   (25.48×, measured on a calibration standard) → ~0.255 µm/px.
 
